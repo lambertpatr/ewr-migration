@@ -2,6 +2,42 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 import uuid
+import pandas as pd
+
+# Re-use the countries dict from shareholders_import_service — single source of truth.
+from app.services.shareholders_import_service import COUNTRY_ID_TO_NAME
+
+
+def _map_country_id_to_name(v) -> str:
+    """Convert a numeric country-ID (plain int or scientific notation) to its name."""
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return ""
+    try:
+        key = int(float(s))          # handles "1.54469E+12" and plain integers
+    except (ValueError, OverflowError):
+        return ""
+    return COUNTRY_ID_TO_NAME.get(key, "")
+
+
+def _to_bigint_str(v) -> str:
+    """Convert scientific-notation or plain numeric value to a clean integer string.
+
+    Returns empty string for anything that cannot be parsed (→ NULL in DB).
+    """
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if not s or s.lower() in ("nan", "none"):
+        return ""
+    try:
+        # NOTE: use float(...) to handle scientific notation (e.g. 2.55756E+11)
+        # then int(...) to drop any trailing .0 representation.
+        return str(int(float(s)))
+    except (ValueError, OverflowError):
+        return ""
 
 
 def import_managing_directors_via_staging_copy(
@@ -13,24 +49,24 @@ def import_managing_directors_via_staging_copy(
 ) -> dict:
     """High-volume import of managing directors using staging + COPY + set-based SQL.
 
-    Excel → DB mapping
-    - apprefno -> ca_applications.application_number -> ca_managing_directors.application_id
-    - demail -> email
-    - phoneno -> mobile_no
-    - conadd -> contact_address
-    - name -> name
-    - countryname -> country
-    - nationality1 (country id) -> countries.countriesid -> countries.countryname -> nationality (TEXT)
-    - workpermit -> work_permit_id (BIGINT)
-    - workpermitfilename -> work_permit (store filename)
-    - cpana -> logic_doc_id (BIGINT)
-    - cpanafilename -> copy_of_id (store filename)
-
-    Returns JSON-friendly stats including inserted/skipped breakdown and examples.
+    Excel column → DB column mapping
+    ─────────────────────────────────
+    apprefno           → application_number  (join key)
+    name               → name
+    demail             → email
+    phoneno            → mobile_no  (bigint, may arrive as scientific notation)
+    conadd             → contact_address
+    countryname        → country
+    nationality1       → nationality  (bigint country-ID → name via COUNTRY_ID_TO_NAME)
+    workpermit         → work_permit  (bigint, may arrive as scientific notation)
+    workpermitfilename → work_permit_filename  (filename text)
+    cpana              → cpana  (bigint, may arrive as scientific notation)
+    cpanafilename      → cpana_filename  (filename text)
     """
 
     from sqlalchemy import text
     import io
+    import sys
 
     def _progress(msg: str):
         if progress_cb:
@@ -48,22 +84,31 @@ def import_managing_directors_via_staging_copy(
         .str.replace("/", "_")
     )
 
-    required = {
-        "apprefno",
-        "demail",
-        "phoneno",
-        "conadd",
-        "name",
-        "workpermit",
-        "workpermitfilename",
-        "cpana",
-        "cpanafilename",
-        "nationality1",
-        "countryname",
-    }
+    required = {"apprefno", "name"}
     missing = required - set(df2.columns)
     if missing:
-        raise ValueError(f"Missing required columns for managing directors import: {sorted(missing)}")
+        raise ValueError(
+            f"Missing required columns for managing directors import: {sorted(missing)}"
+        )
+
+    # DEBUG — printed to stderr so it shows in uvicorn logs
+    import sys as _sys
+    print(
+        f"[managing_directors_import] columns ({len(df2.columns)}): {list(df2.columns)}",
+        file=_sys.stderr, flush=True,
+    )
+    if len(df2) > 0:
+        print(
+            f"[managing_directors_import] first row: {df2.iloc[0].to_dict()}",
+            file=_sys.stderr, flush=True,
+        )
+
+    # Fill optional columns with empty string so code below never KeyErrors.
+    for _opt in ("demail", "phoneno", "conadd", "countryname",
+                 "nationality1", "workpermit", "workpermitfilename",
+                 "cpana", "cpanafilename"):
+        if _opt not in df2.columns:
+            df2[_opt] = ""
 
     total_rows_in_file = int(len(df2))
     if total_rows_in_file == 0:
@@ -87,68 +132,68 @@ def import_managing_directors_via_staging_copy(
 
     _progress("managing_directors:staging:create")
 
+    # Always DROP + recreate so column order always matches the COPY CSV.
+    db.execute(text("DROP TABLE IF EXISTS public.stage_ca_managing_directors_raw"))
     db.execute(
         text(
             """
-            CREATE TABLE IF NOT EXISTS public.stage_ca_managing_directors_raw (
-                id uuid PRIMARY KEY,
+            CREATE TABLE public.stage_ca_managing_directors_raw (
+                id                 uuid PRIMARY KEY,
                 application_number text,
-                name text,
-                email text,
-                mobile_no text,
-                contact_address text,
-                countryname text,
-                nationality1 text,
-                workpermit text,
+                name               text,
+                email              text,
+                mobile_no          text,
+                contact_address    text,
+                countryname        text,
+                nationality        text,
+                workpermit         text,
                 workpermitfilename text,
-                cpana text,
-                cpanafilename text,
-                file_name text,
-                source_row_no bigint
-            );
+                cpana              text,
+                cpanafilename      text,
+                source_row_no      bigint
+            )
             """
         )
     )
 
-    db.execute(text("TRUNCATE TABLE public.stage_ca_managing_directors_raw"))
-
     _progress("managing_directors:prepare:export")
 
-    export = df2[[
-        "apprefno",
-        "name",
-        "demail",
-        "phoneno",
-        "conadd",
-        "countryname",
-        "nationality1",
-        "workpermit",
-        "workpermitfilename",
-        "cpana",
-        "cpanafilename",
-    ]].copy()
+    # Build export frame — resolve scientific-notation numbers in Python before COPY.
+    export = pd.DataFrame()
+    export["name"]               = df2["name"].astype(str).str.strip()
+    export["email"]              = df2["demail"].astype(str).str.strip()
+    export["mobile_no"]          = df2["phoneno"].apply(_to_bigint_str)
+    export["contact_address"]    = df2["conadd"].astype(str).str.strip()
+    export["countryname"]        = df2["countryname"].astype(str).str.strip()
+    # nationality1 is a bigint country-ID (may be scientific notation) → resolve to name
+    export["nationality"]        = df2["nationality1"].map(_map_country_id_to_name).fillna("")
+    # workpermit and cpana are bigint IDs (may be scientific notation) → clean int strings
+    export["workpermit"]         = df2["workpermit"].apply(_to_bigint_str)
+    export["workpermitfilename"] = df2["workpermitfilename"].astype(str).str.strip()
+    export["cpana"]              = df2["cpana"].apply(_to_bigint_str)
+    export["cpanafilename"]      = df2["cpanafilename"].astype(str).str.strip()
 
-    export.insert(0, "id", [str(uuid.uuid4()) for _ in range(len(export))])
-    export.insert(1, "application_number", export["apprefno"].astype(str).str.strip())
-    export.insert(2, "file_name", (source_file_name or "").strip())
-    export.insert(len(export.columns), "source_row_no", range(1, len(export) + 1))
+    n = len(export)
+    export.insert(0, "id",                 [str(uuid.uuid4()) for _ in range(n)])
+    export.insert(1, "application_number", df2["apprefno"].astype(str).str.strip())
+    export["source_row_no"] = range(1, n + 1)
 
-    _progress(f"managing_directors:prepare:done rows={len(export)}")
+    _progress(f"managing_directors:prepare:done rows={n}")
 
+    # Final column order MUST match CREATE TABLE above.
     export = export[[
         "id",
         "application_number",
         "name",
-        "demail",
-        "phoneno",
-        "conadd",
+        "email",
+        "mobile_no",
+        "contact_address",
         "countryname",
-        "nationality1",
+        "nationality",
         "workpermit",
         "workpermitfilename",
         "cpana",
         "cpanafilename",
-        "file_name",
         "source_row_no",
     ]]
 
@@ -171,7 +216,12 @@ def import_managing_directors_via_staging_copy(
         _progress(f"managing_directors:copy:start total_rows={total}")
         for buf, copied_now in _iter_csv_chunks(export, chunk_rows=50000):
             cur.copy_expert(
-                "COPY public.stage_ca_managing_directors_raw FROM STDIN WITH CSV HEADER",
+                """COPY public.stage_ca_managing_directors_raw (
+                    id, application_number, name, email, mobile_no,
+                    contact_address, countryname, nationality,
+                    workpermit, workpermitfilename,
+                    cpana, cpanafilename, source_row_no
+                ) FROM STDIN WITH CSV HEADER""",
                 buf,
             )
             copied = copied_now
@@ -187,129 +237,163 @@ def import_managing_directors_via_staging_copy(
 
     transform_sql = text(
         """
-        -- Ensure target columns exist
-        ALTER TABLE IF EXISTS public.ca_managing_directors
-            ADD COLUMN IF NOT EXISTS logic_doc_id bigint;
-
-        ALTER TABLE IF EXISTS public.ca_managing_directors
-            ADD COLUMN IF NOT EXISTS work_permit_id bigint;
+        -- Ensure all required columns exist on the target table.
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS work_permit               bigint;
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS work_permit_filename      character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS cpana                     bigint;
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS cpana_filename            character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS national_id_number        character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS passport_number           character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS birth_date                character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS gender                    character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS first_name                character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS middle_name               character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS last_name                 character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid;
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS email                         character varying(255);
+        ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS nationality                   character varying(255);
+        -- NOTE: We intentionally do NOT create/use application_id/contact_address/work_permit/cpana_filename
+        -- because your current public.managing_directors table doesn't have those columns.
 
         WITH s_norm AS (
             SELECT
                 s.id,
-                NULLIF(trim(s.application_number), '') AS application_number,
-                NULLIF(trim(s.name), '') AS md_name,
-                NULLIF(trim(s.email), '') AS email,
-                NULLIF(trim(s.mobile_no), '') AS mobile_no,
-                NULLIF(trim(s.contact_address), '') AS contact_address,
-                NULLIF(trim(s.countryname), '') AS country,
-                NULLIF(trim(s.nationality1), '') AS nationality1_raw,
-                NULLIF(trim(s.workpermit), '') AS workpermit_raw,
-                NULLIF(trim(s.workpermitfilename), '') AS work_permit_filename,
-                NULLIF(trim(s.cpana), '') AS cpana_raw,
-                NULLIF(trim(s.cpanafilename), '') AS copy_of_id_filename,
-                COALESCE(NULLIF(trim(s.source_row_no::text), '')::bigint, 0) AS source_row_no
+                NULLIF(trim(s.application_number), '')  AS application_number,
+                NULLIF(trim(s.name), '')                AS md_name,
+                NULLIF(trim(s.email), '')               AS email,
+                NULLIF(trim(s.mobile_no), '')           AS mobile_no,
+                NULLIF(trim(s.contact_address), '')     AS contact_address,
+                NULLIF(trim(s.countryname), '')         AS country,
+                -- nationality already resolved to country name in Python
+                -- Normalize to enum: TANZANIAN | NON_TANZANIAN | NULL
+                CASE
+                    WHEN LOWER(TRIM(s.nationality)) = 'tanzanian'          THEN 'TANZANIAN'
+                    WHEN LOWER(TRIM(s.nationality)) LIKE '%non%tanzanian%' THEN 'NON_TANZANIAN'
+                    WHEN LOWER(TRIM(s.nationality)) = 'non-tanzanian'      THEN 'NON_TANZANIAN'
+                    ELSE NULL
+                END                                    AS nationality,
+                -- workpermit and cpana are already clean integer strings from Python
+                CASE
+                    WHEN NULLIF(trim(s.workpermit), '') IS NULL THEN NULL
+                    WHEN trim(s.workpermit) ~ '^[0-9]+$'       THEN trim(s.workpermit)::bigint
+                    ELSE NULL
+                END AS work_permit,
+                NULLIF(trim(s.workpermitfilename), '')  AS work_permit_filename,
+                CASE
+                    WHEN NULLIF(trim(s.cpana), '') IS NULL THEN NULL
+                    WHEN trim(s.cpana) ~ '^[0-9]+$'       THEN trim(s.cpana)::bigint
+                    ELSE NULL
+                END AS cpana_val,
+                NULLIF(trim(s.cpanafilename), '')       AS cpana_filename,
+                s.source_row_no,
+                (NULLIF(trim(s.workpermit), '') IS NOT NULL
+                    AND trim(s.workpermit) !~ '^[0-9]+$') AS invalid_workpermit,
+                (NULLIF(trim(s.cpana), '') IS NOT NULL
+                    AND trim(s.cpana) !~ '^[0-9]+$')      AS invalid_cpana
             FROM public.stage_ca_managing_directors_raw s
         ),
         joined AS (
             SELECT
                 sn.*,
-                a.id AS application_id,
-                -- nationality: map nationality1 (id) -> countries.countryname
-                COALESCE(
-                    c.countryname,
-                    sn.country
-                ) AS nationality_name,
-                -- safe bigint parsing
-                CASE
-                    WHEN sn.workpermit_raw ~ '^[0-9]+$' THEN sn.workpermit_raw::bigint
-                    WHEN sn.workpermit_raw ~ '^[0-9]+\\.0$' THEN replace(sn.workpermit_raw, '.0', '')::bigint
-                    ELSE NULL
-                END AS work_permit_id,
-                CASE
-                    WHEN sn.cpana_raw ~ '^[0-9]+$' THEN sn.cpana_raw::bigint
-                    WHEN sn.cpana_raw ~ '^[0-9]+\\.0$' THEN replace(sn.cpana_raw, '.0', '')::bigint
-                    ELSE NULL
-                END AS logic_doc_id,
-                (sn.nationality1_raw IS NOT NULL AND sn.nationality1_raw !~ '^[0-9]+(\\.0)?$') AS invalid_nationality1,
-                (sn.workpermit_raw IS NOT NULL AND sn.workpermit_raw !~ '^[0-9]+(\\.0)?$') AS invalid_workpermit,
-                (sn.cpana_raw IS NOT NULL AND sn.cpana_raw !~ '^[0-9]+(\\.0)?$') AS invalid_cpana
+                asd.id AS application_sector_detail_id
             FROM s_norm sn
-            LEFT JOIN public.ca_applications a
+            LEFT JOIN public.applications a
                 ON a.application_number IS NOT DISTINCT FROM sn.application_number
-            LEFT JOIN public.countries c
-                ON (
-                    sn.nationality1_raw ~ '^[0-9]+$'
-                    AND c.countriesid = sn.nationality1_raw::bigint
-                )
+            LEFT JOIN public.application_sector_details asd
+                ON asd.application_id = a.id
         ),
         eligible AS (
             SELECT j.*
             FROM joined j
-            WHERE j.application_id IS NOT NULL
+            WHERE j.application_sector_detail_id IS NOT NULL
               AND j.md_name IS NOT NULL
               AND NOT EXISTS (
                   SELECT 1
-                  FROM public.ca_managing_directors x
-                  WHERE x.application_id = j.application_id
-                    AND lower(trim(x.name)) = lower(trim(j.md_name))
+                  FROM public.managing_directors x
+                  WHERE lower(trim(x.name)) = lower(trim(j.md_name))
+                    AND x.application_sector_detail_id = j.application_sector_detail_id
               )
         ),
         ins AS (
-            INSERT INTO public.ca_managing_directors (
+            INSERT INTO public.managing_directors (
                 id,
                 created_at,
                 updated_at,
-                application_id,
+                application_sector_detail_id,
                 name,
+                first_name,
+                middle_name,
+                last_name,
                 email,
                 mobile_no,
-                contact_address,
                 country,
                 nationality,
                 work_permit,
-                work_permit_id,
-                copy_of_id,
-                logic_doc_id
+                work_permit_filename,
+                cpana,
+                cpana_filename
             )
             SELECT
                 e.id,
-                now() AS created_at,
-                now() AS updated_at,
-                e.application_id,
-                e.md_name AS name,
+                now()                          AS created_at,
+                now()                          AS updated_at,
+                e.application_sector_detail_id,
+                e.md_name                      AS name,
+                split_part(trim(e.md_name), ' ', 1) AS first_name,
+                CASE
+                    WHEN array_length(regexp_split_to_array(trim(e.md_name), '\\s+'), 1) <= 2
+                    THEN NULL
+                    ELSE regexp_replace(trim(e.md_name), '^\\S+\\s+(.+)\\s+\\S+$', '\\1')
+                END                            AS middle_name,
+                CASE
+                    WHEN array_length(regexp_split_to_array(trim(e.md_name), '\\s+'), 1) = 1
+                    THEN NULL
+                    ELSE regexp_replace(trim(e.md_name), '^.*\\s+(\\S+)$', '\\1')
+                END                            AS last_name,
                 e.email,
                 e.mobile_no,
-                e.contact_address,
                 e.country,
-                e.nationality_name AS nationality,
-                e.work_permit_filename AS work_permit,
-                e.work_permit_id,
-                e.copy_of_id_filename AS copy_of_id,
-                e.logic_doc_id
+                e.nationality,
+                e.work_permit,
+                e.work_permit_filename,
+                e.cpana_val                    AS cpana,
+                e.cpana_filename               AS cpana_filename
             FROM eligible e
             ON CONFLICT (id) DO NOTHING
             RETURNING 1
         ),
         stats AS (
             SELECT
-                (SELECT COUNT(*) FROM joined) AS processed_rows,
-                (SELECT COUNT(*) FROM ins) AS inserted_rows,
-                (SELECT COUNT(*) FROM joined WHERE application_id IS NULL) AS skipped_missing_application,
-                (SELECT COUNT(*) FROM joined WHERE application_id IS NOT NULL AND md_name IS NULL) AS skipped_missing_name,
+                (SELECT COUNT(*) FROM joined)                                    AS processed_rows,
+                (SELECT COUNT(*) FROM ins)                                       AS inserted_rows,
+                (SELECT COUNT(*) FROM joined WHERE application_sector_detail_id IS NULL) AS skipped_missing_application,
+                (SELECT COUNT(*) FROM joined
+                    WHERE application_sector_detail_id IS NOT NULL AND md_name IS NULL) AS skipped_missing_name,
                 (SELECT COUNT(*) FROM joined j
-                    WHERE j.application_id IS NOT NULL
+                    WHERE j.application_sector_detail_id IS NOT NULL
                       AND j.md_name IS NOT NULL
                       AND EXISTS (
-                          SELECT 1
-                          FROM public.ca_managing_directors x
-                          WHERE x.application_id = j.application_id
-                            AND lower(trim(x.name)) = lower(trim(j.md_name))
+                          SELECT 1 FROM public.managing_directors x
+                          WHERE lower(trim(x.name)) = lower(trim(j.md_name))
+                            AND x.application_sector_detail_id = j.application_sector_detail_id
                       )
-                ) AS skipped_already_exists,
-                (SELECT COUNT(*) FROM joined WHERE invalid_nationality1) AS invalid_nationality1,
-                (SELECT COUNT(*) FROM joined WHERE invalid_workpermit) AS invalid_workpermit,
-                (SELECT COUNT(*) FROM joined WHERE invalid_cpana) AS invalid_cpana
+                )                                                                AS skipped_already_exists,
+                (SELECT COUNT(*) FROM joined WHERE invalid_workpermit)           AS invalid_workpermit,
+                (SELECT COUNT(*) FROM joined WHERE invalid_cpana)                AS invalid_cpana
         )
         SELECT
             processed_rows,
@@ -318,7 +402,6 @@ def import_managing_directors_via_staging_copy(
             skipped_missing_application,
             skipped_missing_name,
             skipped_already_exists,
-            invalid_nationality1,
             invalid_workpermit,
             invalid_cpana
         FROM stats;
@@ -327,22 +410,22 @@ def import_managing_directors_via_staging_copy(
 
     row = db.execute(transform_sql).first()
     if not row:
-        row = (staged_total, 0, staged_total, 0, 0, 0, 0, 0, 0)
+        row = (staged_total, 0, staged_total, 0, 0, 0, 0, 0)
 
-    processed_rows = int(row[0] or 0)
-    inserted_rows = int(row[1] or 0)
-    skipped_total = int(row[2] or 0)
+    processed_rows              = int(row[0] or 0)
+    inserted_rows               = int(row[1] or 0)
+    skipped_total               = int(row[2] or 0)
     skipped_missing_application = int(row[3] or 0)
-    skipped_missing_name = int(row[4] or 0)
-    skipped_already_exists = int(row[5] or 0)
-    invalid_nationality1 = int(row[6] or 0)
-    invalid_workpermit = int(row[7] or 0)
-    invalid_cpana = int(row[8] or 0)
+    skipped_missing_name        = int(row[4] or 0)
+    skipped_already_exists      = int(row[5] or 0)
+    invalid_workpermit          = int(row[6] or 0)
+    invalid_cpana               = int(row[7] or 0)
 
     _progress(
         "managing_directors:transform:done "
         f"processed={processed_rows} inserted={inserted_rows} skipped={skipped_total} "
-        f"missing_app={skipped_missing_application} missing_name={skipped_missing_name} already_exists={skipped_already_exists}"
+        f"missing_app={skipped_missing_application} missing_name={skipped_missing_name} "
+        f"already_exists={skipped_already_exists}"
     )
 
     result = {
@@ -357,10 +440,12 @@ def import_managing_directors_via_staging_copy(
             "already_exists": skipped_already_exists,
         },
         "diagnostics": {
-            "invalid_nationality1": invalid_nationality1,
             "invalid_workpermit": invalid_workpermit,
             "invalid_cpana": invalid_cpana,
-            "note": "Rows are skipped when application_number doesn't match ca_applications, name is blank, or an existing managing director with same name already exists for that application.",
+            "note": (
+                "Rows are skipped when application_number has no match in public.applications, "
+                "name is blank, or a director with the same name already exists for that application."
+            ),
         },
     }
 
@@ -375,9 +460,11 @@ def _fetch_skip_samples(db: Any, *, limit: int = 10) -> dict:
     """Return small sample rows from staging to explain why inserts might be 0."""
     from sqlalchemy import text
 
-    reg = db.execute(text("select to_regclass('public.stage_ca_managing_directors_raw')")).scalar()
+    reg = db.execute(
+        text("SELECT to_regclass('public.stage_ca_managing_directors_raw')")
+    ).scalar()
     if not reg:
-        return {"note": "staging table public.stage_ca_managing_directors_raw does not exist in this DB/session"}
+        return {"note": "staging table public.stage_ca_managing_directors_raw does not exist"}
 
     samples = {}
 
@@ -386,9 +473,9 @@ def _fetch_skip_samples(db: Any, *, limit: int = 10) -> dict:
         for r in db.execute(
             text(
                 """
-                SELECT s.source_row_no, s.application_number, s.name, s.demail
+                SELECT s.source_row_no, s.application_number, s.name, s.email
                 FROM public.stage_ca_managing_directors_raw s
-                LEFT JOIN public.ca_applications a
+                LEFT JOIN public.applications a
                   ON a.application_number IS NOT DISTINCT FROM NULLIF(trim(s.application_number), '')
                 WHERE a.id IS NULL
                 ORDER BY s.source_row_no
@@ -404,7 +491,7 @@ def _fetch_skip_samples(db: Any, *, limit: int = 10) -> dict:
         for r in db.execute(
             text(
                 """
-                SELECT s.source_row_no, s.application_number, s.name, s.demail
+                SELECT s.source_row_no, s.application_number, s.name, s.email
                 FROM public.stage_ca_managing_directors_raw s
                 WHERE NULLIF(trim(s.name), '') IS NULL
                 ORDER BY s.source_row_no
@@ -420,13 +507,15 @@ def _fetch_skip_samples(db: Any, *, limit: int = 10) -> dict:
         for r in db.execute(
             text(
                 """
-                SELECT s.source_row_no, s.application_number, s.name, s.demail
+                SELECT s.source_row_no, s.application_number, s.name, s.email
                 FROM public.stage_ca_managing_directors_raw s
-                JOIN public.ca_applications a
+                JOIN public.applications a
                   ON a.application_number IS NOT DISTINCT FROM NULLIF(trim(s.application_number), '')
-                JOIN public.ca_managing_directors x
-                  ON x.application_id = a.id
-                 AND lower(trim(x.name)) = lower(trim(NULLIF(trim(s.name), '')))
+                                JOIN public.application_sector_details asd
+                                    ON asd.application_id = a.id
+                                JOIN public.managing_directors x
+                                    ON x.application_sector_detail_id = asd.id
+                                 AND lower(trim(x.name)) = lower(trim(NULLIF(trim(s.name), '')))
                 ORDER BY s.source_row_no
                 LIMIT :limit
                 """

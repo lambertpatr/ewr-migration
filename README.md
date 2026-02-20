@@ -1,6 +1,77 @@
 # Ewura Migration (FastAPI)
 
-This repo contains a FastAPI service and SQL scripts used to migrate data into the eService database using a **fast staging + Postgres COPY + SQL transform** approach.
+This repo contains a FastAPI service and SQL scripts used to migrate d## Troubleshooting
+
+### "ON CONFLICT DO UPDATE command cannot affect row a second time"
+This happens when a single bulk insert statement tries to upsert the same unique key more than once.
+
+Fix implemented: the LOIS users import deduplicates staging rows per `username` before the bulk upsert.
+
+### "No data / looks stuck"
+Use the job status endpoint(s) and server logs. The high-volume import path logs progress during:
+
+- staging table creation
+- COPY streaming
+- SQL transform
+
+---
+
+## Switching between environments (Test / Staging / Production)
+
+The project ships with three named environment files and a helper script so you can safely switch target databases without editing `.env` by hand.
+
+### Environment files
+
+| File | Environment | Status |
+|---|---|---|
+| `.env.test` | Local / test database | ✅ Active development |
+| `.env.staging` | Staging database | ✅ Pre-production verification |
+| `.env.production` | Production database | ⚠️ Live — use with extreme caution |
+
+All three files are listed in `.gitignore` — credentials are never committed.
+
+### `use-env.sh` — the switch script
+
+```bash
+# Switch to staging
+./use-env.sh staging
+
+# Switch to production
+./use-env.sh production
+
+# Switch back to test
+./use-env.sh test
+
+# Print which DB is currently active (password masked)
+./use-env.sh show
+```
+
+After switching, **restart the server** so the new `.env` is loaded:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+### Current connections
+
+| Environment | Host | Database |
+|---|---|---|
+| `test` | `10.1.8.144:5432` | `auth_migration_v2` |
+| `staging` | `10.1.8.144:5432` | `eservice_applications` |
+| `production` | `<PRODUCTION_HOST>:5432` | `<PRODUCTION_DB>` |
+
+> Fill in `<PRODUCTION_HOST>` and `<PRODUCTION_DB>` inside `.env.production` when the production server is ready.
+
+> ⚠️ **Always run `./use-env.sh show` before executing a schema sync or bulk migration** to confirm you are targeting the intended database.
+
+---
+
+## Safety notes
+
+- Always verify which database you're connected to before running schema sync.
+- Schema sync is intentionally additive for missing columns, but **does drop unique constraints** as requested.
+- Prefer running large migrations in a maintenance window.
+- **Never point the server at production without a tested, verified migration run on staging first.**ce database using a **fast staging + Postgres COPY + SQL transform** approach.
 
 ## What’s included
 

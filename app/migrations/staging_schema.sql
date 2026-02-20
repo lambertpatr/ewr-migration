@@ -4,6 +4,7 @@
 
 BEGIN;
 
+-- NOTE: stage table name is kept as-is to avoid changing Python pipeline code.
 CREATE TABLE IF NOT EXISTS public.stage_ca_applications_raw (
     generated_id uuid PRIMARY KEY,
     source_row_no integer,
@@ -26,6 +27,7 @@ CREATE TABLE IF NOT EXISTS public.stage_ca_applications_raw (
     website text,
     latitude text,
     longitude text,
+    po_box text,
 
     facility_name text,
     company_name text,
@@ -47,8 +49,12 @@ CREATE TABLE IF NOT EXISTS public.stage_ca_applications_raw (
     -- mapping columns that may be either UUID or free text in Excel
     application_legal_status_raw text,
     license_category_raw text,
+    license_type text,
 
     username text,
+
+    -- provenance flag (true for LOIS-migrated rows)
+    is_from_lois boolean NOT NULL DEFAULT true,
 
     -- Fire certificate fields
     fire_certificate_control_number text,
@@ -80,6 +86,11 @@ CREATE TABLE IF NOT EXISTS public.stage_ca_applications_raw (
     title text
 );
 
+-- Ensure new columns exist even if table was already created
+ALTER TABLE public.stage_ca_applications_raw ADD COLUMN IF NOT EXISTS license_type text;
+ALTER TABLE public.stage_ca_applications_raw ADD COLUMN IF NOT EXISTS is_from_lois boolean NOT NULL DEFAULT true;
+ALTER TABLE public.stage_ca_applications_raw ADD COLUMN IF NOT EXISTS po_box text;
+
 -- One contact person per application (matches unique(application_id) in final)
 CREATE TABLE IF NOT EXISTS public.stage_ca_contact_persons_raw (
     id uuid PRIMARY KEY,
@@ -98,6 +109,8 @@ CREATE TABLE IF NOT EXISTS public.stage_ca_contact_persons_raw (
 CREATE TABLE IF NOT EXISTS public.stage_ca_documents_raw (
     id uuid PRIMARY KEY,
     application_generated_id uuid NOT NULL,
+    -- In the NEW schema, documents belong to application_sector_details, not applications.
+    -- We stage against the application first, then resolve to the sector-detail row.
     document_name text NOT NULL,
     file_name text NOT NULL,
     documents_order integer,
@@ -112,5 +125,34 @@ CREATE TABLE IF NOT EXISTS public.stage_ca_documents_raw (
 -- Helpful indexes for transforms
 CREATE INDEX IF NOT EXISTS idx_stage_docs_app_gen_id ON public.stage_ca_documents_raw(application_generated_id);
 CREATE INDEX IF NOT EXISTS idx_stage_contact_app_gen_id ON public.stage_ca_contact_persons_raw(application_generated_id);
+
+-------------------------------------------------------------------------------
+-- Shareholders staging (used by the normalized shareholders insert)
+-------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.stage_ca_shareholders_raw (
+    id uuid PRIMARY KEY,
+
+    -- join key back to application
+    application_number text,
+
+    -- raw shareholder fields from Excel (kept as text for COPY safety)
+    file_name text,
+    shname text,
+    amountofshare text,
+    sconadd text,
+    indcomp text,
+    nationality text,
+    countryname text,
+    rowid text,
+    objectid text,
+    source_row_no bigint
+);
+
+CREATE INDEX IF NOT EXISTS idx_stage_shareholders_app_no ON public.stage_ca_shareholders_raw(application_number);
+
+CREATE TABLE IF NOT EXISTS public.stage_categories (
+    name text,
+    sector_name text
+);
 
 COMMIT;

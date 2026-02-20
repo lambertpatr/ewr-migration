@@ -20,19 +20,17 @@ def import_license_categories_and_fees_via_staging_copy(
 
     Contract
     - Input df: output of read_users_file() (already normalized columns in your codebase).
-    - Category name: df['categoryorclass'] -> public.license_categories.name
-    - sector_id: looked up from public.ca_sectors by sector_name
-    - years_eligible: default 2
-    - If license_categories row already exists (same sector_id + case-insensitive trimmed name), do not insert.
+    - Category name: df['categoryorclass'] -> public.categories.name
+    - sector_id: looked up from public.sectors by sector_name
+    - If categories row already exists (same sector_id + case-insensitive trimmed name), do not insert.
     - Then create public.application_category_fees rows using mapping columns.
 
     Dedupe policy
-    - license_categories: unique by (sector_id, lower(trim(name)))
+    - categories: unique by (sector_id, lower(trim(name)))
     - application_category_fees: if a row already exists for the same category_id + application_type + prefixes + capacity range + months_eligible, skip.
 
     Returns: stats dict with inserted/skipped counts.
     """
-
     def _progress(msg: str):
         if progress_cb:
             progress_cb(msg)
@@ -92,13 +90,27 @@ def import_license_categories_and_fees_via_staging_copy(
 
     # Sector lookup
     _progress(f"Looking up sector_id for sector '{sector_name}'...")
+
+    # Map human-readable input names to the new database enum-style names.
+    sector_name_map = {
+        "Natural Gas": "NATURAL_GAS",
+        "Petroleum": "PETROLEUM",
+        "Electricity": "ELECTRICITY",
+        "Water & Wastewater": "WATER_SUPPLY",
+    }
+    db_sector_name = sector_name_map.get(sector_name)
+    if not db_sector_name:
+        raise ValueError(
+            f"Invalid sector_name '{sector_name}'. Expected one of: {list(sector_name_map.keys())}"
+        )
+
     sector_id = db.execute(
-        text("SELECT id FROM public.ca_sectors WHERE name = :name"),
-        {"name": sector_name},
+        text("SELECT id FROM public.sectors WHERE name = :name"),
+        {"name": db_sector_name},
     ).scalar()
     if not sector_id:
         raise ValueError(
-            f"Sector '{sector_name}' not found in ca_sectors. Expected one of: Natural Gas, Petroleum, Electricity, Water & Wastewater"
+            f"Sector '{db_sector_name}' not found in public.sectors. Please ensure the sectors table is populated."
         )
 
     stage = "public.stage_license_category_fees_raw"
@@ -127,18 +139,18 @@ def import_license_categories_and_fees_via_staging_copy(
         )
     )
 
-    # Ensure license_categories has the columns we want to set during insert.
+    # Ensure categories has the columns we want to set during insert.
     # (This keeps the importer self-contained if migrations haven't been run.)
     db.execute(
         text(
             """
-            ALTER TABLE IF EXISTS public.license_categories
+            ALTER TABLE IF EXISTS public.categories
                 ADD COLUMN IF NOT EXISTS sub_sector_type character varying;
 
-            ALTER TABLE IF EXISTS public.license_categories
+            ALTER TABLE IF EXISTS public.categories
                 ADD COLUMN IF NOT EXISTS code character varying;
 
-            ALTER TABLE IF EXISTS public.license_categories
+            ALTER TABLE IF EXISTS public.categories
                 ADD COLUMN IF NOT EXISTS category_type character varying;
             """
         )
@@ -289,19 +301,19 @@ def import_license_categories_and_fees_via_staging_copy(
                 FROM raw_names rn
                 WHERE NOT EXISTS (
                     SELECT 1
-                    FROM public.license_categories lc
+                    FROM public.categories lc
                     WHERE lower(btrim(lc.name)) = rn.key_name
                       AND lc.deleted_at IS NULL
                 )
             )
-            INSERT INTO public.license_categories (
+            INSERT INTO public.categories (
                 id,
                 name,
                 code,
                 sector_id,
-                years_eligible,
                 sub_sector_type,
                 category_type,
+                is_approved,
                 created_at,
                 updated_at
             )
@@ -310,7 +322,6 @@ def import_license_categories_and_fees_via_staging_copy(
                 m.display_name,
                 COALESCE(NULLIF(btrim(m.first_license_prefix), ''), m.display_name),
                 :sector_id,
-                2,
                 'OPERATIONAL',
                 CASE
                     WHEN EXISTS (
@@ -321,6 +332,7 @@ def import_license_categories_and_fees_via_staging_copy(
                     ) THEN 'Construction'
                     ELSE 'License'
                 END,
+                false,
                 now(),
                 now()
             FROM missing m
@@ -351,7 +363,7 @@ def import_license_categories_and_fees_via_staging_copy(
                             lc.id
                     ) AS rn
                 FROM {stage} s
-                JOIN public.license_categories lc
+                JOIN public.categories lc
                   ON lower(btrim(lc.name)) = lower(btrim(s.categoryorclass))
                  AND lc.deleted_at IS NULL
                 WHERE s.categoryorclass IS NOT NULL AND btrim(s.categoryorclass) <> ''
@@ -384,7 +396,7 @@ def import_license_categories_and_fees_via_staging_copy(
                                 regexp_replace(
                                     upper(
                                         CASE
-                                            WHEN :sector_name = 'Electricity' THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
+                                            WHEN :db_sector_name = 'ELECTRICITY' THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
                                             ELSE 'OPERATIONAL'
                                         END
                                     ),
@@ -406,7 +418,7 @@ def import_license_categories_and_fees_via_staging_copy(
                                 regexp_replace(
                                     upper(
                                         CASE
-                                            WHEN :sector_name = 'Electricity' THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
+                                            WHEN :db_sector_name = 'ELECTRICITY' THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
                                             ELSE 'OPERATIONAL'
                                         END
                                     ),
@@ -426,9 +438,9 @@ def import_license_categories_and_fees_via_staging_copy(
                     NULLIF(btrim(s.nocustomerto), '') AS no_customer_to,
                     upper(
                         CASE
-                            WHEN :sector_name IN ('Natural Gas', 'Water & Wastewater') THEN
+                            WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
                                 COALESCE(NULLIF(btrim(s.applicationtype), ''), 'NEW')
-                            WHEN :sector_name = 'Electricity' THEN
+                            WHEN :db_sector_name = 'ELECTRICITY' THEN
                                 'NEW'
                             ELSE
                                 COALESCE(NULLIF(btrim(s.licencetype), ''), 'NEW')
@@ -438,13 +450,13 @@ def import_license_categories_and_fees_via_staging_copy(
                     -- numeric safe casting for capacities/fees
                     -- Natural Gas + Water & Wastewater: do NOT invent capacity ranges; keep NULL when not provided.
                     CASE
-                        WHEN :sector_name IN ('Natural Gas', 'Water & Wastewater') THEN
+                        WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
                             CASE WHEN btrim(s.acapacityfrom) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityfrom))::numeric ELSE NULL END
                         ELSE
                             CASE WHEN btrim(s.acapacityfrom) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityfrom))::numeric ELSE 1 END
                     END AS capacity_from,
                     CASE
-                        WHEN :sector_name IN ('Natural Gas', 'Water & Wastewater') THEN
+                        WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
                             CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE NULL END
                         ELSE
                             CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE 10 END
@@ -546,7 +558,7 @@ def import_license_categories_and_fees_via_staging_copy(
             RETURNING 1;
             """
         ),
-        {"sector_name": sector_name},
+        {"db_sector_name": db_sector_name},
     )
 
     after_fee_count = db.execute(
@@ -566,7 +578,7 @@ def import_license_categories_and_fees_via_staging_copy(
                 FROM {stage}
                 WHERE categoryorclass IS NOT NULL AND btrim(categoryorclass) <> ''
             ) x
-            JOIN public.license_categories lc
+            JOIN public.categories lc
               ON lc.sector_id = :sector_id
              AND lower(btrim(lc.name)) = x.key_name
              AND lc.deleted_at IS NULL;
@@ -592,7 +604,7 @@ def import_license_categories_and_fees_via_staging_copy(
                                 regexp_replace(
                                     upper(
                                         CASE
-                                            WHEN :sector_name = 'Electricity' THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
+                                            WHEN :db_sector_name = 'ELECTRICITY' THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
                                             ELSE 'OPERATIONAL'
                                         END
                                     ),
@@ -614,7 +626,7 @@ def import_license_categories_and_fees_via_staging_copy(
                                 regexp_replace(
                                     upper(
                                         CASE
-                                            WHEN :sector_name = 'Electricity' THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
+                                            WHEN :db_sector_name = 'ELECTRICITY' THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
                                             ELSE 'OPERATIONAL'
                                         END
                                     ),
@@ -634,22 +646,22 @@ def import_license_categories_and_fees_via_staging_copy(
                     NULLIF(btrim(s.nocustomerto), '') AS no_customer_to,
                     upper(
                         CASE
-                            WHEN :sector_name IN ('Natural Gas', 'Water & Wastewater') THEN
+                            WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
                                 COALESCE(NULLIF(btrim(s.applicationtype), ''), 'NEW')
-                            WHEN :sector_name = 'Electricity' THEN
+                            WHEN :db_sector_name = 'ELECTRICITY' THEN
                                 'NEW'
                             ELSE
                                 COALESCE(NULLIF(btrim(s.licencetype), ''), 'NEW')
                         END
                     ) AS application_type,
                     CASE
-                        WHEN :sector_name IN ('Natural Gas', 'Water & Wastewater') THEN
+                        WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
                             CASE WHEN btrim(s.acapacityfrom) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityfrom))::numeric ELSE NULL END
                         ELSE
                             CASE WHEN btrim(s.acapacityfrom) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityfrom))::numeric ELSE 1 END
                     END AS capacity_from,
                     CASE
-                        WHEN :sector_name IN ('Natural Gas', 'Water & Wastewater') THEN
+                        WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
                             CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE NULL END
                         ELSE
                             CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE 10 END
@@ -678,7 +690,7 @@ def import_license_categories_and_fees_via_staging_copy(
             ) x;
             """
         ),
-        {"sector_name": sector_name},
+        {"db_sector_name": db_sector_name},
     ).scalar() or 0
     skipped_fees_existing = max(0, int(deduped_count) - int(inserted_fees))
 

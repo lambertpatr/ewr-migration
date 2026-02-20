@@ -197,8 +197,59 @@ def _load_map_from_csv_module(rel_path: str) -> Dict[str, str]:
     return out
 
 
-# Preload ward map at module import time (fast, done once)
-ward_map = _load_map_from_csv_module('data/ward_map.csv')
+def _load_id_name_map(rel_path: str) -> Dict[str, str]:
+    """Load an (id,name) CSV from app/data into a lookup dict.
+
+    - Works with quoted or unquoted CSV.
+    - Skips a header row like: id,name
+    - Adds normalized numeric keys to handle scientific notation strings.
+    """
+
+    out: Dict[str, str] = {}
+    base_dir = os.path.dirname(__file__)
+    csv_path = os.path.normpath(os.path.join(base_dir, '..', rel_path))
+    if not os.path.exists(csv_path):
+        return out
+
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as fh:
+            reader = csv.reader(fh)
+            for r in reader:
+                if not r or all(not str(x).strip() for x in r):
+                    continue
+
+                key = str(r[0]).strip().strip('"')
+                val = (str(r[1]).strip().strip('"') if len(r) > 1 else '')
+
+                # Skip header row
+                if key.lower() in ('id', 'ward_id', 'district_id', 'region_id') and val.lower() in ('name',):
+                    continue
+
+                if not key:
+                    continue
+
+                out[key] = val
+
+                # Add normalized numeric key too (handles things like 1.554087241741e+12)
+                try:
+                    nk = _normalize_numeric_string(key)
+                    if nk and nk != key:
+                        out[nk] = val
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.exception("Failed loading id->name mapping CSV %s: %s", csv_path, e)
+        return {}
+
+    return out
+
+
+# Preload lookup maps at module import time (fast, done once)
+region_map_csv = _load_id_name_map('data/regions.csv')
+district_map_csv = _load_id_name_map('data/districts.csv')
+ward_map_csv = _load_id_name_map('data/wards.csv')
+# Alias for backward compatibility
+ward_map = ward_map_csv
 
 
 def _detect_attachment_pairs_from_cols(cols: List[str]) -> List[Tuple[str, str, str]]:
@@ -227,75 +278,139 @@ def _detect_attachment_pairs_from_cols(cols: List[str]) -> List[Tuple[str, str, 
 def _build_default_mappings():
     """Return the explicit mappings requested by the user.
 
-    This maps Excel column names to `ca_applications` column names and
+    This maps Excel column names to staging column names and
     returns the fixed attachments specification.
+
+    MASTER MAPPING TABLE (Excel column -> staging/DB column):
+    ─────────────────────────────────────────────────────────
+    APPLICATION / ASD columns (direct):
+      address_code                -> address_code
+      address_no                  -> address_no
+      block_no                    -> block_no
+      district                    -> district   (mapped ID->name via districts.csv)
+      region                      -> region     (mapped ID->name via regions.csv)
+      ward                        -> ward       (mapped ID->name via wards.csv)
+      street                      -> street
+      road                        -> road
+      plot_no                     -> plot_no
+      facility_name               -> facility_name
+      company_name                -> company_name
+      latitude                    -> latitude
+      longitude                   -> longitude
+      mobile_no                   -> mobile_no
+      po_box                      -> po_box
+      website                     -> website
+      tin                         -> tin
+      tin_name                    -> tin_name
+      brela_number                -> brela_number
+      brela_registration_type     -> brela_registration_type
+      certificate_of_incorporation_no -> certificate_of_incorporation_no
+      email                       -> email
+
+    APPLICATION meta columns:
+      application_number          -> application_number
+      application_type            -> application_type  (uppercased)
+      approval_no                 -> approval_no
+      effective_date              -> effective_date    (ISO date)
+      expire_date                 -> expire_date       (ISO date)
+      completed_at                -> completed_at
+      license_type                -> license_type
+      license_category_id         -> license_category_raw (staging)
+      application_legal_status_id -> application_legal_status_raw (staging)
+      userid                      -> username
+      created_by                  -> old_created_by
+      parent_application_id       -> old_parent_application_id
+
+    FIRE certificate columns (Excel f... -> staging fire_*):
+      fcontrolno                  -> fire_certificate_control_number
+      fpremisename                -> fire_premise_name
+      fregion                     -> fire_region
+      fdistrict                   -> fire_district
+      fadministrativearea         -> fire_administrative_area
+      fward                       -> fire_ward
+      fstreet                     -> fire_street
+      fvalidfrom                  -> fire_valid_from
+      fvalidto                    -> fire_valid_to
+
+    INSURANCE / TIRA columns (Excel tira... -> staging cover_note_*/insurance_*):
+      covernoterefno              -> cover_note_ref_no
+      tiracovernotenumber         -> cover_note_number
+      tiracovernotereferencenumber -> insurance_ref_no
+      tirapolicyholdername        -> policy_holder_name
+      tirainsurercompanyname      -> insurer_company_name
+      tiracovernotestartdate      -> cover_note_start_date
+      tiracovernotenddate         -> cover_note_end_date
+      tirariskname                -> risk_name
+      tirasubjectmatterdesc       -> subject_matter_desc
     """
-    # 1) Direct 1-to-1 mappings (Excel -> ca_applications)
+    # ── APPLICATION / ASD fields ──────────────────────────────────────────────
     excel_to_app = {
-        'address_code': 'address_code',
-        'address_no': 'address_no',
-        'application_number': 'application_number',
-        'application_type': 'application_type',
-        'block_no': 'block_no',
-        'brela_number': 'brela_number',
-        'district': 'district',
-        'email': 'email',
-        'facility_name': 'facility_name',
-        'latitude': 'latitude',
-        'mobile_no': 'mobile_no',
-        'plot_no': 'plot_no',
-        'region': 'region',
-        'road': 'road',
-        'street': 'street',
-        'tin': 'tin',
-        'tin_name': 'tin_name',
-        'ward': 'ward',
-        'license_category_id': 'license_category_id',
-        'brela_registration_type': 'brela_registration_type',
-        'company_name': 'company_name',
-        'license_type': 'license_type',
-        'longitude': 'longitude',
-        'website': 'website',
-        'application_legal_status_id': 'application_legal_status_id',
+        # address / location (region/district/ward IDs mapped to names via CSV)
+        'address_code':                    'address_code',
+        'address_no':                      'address_no',
+        'block_no':                        'block_no',
+        'plot_no':                         'plot_no',
+        'road':                            'road',
+        'street':                          'street',
+        'region':                          'region',
+        'district':                        'district',
+        'ward':                            'ward',
+        # contact / business
+        'mobile_no':                       'mobile_no',
+        'email':                           'email',
+        'website':                         'website',
+        'latitude':                        'latitude',
+        'longitude':                       'longitude',
+        'po_box':                          'po_box',
+        'facility_name':                   'facility_name',
+        'company_name':                    'company_name',
+        'tin':                             'tin',
+        'tin_name':                        'tin_name',
+        'brela_number':                    'brela_number',
+        'brela_registration_type':         'brela_registration_type',
         'certificate_of_incorporation_no': 'certificate_of_incorporation_no',
-        'completed_at': 'completed_at',
-        'effective_date': 'effective_date',
-        'expire_date': 'expire_date',
-        'approval_no': 'approval_no',
-        'parent_application_id': 'old_parent_application_id',
-        # Note: created_at is excluded - we always use now() for new inserts
-        'created_by': 'old_created_by',
-        'company_name': 'company_name',
+        # application meta
+        'application_number':              'application_number',
+        'application_type':                'application_type',
+        'approval_no':                     'approval_no',
+        'effective_date':                  'effective_date',
+        'expire_date':                     'expire_date',
+        'completed_at':                    'completed_at',
+        'license_type':                    'license_type',
+        'license_category_id':             'license_category_id',
+        'application_legal_status_id':     'application_legal_status_id',
+        'userid':                          'username',
+        'created_by':                      'old_created_by',
+        'parent_application_id':           'old_parent_application_id',
     }
 
-    # 2) New mapping: userid -> username
-    excel_to_app['userid'] = 'username'
-
-    # 3) Fire certificate mappings (prefix f...)
+    # ── FIRE certificate fields ───────────────────────────────────────────────
+    # Keys are normalized (lowercase, no spaces) Excel headers.
+    # Values are the staging column names (fire_* prefix).
     fire_map = {
-        'fcontrolno': 'fire_certificate_control_number',
-        'fpremisename': 'fire_premise_name',
-        'fregion': 'fire_region',
-        'fdistrict': 'fire_district',
+        'fcontrolno':        'fire_certificate_control_number',
+        'fpremisename':      'fire_premise_name',
+        'fregion':           'fire_region',
+        'fdistrict':         'fire_district',
         'fadministrativearea': 'fire_administrative_area',
-        'fward': 'fire_ward',
-        'fstreet': 'fire_street',
-        'fvalidfrom': 'fire_valid_from',
-        'fvalidto': 'fire_valid_to',
+        'fward':             'fire_ward',
+        'fstreet':           'fire_street',
+        'fvalidfrom':        'fire_valid_from',
+        'fvalidto':          'fire_valid_to',
     }
     excel_to_app.update(fire_map)
 
-    # 4) Insurance / TIRA mapping (prefix tira...)
+    # ── INSURANCE / TIRA fields ───────────────────────────────────────────────
     tira_map = {
-        'covernoterefno': 'insurance_ref_no',
-        'tiracovernotenumber': 'cover_note_number',
-        'tiracovernotereferencenumber': 'cover_note_ref_no',
-        'tirapolicyholdername': 'policy_holder_name',
-        'tirainsurercompanyname': 'insurer_company_name',
-        'tiracovernotestartdate': 'cover_note_start_date',
-        'tiracovernotenddate': 'cover_note_end_date',
-        'tirariskname': 'risk_name',
-        'tirasubjectmatterdesc': 'subject_matter_desc',
+        'covernoterefno':             'cover_note_ref_no',
+        'tiracovernotenumber':        'cover_note_number',
+        'tiracovernotereferencenumber': 'insurance_ref_no',
+        'tirapolicyholdername':       'policy_holder_name',
+        'tirainsurercompanyname':     'insurer_company_name',
+        'tiracovernotestartdate':     'cover_note_start_date',
+        'tiracovernotenddate':        'cover_note_end_date',
+        'tirariskname':               'risk_name',
+        'tirasubjectmatterdesc':      'subject_matter_desc',
     }
     excel_to_app.update(tira_map)
 
@@ -317,16 +432,21 @@ def _build_default_mappings():
     # the attachments_spec with those names so the importer will handle
     # them if present.
     extra_names = [
-        'apwrttpog', 'pfspes', 'dpana', 'jvc', 'pfsramotdtfc', 'cmu', 'eotcaafs',
-        'daabd', 'fs', 'ccobp', 'ccfc', 'cctic', 'commissioningreport', 'cngplan',
+        'afr', 'dpana', 'wp', 'ccocoooaoaf', 'laictaontootl', 'ccobp', 'apobpdtsotpba',
+        'roalopapotaq', 'aelpdsbareoaloftbc', 'epmtbetpheirf', 'pprpm', 'adsip',
+        'poavcocoami', 'poalalcbaraoa', 'poasp', 'poaeiacibra', 'polbptcwgpi', 'blbs',
+        'pofcftptol', 'soppcau', 'cloybu', 'pooolotlp', 'fsc', 'txinc', 'aelpdsbarefpi',
+        'areffletter', 'bgonltobafhms', 'adonltobafhsaabofi', 'aulocfafioabtcttb',
+        'powolsfafpoaha', 'popoaqp', 'lofapoaosftstpb',
+        'apwrttpog', 'pfspes', 'jvc', 'pfsramotdtfc', 'cmu', 'eotcaafs',
+        'daabd', 'fs', 'ccfc', 'cctic', 'commissioningreport', 'cngplan',
         'commission', 'decommission', 'imfng', 'tcam', 'dptos', 'sotcam',
-        'adsotarrpfffy', 'tpiitffy', 'trror', 'trrorfilename', 'coi', 'cloybu',
-        'txinc', 'apopoaaf', 'ccoavtcc', 'bgonltobafhms', 'adonltobafhsaabofi',
-        'aulocfafioabtcttb', 'lwllabel1', 'lwllabel2', 'lwllabel3', 'lwllabel4',
+        'adsotarrpfffy', 'tpiitffy', 'trror', 'trrorfilename', 'coi',
+        'apopoaaf', 'ccoavtcc', 'lwllabel1', 'lwllabel2', 'lwllabel3', 'lwllabel4',
         'lwllabel8', 'lwllabel9', 'bpotra', 'pnclabel1', 'pnclabel2', 'frd',
         'loptarl', 'pfsapes', 'bust', 'pipelinemeasuresdoc', 'pacra',
-        'pipelineengplandoc', 'peclabel1filename', 'epmtbetpheirf',
-        'tpdfcacocotf', 'pnclabel3', 'tinc', 'tmpiwfsdtf', 'businessplan',
+        'pipelineengplandoc', 'peclabel1filename',
+        'tpdfcacocotf', 'pnclabel3', 'tmpiwfsdtf', 'businessplan',
         'pipelinedetaildoc', 'alofaposftstpb', 'fssa', 'pofctmaotf', 'accotinc',
         'adotpttbattf', 'tcc', 'poaqpp', 'coteasiac', 'pipelinecvdoc', 'ptrl',
         'openarea', 'consume', 'eoperator', 'peclable6', 'peclable7', 'peclable8',
@@ -344,33 +464,32 @@ def _build_default_mappings():
         'ngdisclabel2', 'ngdisclabel3', 'ngdisclabel4', 'ngdisclabel5',
         'ngdisclabel6', 'ngtranslabel1', 'ngtranslabel2', 'ngtransabel3',
         'ngtranslabel4', 'ngtranslabel5', 'tcompany', 'particular', 'stackhoilder',
-        'dsysplan', 'coc', 'soppcau', 'poneosoppwcna', 'pooolotlp', 'fsc',
-        'aelpdsbarefpi', 'eiac', 'adfipf', 'coponi', 'pprpm', 'pro', 'laictaontootl',
-        'wp', 'dawtlwtctfi', 'bpdtsoala', 'loildttsdhdawfsol', 'ccocoooaoaf',
-        'popoaqp', 'lofapoaosftstp', 'adfip', 'ccooc', 'popolpg', 'loldttsdhdawfsol',
-        'maaa', 'areffletter', 'powolsfafpoaha', 'lofapoaosftstpb', 'cvoal',
+        'dsysplan', 'poneosoppwcna', 'eiac', 'adfipf', 'coponi', 'pro',
+        'dawtlwtctfi', 'bpdtsoala', 'loildttsdhdawfsol',
+        'lofapoaosftstp', 'adfip', 'ccooc', 'popolpg', 'loldttsdhdawfsol',
+        'maaa', 'cvoal',
         'lirwplt', 'popoasd', 'popoasdlpg', 'rfaoalcdcam', 'lwllabel5', 'lwllabel6',
         'lwllabel7', 'prtraatcotfo', 'cpana', 'ccovttcc', 'pd', 'sm', 'lup',
-        'workpermit', 'ccobrd', 'wpoooloalwtc', 'pooalhpfara', 'poaqp', 'dawtlw',
-        'lolr', 'elpdsbarewss', 'aswdp', 'popoavcocoamiftca', 'popoasp', 'spcaatp',
-        'oshc', 'adsip', 'alopapotaq', 'doaaa', 'popoasfohawael', 'sacb',
+        'workpermit', 'ccobrd', 'wpoooloalwtc', 'pooalhpfara', 'dawtlw',
+        'lolr', 'elpdsbarewss', 'aswdp', 'popoavcocoamiftca', 'spcaatp',
+        'oshc', 'alopapotaq', 'doaaa', 'popoasfohawael', 'sacb',
         'pcoassowsorb', 'mtrdiclo', 'popoaefmsfpc', 'ppwllabel1', 'sc', 'ppwllabel3',
-        'smtcelabel', 'aloptarl', 'ppsa', 'peclabel', 'ppwllabel2', 'peclabelnew',
+        'smtcelabel', 'aloptarl', 'ppsa', 'peclabel', 'ppwllabel2',
         'pfdpu', 'tnotfsfapp', 'tlladotl', 'tladbbsafae', 'eae', 'tpwapb', 'dotfsctlp',
         'poloarouotlt', 'ccoabtico', 'ccopoc', 'ccowamacop', 'cvarccoa', 'popoalitc',
         'sop', 'popoaf', 'pimsrlabel1', 'pimsrlabel2', 'pimsrlabel3', 'pimsrlabel4',
         'ppsawomc', 'tasac', 'ccobrdp', 'poootpw', 'pbotpitutwtpwbp', 'alofa',
         'tregistration', 'townership', 'tlease', 'tpermit', 'tfire', 'teiac',
-        'telayout', 'tdetail', 'taccess', 'aeiacibra', 'roalopapotaq',
-        'aelpdsbareoaloftbc', 'ccoavfcftfd', 'adotmapiwco', 'pipelinefclosuredoc',
+        'telayout', 'tdetail', 'taccess', 'aeiacibra',
+        'ccoavfcftfd', 'adotmapiwco', 'pipelinefclosuredoc',
         'pipelinelandowndoc', 'pelabel5', 'tconsume', 'teoperator', 'tform',
         'lopapotaq', 'cvoaltkp', 'ccoha', 'corrosion', 'peclabel1', 'peclabel2',
-        'peclabel3', 'peclabel4', 'mnblicense', 'mnusage', 'afr', 'apobpdtsotpba',
+        'peclabel3', 'peclabel4', 'mnblicense', 'mnusage',
         'ccovtcc', 'miaoapstapa', 'pfd', 'ppitsotpdiq', 'bp', 'llc', 'wap',
         'tdfwsaaoi', 'todis', 'coa', 'releventcon', 'stsatwngwbs', 'mougctorgas',
         'comt', 'os', 'caat', 'cbp', 'moudqaw', 'cafsftpy', 'eiarcfpui', 'ccsc',
         'abftcoy', 'moumaw', 'sesr', 'wsdpfruabtua', 'sv', 'cafsaafpupta', 'ppirwplt',
-        'blbs', 'pwllabel1', 'pwllabel2', 'pwllabel3', 'pwllabel4', 'refltr',
+        'pwllabel1', 'pwllabel2', 'pwllabel3', 'pwllabel4', 'refltr',
         'pwllabel5', 'pwllabel6', 'accotsawalw', 'ccicftf', 'atgproof', 'pwllabel7',
         'pwllabel8', 'pwllabel9', 'avccotcc', 'prodoc', 'commreport', 'ppapotapsapea',
         'losflg', 'losfmrfe'
@@ -393,18 +512,83 @@ def _build_default_mappings():
 
 
 def _build_stage_mappings():
-    """Build mappings for the staging pipeline.
+    """Build the authoritative Excel->staging column mapping for the COPY pipeline.
 
-    We keep staging columns stable and close to the final schema, but we stage
-    legal-status and license-category as raw text so SQL transform can map/cast.
+    This is the SINGLE SOURCE OF TRUTH for what lands in stage_ca_applications_raw.
+
+    Rules:
+      - All keys must be lowercase (no spaces). The staging importer normalizes
+        Excel headers to lowercase+strip before matching, so these will always match.
+      - region/district/ward values are numeric IDs in Excel; the staging importer
+        maps them to names via CSV dicts AFTER copying them into stage columns.
+      - Fire fields: fregion/fdistrict/fward go into fire_region/fire_district/fire_ward
+        (NOT region/district/ward — those are application-level columns).
+      - insurance/tira fields go into cover_note_* and insurance_ref_no columns.
+      - license_category_id and application_legal_status_id are stored as raw text
+        so the SQL transform can resolve them by name later.
     """
-    excel_to_app, attachments_spec = _build_default_mappings()
+    excel_to_stage = {
+        # ── ADDRESS / LOCATION (application-level) ────────────────────────────
+        'address_code':                    'address_code',
+        'address_no':                      'address_no',
+        'block_no':                        'block_no',
+        'plot_no':                         'plot_no',
+        'road':                            'road',
+        'street':                          'street',
+        'region':                          'region',       # ID->name mapped via regions.csv
+        'district':                        'district',     # ID->name mapped via districts.csv
+        'ward':                            'ward',         # ID->name mapped via wards.csv
+        # ── CONTACT / BUSINESS ────────────────────────────────────────────────
+        'mobile_no':                       'mobile_no',
+        'email':                           'email',
+        'website':                         'website',
+        'latitude':                        'latitude',
+        'longitude':                       'longitude',
+        'po_box':                          'po_box',
+        'facility_name':                   'facility_name',
+        'company_name':                    'company_name',
+        'tin':                             'tin',
+        'tin_name':                        'tin_name',
+        'brela_number':                    'brela_number',
+        'brela_registration_type':         'brela_registration_type',
+        'certificate_of_incorporation_no': 'certificate_of_incorporation_no',
+        # ── APPLICATION META ─────────────────────────────────────────────────
+        'application_number':              'application_number',
+        'application_type':                'application_type',
+        'approval_no':                     'approval_no',
+        'effective_date':                  'effective_date',
+        'expire_date':                     'expire_date',
+        'completed_at':                    'completed_at',
+        'license_type':                    'license_type',
+        'license_category_id':             'license_category_raw',        # raw text -> resolved in transform
+        'application_legal_status_id':     'application_legal_status_raw', # raw text -> resolved in transform
+        'userid':                          'username',
+        'created_by':                      'old_created_by',
+        'parent_application_id':           'old_parent_application_id',
+        # ── FIRE CERTIFICATE (fcontrolno etc -> fire_* staging columns) ───────
+        'fcontrolno':                      'fire_certificate_control_number',
+        'fpremisename':                    'fire_premise_name',
+        'fregion':                         'fire_region',           # NOT mapped via CSV (saved as-is)
+        'fdistrict':                       'fire_district',         # NOT mapped via CSV (saved as-is)
+        'fadministrativearea':             'fire_administrative_area',
+        'fward':                           'fire_ward',             # NOT mapped via CSV (saved as-is)
+        'fstreet':                         'fire_street',
+        'fvalidfrom':                      'fire_valid_from',
+        'fvalidto':                        'fire_valid_to',
+        # ── INSURANCE / TIRA ─────────────────────────────────────────────────
+        'covernoterefno':                  'cover_note_ref_no',
+        'tiracovernotenumber':             'cover_note_number',
+        'tiracovernotereferencenumber':    'insurance_ref_no',
+        'tirapolicyholdername':            'policy_holder_name',
+        'tirainsurercompanyname':          'insurer_company_name',
+        'tiracovernotestartdate':          'cover_note_start_date',
+        'tiracovernotenddate':             'cover_note_end_date',
+        'tirariskname':                    'risk_name',
+        'tirasubjectmatterdesc':           'subject_matter_desc',
+    }
 
-    # Copy the application mappings but redirect specific fields to staging raw columns
-    excel_to_stage = dict(excel_to_app)
-    excel_to_stage['application_legal_status_id'] = 'application_legal_status_raw'
-    excel_to_stage['license_category_id'] = 'license_category_raw'
-
+    # Attachments spec is the same as the default mappings.
+    _, attachments_spec = _build_default_mappings()
     return excel_to_stage, attachments_spec
 
 
@@ -415,6 +599,7 @@ def import_applications_via_staging_copy(
     chunk_rows: int = 50000,
     truncate_first: bool = True,
     progress_cb=None,
+    sector_name: str = "PETROLEUM"
 ):
     """High-volume import (recommended for 500k+ remote DB): staging + COPY + SQL transform."""
     # Local import to avoid adding import-time dependencies for users that don't use this path.
@@ -429,6 +614,7 @@ def import_applications_via_staging_copy(
         progress_cb=progress_cb,
         chunk_rows=chunk_rows,
         truncate_first=truncate_first,
+        sector_name=sector_name
     )
 
 
@@ -450,208 +636,11 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
     excel_to_app, attachments_spec = _build_default_mappings()
     logger.info("Built mappings: %d excel_to_app, %d attachment specs", len(excel_to_app), len(attachments_spec))
 
-    # Region id -> name mapping: some Excel sheets send region id, but
-    # ca_applications.region expects the region name. Map common ids to names.
-    region_map = {
-        '1553779224291': 'MARA',
-        '1553779224267': 'RUVUMA',
-        '1553779224268': 'SINGIDA',
-        '1553779224269': 'MBEYA',
-        '1553779224270': 'TANGA',
-        '1553779224272': 'ARUSHA',
-        '1553779224273': 'MWANZA',
-        '1553779224277': 'KIGOMA',
-        '1553779224278': 'SIMIYU',
-        '1553779224280': 'RUKWA',
-        '1553779224281': 'MANYARA',
-        '1553779224282': 'IRINGA',
-        '1553779224283': 'PWANI',
-        '1553779224285': 'NJOMBE',
-        '1553779224287': 'SHINYANGA',
-        '1553779224288': 'LINDI',
-        '1553779224289': 'MOROGORO',
-        '1553779224292': 'KILIMANJARO',
-        '1553779224293': 'MTWARA',
-        '1553779224286': 'DODOMA',
-        '1553779224290': 'DAR ES SALAAM',
-        '1553779224274': 'TABORA',
-        '1553779224275': 'KAGERA',
-        '1553779224279': 'GEITA',
-        '1553835958960': 'KATAVI',
-        '1595421746468': 'SONGWE',
-    }
-
-    # District id -> name mapping: Excel may send district ids; map to names
-    district_map = {
-        '1554087241462': 'TUNDURU',
-        '1554087241461': 'NAMTUMBO',
-        '1554087241460': 'NYASA',
-        '1554087241459': 'SONGEA',
-        '1554087241458': 'MBINGA',
-        '1730103333427': 'ITIGI',
-        '1635215514550': 'MKALAMA',
-        '1635215514519': 'IKUNGI',
-        '1553781100866': 'SINGIDA VIJIJINI',
-        '1553781100865': 'SINGIDA',
-        '1553781100864': 'MANYONI',
-        '1553781100863': 'IRAMBA',
-        '1554087241470': 'RUNGWE',
-        '1554087241468': 'MBEYA',
-        '1554087241467': 'MBEYA CBD',
-        '1554087241466': 'MBARALI',
-        '1554087241465': 'KYELA',
-        '1554087241464': 'ILEJE',
-        '1554087241463': 'CHUNYA',
-        '1570589548831': 'MKINGA',
-        '1570589548830': 'KILINDI',
-        '1554087241476': 'TANGA',
-        '1554087241475': 'PANGANI',
-        '1554087241474': 'MUHEZA',
-        '1554087241473': 'LUSHOTO',
-        '1554087241472': 'KOROGWE',
-        '1554087241471': 'HANDENI',
-        '1554087241485': 'NGORONGORO',
-        '1554087241484': 'MONDULI',
-        '1554087241483': 'ARUMERU',
-        '1554087241482': 'LONGIDO',
-        '1554087241481': 'KARATU',
-        '1554087241480': 'ARUSHA VIJIJINI',
-        '1554087241479': 'ARUSHA',
-        '1554087241492': 'UKEREWE',
-        '1554087241491': 'SENGEREMA',
-        '1554087241490': 'NYAMAGANA',
-        '1554087241489': 'MISUNGWI',
-        '1554087241488': 'MAGU',
-        '1554087241487': 'KWIMBA',
-        '1554087241486': 'ILEMELA',
-        '1554087241499': 'UYUI',
-        '1554087241498': 'URAMBO',
-        '1554087241497': 'TABORA CBD',
-        '1554087241496': 'SIKONGE',
-        '1554087241495': 'NZEGA',
-        '1554087241494': 'KALIUA',
-        '1554087241493': 'IGUNGA',
-        '1554087241507': 'NGARA',
-        '1554087241506': 'MULEBA',
-        '1554087241505': 'MISSENYI',
-        '1554087241504': 'KYERWA',
-        '1554087241503': 'KARAGWE',
-        '1554087241502': 'BUKOBA VIJIJINI',
-        '1554087241501': 'BUKOBA',
-        '1554087241500': 'BIHARAMULO',
-        '1694485869749': 'KAKONKO',
-        '1644375071664': 'BUHIGWE',
-        '1554087241514': 'KIGOMA CBD',
-        '1554087241513': 'UVINZA',
-        '1554087241512': 'KIGOMA',
-        '1554087241511': 'KIBONDO',
-        '1554087241510': 'KASULU',
-        '1554087241519': 'MEATU',
-        '1554087241518': 'MASWA',
-        '1554087241517': 'ITILIMA',
-        '1554087241516': 'BUSEGA',
-        '1554087241515': 'BARIADI',
-        '1554087241524': "NYANG'HWALE",
-        '1554087241523': 'MBOGWE',
-        '1554087241522': 'GEITA',
-        '1554087241521': 'CHATO',
-        '1554087241520': 'BUKOMBE',
-        '1720594791771': 'KALAMBO',
-        '1554087241527': 'SUMBAWANGA VIJIJINI',
-        '1554087241526': 'SUMBAWANGA',
-        '1554087241525': 'NKASI',
-        '1554087241532': 'SIMANJIRO',
-        '1554087241531': 'MBULU',
-        '1554087241530': 'KITETO',
-        '1554087241529': "HANANG'",
-        '1554087241528': 'BABATI',
-        '1595421746493': 'MAFINGA',
-        '1588584111755': 'KILOLO',
-        '1554087241535': 'MUFINDI',
-        '1554087241534': 'IRINGA VIJIJINI',
-        '1554087241533': 'IRINGA',
-        '1735825622854': 'KIBAHA CBD',
-        '1709520066477': 'CHALINZE',
-        '1554087241542': 'RUFIJI',
-        '1554087241541': 'MKURANGA',
-        '1554087241540': 'MAFIA',
-        '1554087241539': 'KISARAWE',
-        '1554087241538': 'KIBITI',
-        '1554087241537': 'KIBAHA',
-        '1554087241536': 'BAGAMOYO',
-        '1554087241550': "WANGING'OMBE",
-        '1554087241549': 'NJOMBE VIJIJINI',
-        '1554087241548': 'NJOMBE',
-        '1554087241547': 'MAKETE',
-        '1554087241546': 'MAKAMBAKO',
-        '1554087241545': 'LUDEWA',
-        '1554087241558': 'MPWAPWA',
-        '1554087241557': 'KONGWA',
-        '1554087241556': 'KONDOA',
-        '1554087241555': 'DODOMA VIJIJINI',
-        '1554087241554': 'DODOMA',
-        '1554087241553': 'CHEMBA',
-        '1554087241552': 'CHAMWINO',
-        '1554087241551': 'BAHI',
-        '1729063028114': 'MSALALA',
-        '1729063028113': 'USHETU',
-        '1554087241562': 'SHINYANGA VIJIJINI',
-        '1554087241561': 'SHINYANGA',
-        '1554087241560': 'KISHAPU',
-        '1554087241559': 'KAHAMA',
-        '1554087241568': 'RUANGWA',
-        '1554087241567': 'NACHINGWEA',
-        '1554087241566': 'LIWALE',
-        '1554087241565': 'LINDI VIJIJINI',
-        '1554087241564': 'LINDI',
-        '1554087241563': 'KILWA',
-        '1729063028004': 'MALINYI',
-        '1582025888041': 'GAIRO',
-        '1554087241574': 'ULANGA',
-        '1554087241573': 'MVOMERO',
-        '1554087241572': 'MOROGORO VIJIJINI',
-        '1554087241571': 'MOROGORO',
-        '1554087241570': 'KILOSA',
-        '1554087241569': 'KILOMBERO',
-        '1578044087223': 'KIGAMBONI',
-        '1553781100985': 'TEMEKE',
-        '1553781100984': 'UBUNGO',
-        '1553781100983': 'KINONDONI',
-        '1553781100982': 'ILALA',
-        '1595421746470': 'BUTIAMA',
-        '1554087241580': 'TARIME',
-        '1554087241579': 'SERENGETI',
-        '1554087241578': 'RORYA',
-        '1554087241577': 'MUSOMA VIJIJINI',
-        '1554087241576': 'MUSOMA',
-        '1554087241575': 'BUNDA',
-        '1647657808968': 'SIHA',
-        '1554087241586': 'SAME',
-        '1554087241585': 'ROMBO',
-        '1554087241584': 'MWANGA',
-        '1554087241583': 'MOSHI VIJIJINI',
-        '1554087241582': 'MOSHI',
-        '1554087241581': 'HAI',
-        '1709520066494': 'NANYAMBA',
-        '1652149904008': 'MTWARA-MIKINDANI',
-        '1652149904007': 'MASASI TOWN COUNCIL',
-        '1554087241592': 'TANDAHIMBA',
-        '1554087241591': 'NEWALA',
-        '1554087241590': 'NANYUMBU',
-        '1554087241589': 'MTWARA VIJIJINI',
-        '1554087241588': 'MTWARA',
-        '1554087241587': 'MASASI',
-        '1731340749958': 'TANGANYIKA',
-        '1666753612484': 'NSIMBO',
-        '1666753612483': 'MPIMBWE',
-        '1666753612482': 'MPANDA CBD',
-        '1554087241594': 'MPANDA',
-        '1554087241593': 'MLELE',
-        '1595421746505': 'SONGWE',
-        '1595421746504': 'MOMBA',
-        '1595421746502': 'ILEJE',
-        '1554087241469': 'MBOZI',
-    }
+    # Region/District/Ward values may arrive in Excel as bigint-like ids.
+    # The DB columns expect the *names*, so we map ids -> names using CSV lookups.
+    # (Single source of truth: app/data/{regions,districts,wards}.csv)
+    region_map = region_map_csv
+    district_map = district_map_csv
 
     # Build normalized region/district maps to ensure lookups use string-of-number keys
     def _build_normalized_map(source: Dict[str, str]) -> Dict[str, str]:
@@ -876,10 +865,13 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                              val = None
 
                         # conversion: normalize application_type to uppercase (NEW, RENEW, EXTEND)
+                        # NOTE: keep username/userid exactly as provided (no uppercasing).
                         if excel_col == 'application_type' and isinstance(val, str):
                             val = val.strip().upper()
-                        # If region column contains an id, map it to the name
-                        if app_col == 'region' and val not in (None, ''):
+                        # If region column contains an id, map it to the name.
+                        # IMPORTANT: only map for the application-level "region" column,
+                        # not fire-prefixed delimitations (fregion/fdistrict/fward).
+                        if excel_col not in ('fregion', 'fdistrict', 'fward') and app_col == 'region' and val not in (None, ''):
                             sval = str(val).strip()
                             nk = _normalize_numeric_string(sval)
                             if sval in norm_region_map:
@@ -892,8 +884,8 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                                 mapping_stats['region_unmapped'] += 1
                                 if len(mapping_stats['region_unmapped_samples']) < 20:
                                     mapping_stats['region_unmapped_samples'].add(sval)
-                        # Map district ids to names if necessary
-                        if app_col == 'district' and val not in (None, ''):
+                        # Map district ids to names if necessary (application-level only)
+                        if excel_col not in ('fregion', 'fdistrict', 'fward') and app_col == 'district' and val not in (None, ''):
                             sval = str(val).strip()
                             nk = _normalize_numeric_string(sval)
                             if sval in norm_district_map:
@@ -906,8 +898,8 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                                 mapping_stats['district_unmapped'] += 1
                                 if len(mapping_stats['district_unmapped_samples']) < 20:
                                     mapping_stats['district_unmapped_samples'].add(sval)
-                        # Map ward ids to names if a ward_map is provided (ward_map is preloaded and normalized)
-                        if app_col == 'ward' and val not in (None, ''):
+                        # Map ward ids to names if a ward_map is provided (application-level only)
+                        if excel_col not in ('fregion', 'fdistrict', 'fward') and app_col == 'ward' and val not in (None, ''):
                             sval = str(val).strip()
                             nk = _normalize_numeric_string(sval)
                             if sval in ward_map:
@@ -981,6 +973,15 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                             val = _convert_excel_date(val)
 
                         app_row[app_col] = val
+
+                    # ── Migration defaults ──────────────────────────────────
+                    # category_license_type is always OPERATIONAL for imported applications.
+                    if 'category_license_type' in ca_cols:
+                        app_row['category_license_type'] = 'OPERATIONAL'
+                    # All migrated records are flagged as originating from LOIS.
+                    if 'is_from_lois' in ca_cols:
+                        app_row['is_from_lois'] = True
+
                     app_inserts.append(app_row)
 
                     order = 1
@@ -1301,100 +1302,189 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
 def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
     """Backfill created_by UUIDs from users.username.
 
-        Match rule:
-            Case-insensitive match on normalized usernames:
-            lower(trim(public.ca_applications.username)) == lower(trim(public.users.username))
+    Match rule:
+        Case-insensitive match on normalized usernames:
+        lower(trim(applications.username)) == lower(trim(users.username))
 
     Update rule:
-      Only set created_by when it is currently NULL.
+        Only set created_by when it is currently NULL (idempotent / safe to re-run).
 
-    Tables updated:
-      - ca_applications
-      - ca_documents (by application_id)
-      - ca_contact_persons (by application_id)
-            - ca_shareholders (by application_id)
+    Tables updated
+    ──────────────
+    Group A – direct application_id FK:
+        applications, application_sector_details, certificates,
+        application_electrical_installation, task_assignments,
+        batch_application_advertisements, transfer_applications,
+        app_evaluation_checklist, application_additional_conditions,
+        application_reviews
+
+    Group B – via application_sector_details (application_sector_detail_id FK):
+        documents, shareholders, managing_directors, fire,
+        insurance_cover_details, ardhi_information
+
+    Special FK name:
+        contact_persons uses  app_sector_detail_id  (not application_sector_detail_id)
     """
 
-    # Applications
-    updated_apps = db.execute(
-        text(
-            """
-            WITH u AS (
-                SELECT a.id AS application_id, usr.id AS user_id
-                FROM public.ca_applications a
-                JOIN public.users usr ON lower(trim(usr.username)) = lower(trim(a.username))
-                WHERE a.username IS NOT NULL AND trim(a.username) <> ''
-            )
-            UPDATE public.ca_applications a
-            SET created_by = u.user_id
-            FROM u
-            WHERE a.id = u.application_id
-              AND a.created_by IS NULL
-            """
+    # ------------------------------------------------------------------
+    # Reusable CTE SQL fragment (Group A — direct application_id FK)
+    # ------------------------------------------------------------------
+    _APP_CTE = """
+        WITH u AS (
+            SELECT a.id AS application_id, usr.id AS user_id
+            FROM public.applications a
+            JOIN public.users usr
+              ON lower(trim(usr.username)) = lower(trim(a.username))
+            WHERE a.username IS NOT NULL AND trim(a.username) <> ''
         )
-    ).rowcount or 0
+    """
 
-    # Documents
-    updated_docs = db.execute(
-        text(
-            """
-            WITH u AS (
-                SELECT a.id AS application_id, usr.id AS user_id
-                FROM public.ca_applications a
-                JOIN public.users usr ON lower(trim(usr.username)) = lower(trim(a.username))
-                WHERE a.username IS NOT NULL AND trim(a.username) <> ''
-            )
-            UPDATE public.ca_documents d
-            SET created_by = u.user_id
-            FROM u
-            WHERE d.application_id = u.application_id
-              AND d.created_by IS NULL
-            """
+    # ------------------------------------------------------------------
+    # Reusable CTE SQL fragment (Group B — via application_sector_details)
+    # ------------------------------------------------------------------
+    _ASD_CTE = """
+        WITH u AS (
+            SELECT asd.id AS asd_id, usr.id AS user_id
+            FROM public.application_sector_details asd
+            JOIN public.applications a ON a.id = asd.application_id
+            JOIN public.users usr
+              ON lower(trim(usr.username)) = lower(trim(a.username))
+            WHERE a.username IS NOT NULL AND trim(a.username) <> ''
         )
-    ).rowcount or 0
+    """
 
-    # Contact persons
-    updated_contacts = db.execute(
-        text(
-            """
-            WITH u AS (
-                SELECT a.id AS application_id, usr.id AS user_id
-                FROM public.ca_applications a
-                JOIN public.users usr ON lower(trim(usr.username)) = lower(trim(a.username))
-                WHERE a.username IS NOT NULL AND trim(a.username) <> ''
-            )
-            UPDATE public.ca_contact_persons c
-            SET created_by = u.user_id
-            FROM u
-            WHERE c.application_id = u.application_id
-              AND c.created_by IS NULL
-            """
-        )
-    ).rowcount or 0
+    counts: Dict[str, int] = {}
 
-    # Shareholders
-    updated_shareholders = db.execute(
-        text(
-            """
-            WITH u AS (
-                SELECT a.id AS application_id, usr.id AS user_id
-                FROM public.ca_applications a
-                JOIN public.users usr ON lower(trim(usr.username)) = lower(trim(a.username))
-                WHERE a.username IS NOT NULL AND trim(a.username) <> ''
-            )
-            UPDATE public.ca_shareholders s
-            SET created_by = u.user_id
-            FROM u
-            WHERE s.application_id = u.application_id
-              AND s.created_by IS NULL
-            """
-        )
-    ).rowcount or 0
+    def _run(sql: str, key: str) -> None:
+        try:
+            counts[key] = db.execute(text(sql)).rowcount or 0
+        except Exception as exc:
+            logger.warning("backfill_created_by: skipped %s — %s", key, exc)
+            db.rollback()
+            counts[key] = -1
+
+    # ── Group A ──────────────────────────────────────────────────────
+    _run(_APP_CTE + """
+        UPDATE public.applications a
+        SET created_by = u.user_id
+        FROM u
+        WHERE a.id = u.application_id AND a.created_by IS NULL
+    """, "applications")
+
+    _run(_APP_CTE + """
+        UPDATE public.application_sector_details asd
+        SET created_by = u.user_id
+        FROM u
+        WHERE asd.application_id = u.application_id AND asd.created_by IS NULL
+    """, "application_sector_details")
+
+    _run(_APP_CTE + """
+        UPDATE public.certificates c
+        SET created_by = u.user_id
+        FROM u
+        WHERE c.application_id = u.application_id AND c.created_by IS NULL
+    """, "certificates")
+
+    _run(_APP_CTE + """
+        UPDATE public.application_electrical_installation aei
+        SET created_by = u.user_id
+        FROM u
+        WHERE aei.application_id = u.application_id AND aei.created_by IS NULL
+    """, "application_electrical_installation")
+
+    _run(_APP_CTE + """
+        UPDATE public.task_assignments ta
+        SET created_by = u.user_id
+        FROM u
+        WHERE ta.application_id = u.application_id AND ta.created_by IS NULL
+    """, "task_assignments")
+
+    _run(_APP_CTE + """
+        UPDATE public.batch_application_advertisements baa
+        SET created_by = u.user_id
+        FROM u
+        WHERE baa.application_id = u.application_id AND baa.created_by IS NULL
+    """, "batch_application_advertisements")
+
+    _run(_APP_CTE + """
+        UPDATE public.transfer_applications tra
+        SET created_by = u.user_id
+        FROM u
+        WHERE tra.application_id = u.application_id AND tra.created_by IS NULL
+    """, "transfer_applications")
+
+    _run(_APP_CTE + """
+        UPDATE public.app_evaluation_checklist aec
+        SET created_by = u.user_id
+        FROM u
+        WHERE aec.application_id = u.application_id AND aec.created_by IS NULL
+    """, "app_evaluation_checklist")
+
+    _run(_APP_CTE + """
+        UPDATE public.application_additional_conditions aac
+        SET created_by = u.user_id
+        FROM u
+        WHERE aac.application_id = u.application_id AND aac.created_by IS NULL
+    """, "application_additional_conditions")
+
+    _run(_APP_CTE + """
+        UPDATE public.application_reviews ar
+        SET created_by = u.user_id
+        FROM u
+        WHERE ar.application_id = u.application_id AND ar.created_by IS NULL
+    """, "application_reviews")
+
+    # ── Group B ──────────────────────────────────────────────────────
+    _run(_ASD_CTE + """
+        UPDATE public.documents d
+        SET created_by = u.user_id
+        FROM u
+        WHERE d.application_sector_detail_id = u.asd_id AND d.created_by IS NULL
+    """, "documents")
+
+    # contact_persons uses app_sector_detail_id (different FK column name)
+    _run(_ASD_CTE + """
+        UPDATE public.contact_persons cp
+        SET created_by = u.user_id
+        FROM u
+        WHERE cp.app_sector_detail_id = u.asd_id AND cp.created_by IS NULL
+    """, "contact_persons")
+
+    _run(_ASD_CTE + """
+        UPDATE public.shareholders s
+        SET created_by = u.user_id
+        FROM u
+        WHERE s.application_sector_detail_id = u.asd_id AND s.created_by IS NULL
+    """, "shareholders")
+
+    _run(_ASD_CTE + """
+        UPDATE public.managing_directors md
+        SET created_by = u.user_id
+        FROM u
+        WHERE md.application_sector_detail_id = u.asd_id AND md.created_by IS NULL
+    """, "managing_directors")
+
+    _run(_ASD_CTE + """
+        UPDATE public.fire f
+        SET created_by = u.user_id
+        FROM u
+        WHERE f.application_sector_detail_id = u.asd_id AND f.created_by IS NULL
+    """, "fire")
+
+    _run(_ASD_CTE + """
+        UPDATE public.insurance_cover_details icd
+        SET created_by = u.user_id
+        FROM u
+        WHERE icd.application_sector_detail_id = u.asd_id AND icd.created_by IS NULL
+    """, "insurance_cover_details")
+
+    _run(_ASD_CTE + """
+        UPDATE public.ardhi_information ai
+        SET created_by = u.user_id
+        FROM u
+        WHERE ai.application_sector_detail_id = u.asd_id AND ai.created_by IS NULL
+    """, "ardhi_information")
 
     db.commit()
-    return {
-        "updated_ca_applications": int(updated_apps),
-        "updated_ca_documents": int(updated_docs),
-        "updated_ca_contact_persons": int(updated_contacts),
-        "updated_ca_shareholders": int(updated_shareholders),
-    }
+    return counts
+

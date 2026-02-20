@@ -41,7 +41,10 @@ def _as_clean_str(val: Any) -> Optional[str]:
     s = str(val).strip()
     if not s:
         return None
-    if s.lower() in _EMPTY_MARKERS:
+    # Some exports use placeholder tokens instead of blanks.
+    # For example: old_parent_application_id may contain the literal 'papprefno'
+    # meaning "no parent".
+    if s.lower() in _EMPTY_MARKERS or s.lower() == "papprefno":
         return None
     return s
 
@@ -118,18 +121,22 @@ def _copy_dataframe_to_table(
 
     sio = io.StringIO()
     for r in rows:
-        out = []
+        out_fields: List[str] = []
         for v in r:
             if v is None:
-                out.append("")
+                # Important: emit an *unquoted empty field* for NULL.
+                # With COPY ... NULL '' (below) this becomes a real SQL NULL.
+                out_fields.append("")
             else:
                 s = str(v).replace('"', '""')
-                out.append(s)
-        sio.write(",".join(f'"{x}"' for x in out) + "\n")
+                out_fields.append(f'"{s}"')
+        sio.write(",".join(out_fields) + "\n")
     sio.seek(0)
 
     cols_sql = ",".join(columns)
-    copy_sql = f"COPY {table} ({cols_sql}) FROM STDIN WITH CSV"
+    # We keep CSV and quote non-NULL fields. NULLs are represented by empty *unquoted* fields.
+    # Setting NULL '' instructs Postgres to treat those as SQL NULL.
+    copy_sql = f"COPY {table} ({cols_sql}) FROM STDIN WITH CSV NULL ''"
 
     cur = raw_conn.cursor()
     cur.copy_expert(copy_sql, sio)
@@ -178,6 +185,31 @@ def run_transform_into_final(db: Any):
     db.commit()
 
 
+def _drain_psycopg_notices(db: Any) -> List[str]:
+    """Collect and clear server NOTICE messages (psycopg2).
+
+    We use this to return table-level insert counts emitted by transform SQL
+    (via RAISE NOTICE) without printing massive SQL errors.
+    """
+
+    try:
+        raw_conn = _get_raw_conn(db)
+        if raw_conn is None:
+            return []
+        notices = list(getattr(raw_conn, "notices", []) or [])
+        # Clear buffer so the next run doesn't duplicate.
+        # Note: we only call this at controlled points (start of run, and after transform).
+        try:
+            raw_conn.notices.clear()
+        except Exception:
+            # Some drivers expose notices as a plain list.
+            setattr(raw_conn, "notices", [])
+        # psycopg2 includes trailing newlines; normalize.
+        return [n.strip() for n in notices if str(n).strip()]
+    except Exception:
+        return []
+
+
 def truncate_staging(db: Any):
     # Be tolerant: first-run may not have staging tables yet.
     # We use DO blocks so missing tables don't error.
@@ -186,11 +218,54 @@ def truncate_staging(db: Any):
             """
 DO $$
 BEGIN
+    -- Truncate the parent table first; CASCADE clears dependent staging tables.
+    IF to_regclass('public.stage_ca_applications_raw') IS NOT NULL THEN
+        EXECUTE 'TRUNCATE TABLE public.stage_ca_applications_raw RESTART IDENTITY CASCADE';
+    END IF;
+    -- Be explicit as well (safe if CASCADE already cleared them).
+    IF to_regclass('public.stage_ca_contact_persons_raw') IS NOT NULL THEN
+        EXECUTE 'TRUNCATE TABLE public.stage_ca_contact_persons_raw RESTART IDENTITY CASCADE';
+    END IF;
     IF to_regclass('public.stage_ca_documents_raw') IS NOT NULL THEN
         EXECUTE 'TRUNCATE TABLE public.stage_ca_documents_raw RESTART IDENTITY CASCADE';
     END IF;
+    IF to_regclass('public.stage_categories') IS NOT NULL THEN
+        EXECUTE 'TRUNCATE TABLE public.stage_categories RESTART IDENTITY CASCADE';
+    END IF;
+END $$;
+            """
+        )
+    )
+    db.commit()
+
+
+def drop_staging_schema(db: Any):
+    """Drop staging tables.
+
+    Use this only when you've changed the staging schema (added/renamed columns)
+    and want to guarantee the DB matches the current staging_schema.sql.
+
+    For normal runs, truncate_staging() is faster and safer.
+    """
+    db.execute(
+        text(
+            """
+DO $$
+BEGIN
+    IF to_regclass('public.stage_ca_documents_raw') IS NOT NULL THEN
+        EXECUTE 'DROP TABLE public.stage_ca_documents_raw CASCADE';
+    END IF;
+    IF to_regclass('public.stage_ca_contact_persons_raw') IS NOT NULL THEN
+        EXECUTE 'DROP TABLE public.stage_ca_contact_persons_raw CASCADE';
+    END IF;
+    IF to_regclass('public.stage_ca_shareholders_raw') IS NOT NULL THEN
+        EXECUTE 'DROP TABLE public.stage_ca_shareholders_raw CASCADE';
+    END IF;
+    IF to_regclass('public.stage_categories') IS NOT NULL THEN
+        EXECUTE 'DROP TABLE public.stage_categories CASCADE';
+    END IF;
     IF to_regclass('public.stage_ca_applications_raw') IS NOT NULL THEN
-        EXECUTE 'TRUNCATE TABLE public.stage_ca_applications_raw RESTART IDENTITY CASCADE';
+        EXECUTE 'DROP TABLE public.stage_ca_applications_raw CASCADE';
     END IF;
 END $$;
             """
@@ -208,6 +283,8 @@ def stage_and_copy_import(
     *,
     chunk_rows: int = 50000,
     truncate_first: bool = True,
+    drop_and_recreate_staging: bool = True,   # always drop+recreate staging on every import
+    sector_name: str = "PETROLEUM"
 ):
     """Main pipeline.
 
@@ -229,18 +306,126 @@ def stage_and_copy_import(
 
     _progress(f"start rows={len(df)} chunk_rows={chunk_rows}")
 
-    # Ensure staging exists before any TRUNCATE/COPY.
+    # Load region/district/ward dictionaries (CSV-backed) so we can store names in staging.
+    # Requirement: Only application-level region/district/ward should be mapped.
+    # Fire delimitations (fire_region/fire_district/fire_ward) must NOT be mapped.
+    #
+    # Import _normalize_numeric_string once here so it is in scope for ALL helper
+    # functions below (_build_normalized_map AND _map_region/_map_district/_map_ward).
+    try:
+        from app.services.application_migrations_service import _normalize_numeric_string
+    except Exception as _e:
+        logger.warning("[staging-import] could not import _normalize_numeric_string: %s", _e)
+        def _normalize_numeric_string(val: str) -> str:  # type: ignore[misc]
+            return str(val).strip() if val is not None else val
+
+    def _build_normalized_map(source: Dict[str, str]) -> Dict[str, str]:
+        """Build a lookup dict from id-to-name CSV map.
+
+        Adds ALL of these key variants for every entry so pandas float strings
+        (e.g. '1553779224293.0') always resolve:
+          - raw CSV key as-is                  e.g. '1553779224293'
+          - normalized integer string           e.g. '1553779224293'   (same here)
+          - float-string variant                e.g. '1553779224293.0'
+        """
+        nm: Dict[str, str] = {}
+        for k, v in (source or {}).items():
+            ks = str(k).strip()
+            if not ks:
+                continue
+            nm[ks] = v
+            # Normalized integer string (handles scientific notation from other sources)
+            try:
+                nk = _normalize_numeric_string(ks)
+                if nk and nk != ks:
+                    nm[nk] = v
+            except Exception:
+                pass
+            # Float-string variant: pandas often reads integer Excel cells as '12345.0'
+            # Add that key explicitly so direct dict lookup succeeds without needing
+            # _normalize_numeric_string at map time.
+            try:
+                float_key = f"{float(ks):.1f}"  # e.g. '1553779224293.0'
+                if float_key not in nm:
+                    nm[float_key] = v
+                # Also add without the .0 suffix (already added as ks above, but be safe)
+                int_key = str(int(float(ks)))
+                if int_key not in nm:
+                    nm[int_key] = v
+            except (ValueError, OverflowError):
+                pass
+        return nm
+
+    try:
+        from app.services.application_migrations_service import region_map_csv as _region_csv
+        norm_region_map = _build_normalized_map(_region_csv)
+        logger.info("[staging-import] region map loaded: %d entries", len(norm_region_map))
+    except Exception as _e:
+        logger.warning("[staging-import] region map failed to load: %s", _e)
+        norm_region_map = {}
+
+    try:
+        from app.services.application_migrations_service import district_map_csv as _district_csv
+        norm_district_map = _build_normalized_map(_district_csv)
+        logger.info("[staging-import] district map loaded: %d entries", len(norm_district_map))
+    except Exception as _e:
+        logger.warning("[staging-import] district map failed to load: %s", _e)
+        norm_district_map = {}
+
+    try:
+        from app.services.application_migrations_service import ward_map_csv as _ward_csv
+        norm_ward_map = _build_normalized_map(_ward_csv)
+        logger.info("[staging-import] ward map loaded: %d entries", len(norm_ward_map))
+    except Exception as _e:
+        logger.warning("[staging-import] ward map failed to load: %s", _e)
+        norm_ward_map = {}
+
+
+    # Clear any previous server-side NOTICE buffer early.
+    _drain_psycopg_notices(db)
+
+    # Always drop and recreate staging tables on every import.
+    # This guarantees:
+    #   - no stale rows from a previous run
+    #   - schema always matches current staging_schema.sql (no column drift)
+    #   - no COPY conflicts from old data
+    _progress("drop+recreate staging schema (every import)")
+    drop_staging_schema(db)
     ensure_staging_schema(db)
+    _progress("staging schema recreated")
 
-    _progress("staging schema ensured")
+    # Normalize df columns: strip whitespace AND lowercase so header matching is robust.
+    # e.g. "FControlNo" matches "fcontrolno", "Region " matches "region", etc.
+    df_cols_original = [str(c) for c in df.columns]
+    df_cols_normalized = [str(c).strip().lower() for c in df.columns]
+    df.columns = df_cols_normalized
 
-    if truncate_first:
-        truncate_staging(db)
-        _progress("staging truncated")
+    # Also normalize the keys of excel_to_stage so all lookups are case/space-insensitive.
+    excel_to_stage = {str(k).strip().lower(): v for k, v in excel_to_stage.items()}
 
-    # Normalize df columns once
-    df_cols = [str(c).strip() for c in df.columns]
-    df.columns = df_cols
+    # Log the original→normalized header pairs that actually changed (for transparency).
+    changed_headers = [(o, n) for o, n in zip(df_cols_original, df_cols_normalized) if o != n]
+    if changed_headers:
+        _progress(f"diagnostic: normalized {len(changed_headers)} excel headers (strip+lower): {changed_headers[:20]}")
+
+    # Diagnostics: identify mapped Excel columns that are missing in this file.
+    # Missing source columns are the most common reason staging ends up with NULLs.
+    expected_excel_cols = sorted({k for k in excel_to_stage.keys()})
+    missing_excel_cols = [c for c in expected_excel_cols if c not in df.columns]
+    if missing_excel_cols:
+        _progress(f"diagnostic: excel missing mapped columns count={len(missing_excel_cols)}")
+        _progress(f"diagnostic: excel missing mapped columns sample={missing_excel_cols[:50]}")
+    else:
+        _progress(f"diagnostic: all {len(expected_excel_cols)} mapped excel columns found in file")
+
+    # Business rule: only migrate approved applications.
+    # If approval_no is blank/null in Excel, skip the row entirely (do not stage, do not scan attachments).
+    if "approval_no" in df.columns:
+        _progress("filter: dropping rows with empty approval_no")
+        before = len(df)
+        approval_series = df["approval_no"].apply(_as_clean_str)
+        df = df[approval_series.notna()].copy()
+        _progress(f"filter: approval_no not null kept={len(df)}/{before}")
 
     # Build staging apps dataframe (only the columns we know)
     stage_cols = list(set(excel_to_stage.values()))
@@ -268,6 +453,16 @@ def stage_and_copy_import(
     df_stage["generated_id"] = [uuid.uuid4() for _ in range(len(df))]
     df_stage["source_row_no"] = [int(i) + 2 for i in range(len(df))]  # +2 for header/1-index
 
+    # IMPORTANT: create all staging columns up-front.
+    # Without this, any destination column that is missing from excel_to_stage
+    # (or missing in a particular Excel file) might not exist on df_stage at all,
+    # causing it to be omitted from COPY and end up NULL downstream.
+    for c in stage_cols:
+        if c in ("generated_id", "source_row_no"):
+            continue
+        if c not in df_stage.columns:
+            df_stage[c] = None
+
     for src, dst in excel_to_stage.items():
         if dst not in stage_table_cols:
             # mapped destination doesn't exist in staging schema -> ignore
@@ -282,6 +477,147 @@ def stage_and_copy_import(
         if c in ("generated_id", "source_row_no"):
             continue
         df_stage[c] = df_stage[c].apply(_as_clean_str)
+
+    # Normalise integer-like float strings in location columns.
+    # Pandas reads integer Excel cells as floats, so str() gives '1553779224293.0'.
+    # Strip the '.0' suffix so the value is a plain integer string '1553779224293'
+    # before it hits the CSV map lookup.  Only the app-level columns are affected;
+    # fire_* delimitations are left untouched (they are text names, not IDs).
+    def _strip_dot_zero(v: Any) -> Any:
+        """Convert '12345.0' -> '12345', leave everything else unchanged."""
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s.endswith(".0"):
+            try:
+                return str(int(float(s)))
+            except (ValueError, OverflowError):
+                pass
+        return v
+
+    for _loc_col in ("region", "district", "ward"):
+        if _loc_col in df_stage.columns:
+            df_stage[_loc_col] = df_stage[_loc_col].apply(_strip_dot_zero)
+
+    # Map application-level region/district/ward IDs -> names (store names in staging).
+    # IMPORTANT: do not map fire_* delimitations.
+    # The norm_*_map dicts already contain all key variants:
+    #   - '1553779224293'    (integer string, as in CSV)
+    #   - '1553779224293.0'  (float string, how pandas reads integer Excel cells)
+    # So a simple dict.get() is sufficient — no _normalize_numeric_string needed at lookup time.
+    def _map_value(v: Any, lookup: Dict[str, str]) -> Any:
+        """Return name from lookup, or original value if not found."""
+        if v is None:
+            return None
+        s = str(v).strip()
+        if not s or s.lower() in _EMPTY_MARKERS:
+            return None
+        # Direct lookup (handles '1553779224293' and '1553779224293.0')
+        if s in lookup:
+            return lookup[s]
+        # Last-resort: normalise and retry (scientific notation, etc.)
+        try:
+            nk = _normalize_numeric_string(s)
+            if nk and nk != s and nk in lookup:
+                return lookup[nk]
+        except Exception:
+            pass
+        return s  # return unchanged if not in map
+
+    try:
+        if "region" in df_stage.columns and norm_region_map:
+            before_unique = df_stage["region"].nunique()
+            df_stage["region"] = df_stage["region"].apply(lambda v: _map_value(v, norm_region_map))
+            after_unique = df_stage["region"].nunique()
+            mapped_count = int((df_stage["region"].notna()).sum())
+            logger.info("[staging-import] region mapped: %d unique values before=%d after=%d",
+                        mapped_count, before_unique, after_unique)
+
+        if "district" in df_stage.columns and norm_district_map:
+            before_unique = df_stage["district"].nunique()
+            df_stage["district"] = df_stage["district"].apply(lambda v: _map_value(v, norm_district_map))
+            after_unique = df_stage["district"].nunique()
+            mapped_count = int((df_stage["district"].notna()).sum())
+            logger.info("[staging-import] district mapped: %d unique values before=%d after=%d",
+                        mapped_count, before_unique, after_unique)
+
+        if "ward" in df_stage.columns and norm_ward_map:
+            before_unique = df_stage["ward"].nunique()
+            df_stage["ward"] = df_stage["ward"].apply(lambda v: _map_value(v, norm_ward_map))
+            after_unique = df_stage["ward"].nunique()
+            mapped_count = int((df_stage["ward"].notna()).sum())
+            logger.info("[staging-import] ward mapped: %d unique values before=%d after=%d",
+                        mapped_count, before_unique, after_unique)
+
+        # Log a few sample values so we can confirm names (not IDs) are staged.
+        for col in ("region", "district", "ward"):
+            if col in df_stage.columns:
+                samples = df_stage[col].dropna().unique()[:5].tolist()
+                logger.info("[staging-import] %s sample staged values: %s", col, samples)
+
+    except Exception:
+        logger.exception("location mapping: failed to map region/district/ward")
+
+
+    # Diagnostics: report staged fill-rate for mapped staging columns.
+    # This helps detect where values are being turned into NULL by cleaning.
+    try:
+        mapped_stage_cols = sorted({dst for dst in excel_to_stage.values() if dst in df_stage.columns})
+        if mapped_stage_cols:
+            fill_stats = []
+            for c in mapped_stage_cols:
+                non_null = int(df_stage[c].notna().sum())
+                nulls = int(df_stage[c].isna().sum())
+                fill_stats.append((nulls, non_null, c))
+            fill_stats.sort(reverse=True)  # most nulls first
+            _progress("diagnostic: staging null/non-null counts (top nulls first):")
+            for nulls, non_null, c in fill_stats[:30]:
+                _progress(f"  {c}: null={nulls} non_null={non_null}")
+    except Exception:
+        logger.exception("diagnostic: failed to compute staging fill rates")
+
+    # Diagnostic: print one representative staged row to help spot where data disappears.
+    # We prefer a row that has fire/insurance columns present (or at least the src row no)
+    # so the user can cross-check directly in Excel.
+    try:
+        debug_cols = [
+            c
+            for c in (
+                "source_row_no",
+                "approval_no",
+                "application_number",
+                "region",
+                "district",
+                "ward",
+                "fire_certificate_control_number",
+                "cover_note_number",
+                "cover_note_ref_no",
+                "insurance_ref_no",
+            )
+            if c in df_stage.columns
+        ]
+
+        def _looks_numeric_id(x: Any) -> bool:
+            s = _as_clean_str(x)
+            if s is None:
+                return False
+            return bool(pd.Series([s]).astype(str).str.match(r"^[0-9]{10,}$").iloc[0])
+
+        candidate = df_stage
+        if {"region", "district", "ward"}.issubset(df_stage.columns):
+            mask = (
+                df_stage["region"].apply(_looks_numeric_id)
+                | df_stage["district"].apply(_looks_numeric_id)
+                | df_stage["ward"].apply(_looks_numeric_id)
+            )
+            if mask.any():
+                candidate = df_stage[mask]
+
+        if not candidate.empty:
+            sample = candidate.iloc[0][debug_cols].to_dict()
+            _progress(f"diagnostic: sample staged row={sample}")
+    except Exception:
+        logger.exception("diagnostic: failed to print sample staged row")
 
     # Date columns: convert to ISO so transform.sql can cast reliably
     for dc in ("effective_date", "expire_date", "completed_at", "fire_valid_from", "fire_valid_to", "cover_note_start_date", "cover_note_end_date"):
@@ -335,10 +671,13 @@ def stage_and_copy_import(
         # Build per row attachments, only keep valid ones
         # This can be heavy for 500k rows; we only do it if filename columns exist.
         total = len(df)
+        # After filtering, df/df_stage might not have a 0..N-1 index.
+        # Use positional indexing to avoid KeyError on .at[0, ...].
+        gen_ids = df_stage["generated_id"].to_numpy()
         log_every = max(1, total // 20)  # ~5% increments
         for i in range(total):
             row = df.iloc[i]
-            app_gen_id = df_stage.at[i, "generated_id"]
+            app_gen_id = gen_ids[i]
             order = 1
             for id_col, filename_col, label in attachments_spec:
                 if filename_col is None or filename_col not in df_col_set:
@@ -406,10 +745,42 @@ def stage_and_copy_import(
         else:
             _progress("COPY docs skipped (0 docs)")
 
+    # Stage Categories
+    if "license_type" in df.columns:
+        valid_cats = df["license_type"].dropna().astype(str).str.strip()
+        # Filter out empty strings
+        valid_cats = valid_cats[valid_cats != ""]
+        unique_cats = valid_cats.unique()
+        
+        cat_rows = []
+        for c in unique_cats:
+            cat_rows.append((c, sector_name))
+
+        if cat_rows:
+            _copy_dataframe_to_table(db, "public.stage_categories", ["name", "sector_name"], cat_rows)
+            db.commit()
+            _progress(f"COPY categories {len(cat_rows)} distinct license types")
+
     # Transform into final
     _progress("transform into final begin")
     run_transform_into_final(db)
     _progress("transform into final done")
+
+    # Collect server notices after the commit so all DO blocks have flushed their RAISE NOTICE.
+    transform_notices = _drain_psycopg_notices(db)
+    inserted_from_transform: Dict[str, int] = {}
+    for n in transform_notices:
+        # example: "NOTICE:  [staging-transform] inserted apps=123"
+        if "[staging-transform]" not in n or "inserted" not in n or "=" not in n:
+            continue
+        try:
+            left, right = n.rsplit("=", 1)
+            cnt = int(str(right).strip())
+            key = left.split("inserted", 1)[1].strip()
+            key = key.replace("NOTICE:", "").replace(":", "").strip()
+            inserted_from_transform[key] = cnt
+        except Exception:
+            continue
 
     # Make outcomes explicit (helps troubleshoot partial inserts)
     inserted_apps = db.execute(
@@ -417,7 +788,7 @@ def stage_and_copy_import(
             """
             SELECT COUNT(*)
             FROM public.stage_ca_applications_raw s
-            JOIN public.ca_applications a
+            JOIN public.applications a
               ON a.id = s.generated_id
             """
         )
@@ -428,8 +799,11 @@ def stage_and_copy_import(
             """
             SELECT COUNT(*)
             FROM public.stage_ca_documents_raw d
-            JOIN public.ca_documents cd
-              ON cd.id = d.id
+                        JOIN public.application_sector_details asd
+                            ON asd.id = d.application_generated_id
+                        JOIN public.documents cd
+                            ON cd.id = d.id
+                         AND cd.application_sector_detail_id = asd.id
             """
         )
     ).scalar() or 0
@@ -439,14 +813,17 @@ def stage_and_copy_import(
             """
             SELECT COUNT(*)
             FROM public.stage_ca_contact_persons_raw c
-            JOIN public.ca_contact_persons cp
-              ON cp.id = c.id
+                        JOIN public.application_sector_details asd
+                            ON asd.id = c.application_generated_id
+                        JOIN public.contact_persons cp
+                            ON cp.id = c.id
+                         AND cp.app_sector_detail_id = asd.id
             """
         )
     ).scalar() or 0
 
     # Diagnostics: why apps were skipped?
-    # 1) Conflicts with existing rows in ca_applications (already in DB)
+    # 1) Conflicts with existing rows in applications (already in DB)
     skipped_due_to_existing_approval_no = db.execute(
         text(
             """
@@ -454,7 +831,7 @@ def stage_and_copy_import(
             FROM public.stage_ca_applications_raw s
             WHERE NULLIF(s.approval_no, '') IS NOT NULL
               AND EXISTS (
-                SELECT 1 FROM public.ca_applications a
+                SELECT 1 FROM public.applications a
                 WHERE a.approval_no IS NOT DISTINCT FROM NULLIF(s.approval_no, '')
               )
             """
@@ -468,12 +845,12 @@ def stage_and_copy_import(
             FROM public.stage_ca_applications_raw s
             WHERE NULLIF(s.application_number, '') IS NOT NULL
               AND EXISTS (
-                SELECT 1 FROM public.ca_applications a
-                WHERE a.application_number IS NOT DISTINCT FROM NULLIF(s.application_number, '')
-              )
-            """
-        )
-    ).scalar() or 0
+                                SELECT 1 FROM public.applications a
+                                WHERE a.application_number IS NOT DISTINCT FROM NULLIF(s.application_number, '')
+                            )
+                        """
+                )
+        ).scalar() or 0
 
     # 2) Duplicates inside the staging batch itself (Excel duplicates)
     dup_approval_no_in_stage = db.execute(
@@ -512,9 +889,9 @@ def stage_and_copy_import(
             """
             SELECT COUNT(*)
             FROM public.stage_ca_documents_raw d
-            LEFT JOIN public.ca_applications a
-              ON a.id = d.application_generated_id
-            WHERE a.id IS NULL
+            LEFT JOIN public.application_sector_details sd
+              ON sd.id = d.application_generated_id
+            WHERE sd.id IS NULL
             """
         )
     ).scalar() or 0
@@ -524,9 +901,9 @@ def stage_and_copy_import(
             """
             SELECT COUNT(*)
             FROM public.stage_ca_contact_persons_raw c
-            LEFT JOIN public.ca_applications a
-              ON a.id = c.application_generated_id
-            WHERE a.id IS NULL
+            LEFT JOIN public.application_sector_details sd
+              ON sd.id = c.application_generated_id
+            WHERE sd.id IS NULL
             """
         )
     ).scalar() or 0
@@ -535,6 +912,31 @@ def stage_and_copy_import(
     staged_docs = int(len(docs_rows))
     staged_contacts = int(len(contact_rows))
     skipped_apps = staged_apps - int(inserted_apps)
+
+    tables_summary = {
+        "applications": {
+            "staged": staged_apps,
+            "inserted": int(inserted_apps),
+            "skipped": int(skipped_apps),
+        },
+        "documents": {
+            "staged": staged_docs,
+            "inserted": int(inserted_docs),
+            "skipped": int(staged_docs - int(inserted_docs)),
+        },
+        "contact_persons": {
+            "staged": staged_contacts,
+            "inserted": int(inserted_contacts),
+            "skipped": int(staged_contacts - int(inserted_contacts)),
+        },
+    }
+
+    # Merge in transform-level metrics for tables that aren't directly counted above.
+    # Example keys from SQL notices: "application_sector_details", "certificates".
+    for k, v in inserted_from_transform.items():
+        tables_summary.setdefault(k, {})
+        # Don't overwrite if we already computed inserted.
+        tables_summary[k].setdefault("inserted", v)
 
     _progress(
         f"summary: staged_apps={staged_apps}, inserted_apps={int(inserted_apps)}, skipped_apps={skipped_apps}; "
@@ -553,6 +955,7 @@ def stage_and_copy_import(
     )
 
     return {
+        "tables": tables_summary,
         "staged_app_rows": staged_apps,
         "inserted_app_rows": int(inserted_apps),
         "skipped_app_rows": int(skipped_apps),
@@ -569,4 +972,9 @@ def stage_and_copy_import(
         "staged_contact_rows": staged_contacts,
         "inserted_contact_rows": int(inserted_contacts),
         "staged_contact_rows_for_skipped_apps": int(staged_contacts_for_skipped_apps),
+
+        # Extra: what the SQL transform itself reported (per-table inserted counts).
+        "transform_inserted": inserted_from_transform,
+        # Full NOTICE list can be useful for debugging but is kept in the response (not logs).
+        "transform_notices": transform_notices,
     }

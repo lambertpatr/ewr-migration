@@ -1,10 +1,11 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 import logging
 import uuid as uuid_mod
 from datetime import datetime
 from pathlib import Path
+from enum import Enum
 
 from app.core.database import get_db
 from app.utils.file_reader import read_users_file
@@ -18,6 +19,12 @@ logging.basicConfig(level=logging.INFO)
 
 router = APIRouter(prefix="/api/v1/application-migrations", tags=["03 - Applications Migration"])
 
+class SectorName(str, Enum):
+    PETROLEUM = "PETROLEUM"
+    NATURAL_GAS = "NATURAL_GAS"
+    ELECTRICITY = "ELECTRICITY"
+    WATER_SUPPLY = "WATER_SUPPLY"
+
 # Simple in-memory job status tracker
 _job_status: dict = {}
 
@@ -29,11 +36,11 @@ def _get_new_session():
     return db_module._SessionLocal()
 
 
-def _run_import_job(job_id: str, df):
+def _run_import_job(job_id: str, df, sector_name: str = "PETROLEUM"):
     """Background task that runs the import and updates job status."""
     global _job_status
     _job_status[job_id] = {"status": "RUNNING", "started_at": datetime.utcnow().isoformat(), "progress": "Starting..."}
-    logger.info("[Job %s] Starting import of %d rows", job_id, len(df))
+    logger.info("[Job %s] Starting import of %d rows (sector=%s)", job_id, len(df), sector_name)
     
     try:
         db = _get_new_session()
@@ -43,7 +50,7 @@ def _run_import_job(job_id: str, df):
                 _job_status[job_id]["progress"] = msg
 
             # For large files (e.g. 500k rows) on a remote DB, staging+COPY is dramatically faster.
-            result = import_applications_via_staging_copy(db, df, progress_cb=_progress)
+            result = import_applications_via_staging_copy(db, df, progress_cb=_progress, sector_name=sector_name)
             db.commit()
             _job_status[job_id] = {
                 "status": "COMPLETED",
@@ -58,7 +65,10 @@ def _run_import_job(job_id: str, df):
                 "error": str(e),
                 "failed_at": datetime.utcnow().isoformat()
             }
-            logger.exception("[Job %s] Import failed: %s", job_id, e)
+            # Keep logs concise by default: SQLAlchemy exceptions can include huge SQL strings.
+            # Full traceback/SQL is still available by enabling DEBUG logs.
+            logger.error("[Job %s] Import failed: %s: %s", job_id, type(e).__name__, str(e))
+            logger.debug("[Job %s] Import failed (debug traceback)", job_id, exc_info=True)
         finally:
             db.close()
     except Exception as e:
@@ -68,6 +78,7 @@ def _run_import_job(job_id: str, df):
 
 @router.post('/upload')
 def upload_application_migrations(
+    sector_name: SectorName = Form(SectorName.PETROLEUM),
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None,
     sync: bool = False
@@ -75,11 +86,16 @@ def upload_application_migrations(
     """
     Upload and import applications from Excel/CSV.
     
+    - Use sector_name (NATURAL_GAS, PETROLEUM, ELECTRICITY, WATER_SUPPLY) 
+      to associate new categories with the correct sector.
     - By default (sync=false), the import runs in the background and you get a job_id immediately.
     - Use GET /status/{job_id} to check progress.
     - Set sync=true to wait for the import to complete (may timeout for large files).
     """
-    logger.info("Received upload request: %s (sync=%s)", file.filename, sync)
+    logger.info("Received upload request: %s (sector=%s) (sync=%s)", file.filename, sector_name, sync)
+    
+    # Use the enum value (string) for downstream logic
+    sector_str = sector_name.value
 
     try:
         df = read_users_file(file.filename, file.file)
@@ -92,7 +108,7 @@ def upload_application_migrations(
         # Synchronous mode: wait for completion (may timeout)
         db = _get_new_session()
         try:
-            result = import_applications_via_staging_copy(db, df)
+            result = import_applications_via_staging_copy(db, df, sector_name=sector_str)
             db.commit()
             logger.info("Import completed: %s", result)
             return {"status": "SUCCESS", "result": result}
@@ -106,7 +122,7 @@ def upload_application_migrations(
         # Async mode: run in background and return job_id immediately
         job_id = str(uuid_mod.uuid4())
         _job_status[job_id] = {"status": "QUEUED", "queued_at": datetime.utcnow().isoformat()}
-        background_tasks.add_task(_run_import_job, job_id, df)
+        background_tasks.add_task(_run_import_job, job_id, df, sector_str)
         logger.info("Queued background import job: %s", job_id)
         return JSONResponse(
             status_code=202,

@@ -56,47 +56,95 @@ class LoisUsersImportService:
                     # Progress should never break the import.
                     pass
 
-        # 1) UPSERT USER (by username)
-        upsert_user_sql = text("""
-            INSERT INTO users (
-                full_name,
-                username,
-                password_hash,
-                status,
-                phone_number,
-                email_address,
-                user_category,
-                account_type,
-                auth_mode,
-                created_at,
-                updated_at
-            )
-            VALUES (
-                :full_name,
-                :username,
-                :password_hash,
-                :status,
-                :phone_number,
-                :email_address,
-                :user_category,
-                :account_type,
-                :auth_mode,
-                now(),
-                now()
-            )
-            ON CONFLICT (username)
-            DO UPDATE SET
-                full_name = EXCLUDED.full_name,
-                password_hash = EXCLUDED.password_hash,
-                status = EXCLUDED.status,
-                phone_number = EXCLUDED.phone_number,
-                email_address = EXCLUDED.email_address,
-                user_category = EXCLUDED.user_category,
-                account_type = EXCLUDED.account_type,
-                auth_mode = EXCLUDED.auth_mode,
-                updated_at = now()
-            RETURNING id, (xmax = 0) AS inserted;
-        """)
+        # Helper: check whether a given table has a unique/exclusion/PK
+        # constraint covering ALL of the specified column names.
+        def _has_unique_on(table: str, *col_names: str) -> bool:
+            try:
+                return bool(db.execute(text("""
+                    SELECT 1
+                    FROM pg_constraint c
+                    JOIN pg_class r ON r.oid = c.conrelid
+                    JOIN pg_namespace n ON n.oid = r.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND r.relname   = :tbl
+                      AND c.contype  IN ('u', 'p', 'x')
+                      AND c.conkey @> ARRAY(
+                          SELECT a.attnum
+                          FROM pg_attribute a
+                          WHERE a.attrelid = r.oid
+                            AND a.attname  = ANY(:cols)
+                      )
+                      AND array_length(c.conkey, 1) = :ncols
+                    LIMIT 1
+                """), {"tbl": table, "cols": list(col_names), "ncols": len(col_names)}).scalar())
+            except Exception:
+                return False
+
+        # 1) Detect whether users.username has a unique/exclusion constraint.
+        # Some live schemas don't have it; we must handle both paths gracefully.
+        _username_unique = _has_unique_on('users', 'username')
+
+        # 1a) UPSERT USER (by username) — single-row path (used elsewhere)
+        if _username_unique:
+            upsert_user_sql = text("""
+                INSERT INTO users (
+                    full_name, username, password_hash, status,
+                    phone_number, email_address, user_category,
+                    account_type, auth_mode, created_at, updated_at
+                )
+                VALUES (
+                    :full_name, :username, :password_hash, :status,
+                    :phone_number, :email_address, :user_category,
+                    :account_type, :auth_mode, now(), now()
+                )
+                ON CONFLICT (username)
+                DO UPDATE SET
+                    full_name      = EXCLUDED.full_name,
+                    password_hash  = EXCLUDED.password_hash,
+                    status         = EXCLUDED.status,
+                    phone_number   = EXCLUDED.phone_number,
+                    email_address  = EXCLUDED.email_address,
+                    user_category  = EXCLUDED.user_category,
+                    account_type   = EXCLUDED.account_type,
+                    auth_mode      = EXCLUDED.auth_mode,
+                    updated_at     = now()
+                RETURNING id, (xmax = 0) AS inserted;
+            """)
+        else:
+            # No unique constraint on username — use a safe manual upsert
+            upsert_user_sql = None  # handled row-by-row via _manual_upsert_user below
+
+        def _manual_upsert_user(params: dict):
+            """Safe user upsert when username has no unique constraint."""
+            row = db.execute(
+                text("SELECT id FROM users WHERE username = :username LIMIT 1"),
+                {"username": params["username"]}
+            ).mappings().first()
+            if row:
+                db.execute(text("""
+                    UPDATE users SET
+                        full_name     = :full_name,
+                        password_hash = :password_hash,
+                        status        = :status,
+                        phone_number  = :phone_number,
+                        email_address = :email_address,
+                        user_category = :user_category,
+                        account_type  = :account_type,
+                        auth_mode     = :auth_mode,
+                        updated_at    = now()
+                    WHERE id = :id
+                """), {**params, "id": row["id"]})
+                return row["id"], False
+            new_id = str(uuid.uuid4())
+            db.execute(text("""
+                INSERT INTO users (id, full_name, username, password_hash, status,
+                    phone_number, email_address, user_category, account_type, auth_mode,
+                    failed_attempts, is_first_login, deleted, created_at, updated_at)
+                VALUES (:id, :full_name, :username, :password_hash, :status,
+                    :phone_number, :email_address, :user_category, :account_type, :auth_mode,
+                    0, false, false, now(), now())
+            """), {**params, "id": new_id})
+            return new_id, True
 
         # 2) Detect role table name (some schemas use 'role' while others use
         # 'roles') and build the upsert SQL accordingly. We use Postgres
@@ -114,8 +162,8 @@ class LoisUsersImportService:
             raise ValueError("No role table found (looked for 'roles' and 'role')")
 
         upsert_role_sql = text(f"""
-            INSERT INTO {role_table} (name, created_at, updated_at)
-            VALUES (:name, now(), now())
+            INSERT INTO {role_table} (id, name, deleted, active, created_at, updated_at)
+            VALUES (gen_random_uuid(), :name, false, true, now(), now())
             ON CONFLICT (name)
             DO UPDATE SET updated_at = now()
             RETURNING id, (xmax = 0) AS inserted;
@@ -134,7 +182,7 @@ class LoisUsersImportService:
                 return role_id, False
             # insert new role with generated uuid
             new_id = str(uuid.uuid4())
-            db.execute(text(f"INSERT INTO {role_table} (id, name, created_at, updated_at) VALUES (:id, :name, now(), now())"), {"id": new_id, "name": name_val})
+            db.execute(text(f"INSERT INTO {role_table} (id, name, deleted, active, created_at, updated_at) VALUES (:id, :name, false, true, now(), now())"), {"id": new_id, "name": name_val})
             return new_id, True
 
         # 3) MAP USER_ROLE
@@ -256,8 +304,8 @@ class LoisUsersImportService:
                     SELECT DISTINCT TRIM(UPPER(role)) AS role_name
                     FROM staging_lois WHERE role IS NOT NULL AND TRIM(role) <> ''
                 )
-                INSERT INTO {role_table} (id, name, created_at, updated_at)
-                SELECT gen_random_uuid(), role_name, now(), now()
+                INSERT INTO {role_table} (id, name, deleted, active, created_at, updated_at)
+                SELECT gen_random_uuid(), role_name, false, true, now(), now()
                 FROM distinct_roles
                 ON CONFLICT (name) DO UPDATE SET updated_at = now()
                 RETURNING id, name;
@@ -294,71 +342,170 @@ class LoisUsersImportService:
             # 4) Upsert users in bulk
             _progress("users:upsert:start", skip_existing=bool(skip_existing))
 
-            conflict_clause = "DO NOTHING" if skip_existing else "DO UPDATE SET\n                        full_name = EXCLUDED.full_name,\n                        password_hash = EXCLUDED.password_hash,\n                        status = EXCLUDED.status,\n                        phone_number = EXCLUDED.phone_number,\n                        email_address = EXCLUDED.email_address,\n                        user_category = EXCLUDED.user_category,\n                        account_type = EXCLUDED.account_type,\n                        auth_mode = EXCLUDED.auth_mode,\n                        updated_at = now()"
-
-            users_upsert_sql = text(f"""
+            # Shared CTE that deduplicates staging rows by username
+            _users_cte = """
                 WITH user_rows_raw AS (
                     SELECT
-                        TRIM(firstname) AS firstname,
-                        TRIM(lastname) AS lastname,
-                        TRIM(username) AS username,
+                        TRIM(firstname)            AS firstname,
+                        TRIM(lastname)             AS lastname,
+                        TRIM(username)             AS username,
                         password_hash,
-                        TRIM(UPPER(status)) AS status,
-                        TRIM(mobilenumber) as phone_number,
-                        TRIM(emailid) AS email_address,
+                        TRIM(UPPER(status))        AS status,
+                        TRIM(mobilenumber)         AS phone_number,
+                        TRIM(emailid)              AS email_address,
                         TRIM(UPPER(user_category)) AS user_category,
-                        TRIM(UPPER(account_type)) AS account_type,
-                        TRIM(UPPER(auth_mode)) AS auth_mode,
+                        TRIM(UPPER(account_type))  AS account_type,
+                        TRIM(UPPER(auth_mode))     AS auth_mode,
                         ctid AS _ctid
                     FROM staging_lois
                     WHERE username IS NOT NULL AND TRIM(username) <> ''
                 ),
                 user_rows AS (
-                    -- Deduplicate rows for the same username within this batch.
-                    -- Required because Postgres cannot "DO UPDATE" the same target row twice
-                    -- within a single INSERT statement.
                     SELECT DISTINCT ON (username)
-                        firstname,
-                        lastname,
-                        username,
-                        password_hash,
-                        status,
-                        phone_number,
-                        email_address,
-                        user_category,
-                        account_type,
-                        auth_mode
+                        firstname, lastname, username, password_hash,
+                        status, phone_number, email_address,
+                        user_category, account_type, auth_mode
                     FROM user_rows_raw
                     ORDER BY username, _ctid DESC
-                ),
-                ins_users AS (
-                    INSERT INTO users (full_name, username, password_hash, status, phone_number, email_address, user_category, account_type, auth_mode, created_at, updated_at)
+                )
+            """
+
+            _conflict_update = """
+                        full_name     = EXCLUDED.full_name,
+                        password_hash = EXCLUDED.password_hash,
+                        status        = EXCLUDED.status,
+                        phone_number  = EXCLUDED.phone_number,
+                        email_address = EXCLUDED.email_address,
+                        user_category = EXCLUDED.user_category,
+                        account_type  = EXCLUDED.account_type,
+                        auth_mode     = EXCLUDED.auth_mode,
+                        updated_at    = now()
+            """
+
+            _insert_select = """
+                    INSERT INTO users (id, full_name, username, password_hash, status,
+                        phone_number, email_address, user_category, account_type,
+                        auth_mode, failed_attempts, is_first_login, deleted,
+                        created_at, updated_at)
                     SELECT
+                        gen_random_uuid(),
                         (COALESCE(firstname,'') || ' ' || COALESCE(lastname,''))::text,
-                        username,
-                        password_hash,
+                        username, password_hash,
                         COALESCE(status, 'ACTIVE'),
-                        phone_number,
-                        email_address,
+                        phone_number, email_address,
                         COALESCE(user_category, 'EXTERNAL'),
                         COALESCE(account_type, 'INDIVIDUAL'),
                         COALESCE(auth_mode, 'DB'),
+                        0,
+                        false,
+                        false,
                         now(), now()
                     FROM user_rows
-                    ON CONFLICT (username)
-                    {conflict_clause}
-                    RETURNING id, username
-                )
-                SELECT * FROM ins_users;
-            """)
+            """
 
-            user_rows = db.execute(users_upsert_sql).mappings().all()
-            # Count inserted/updated approximately: we can't tell easily which
-            # were inserts via RETURNING without tracking xmax; we'll set
-            # inserted_users to number of returned rows for now.
-            inserted_users += len(user_rows)
-            # If skip_existing=True, RETURNING only includes inserted rows, so
-            # we can estimate skipped as distinct_usernames - inserted.
+            if _username_unique:
+                # Fast path: database has UNIQUE(username) — use ON CONFLICT
+                if skip_existing:
+                    on_conflict = "ON CONFLICT (username) DO NOTHING"
+                else:
+                    on_conflict = f"ON CONFLICT (username) DO UPDATE SET\n{_conflict_update}"
+
+                users_upsert_sql = text(f"""
+                    {_users_cte},
+                    ins_users AS (
+                        {_insert_select}
+                        {on_conflict}
+                        RETURNING id, username
+                    )
+                    SELECT * FROM ins_users;
+                """)
+
+                user_rows = db.execute(users_upsert_sql).mappings().all()
+                inserted_users += len(user_rows)
+            else:
+                # Slow path: no UNIQUE constraint on users.username.
+                # Rules:
+                #   - NEVER call db.rollback() — that drops the TEMP TABLE staging_lois
+                #     (created ON COMMIT DROP) and kills all subsequent statements.
+                #   - Supply gen_random_uuid() for id (no server default).
+                #   - Supply deleted=false (NOT NULL, no default).
+                #   - Use savepoints (begin_nested) so a failed step doesn't abort
+                #     the outer transaction.
+
+                # Step 1: insert new usernames only (WHERE NOT EXISTS guard)
+                _fallback_insert_sql = text(f"""
+                    {_users_cte}
+                    INSERT INTO users (id, full_name, username, password_hash, status,
+                        phone_number, email_address, user_category, account_type,
+                        auth_mode, failed_attempts, is_first_login, deleted,
+                        created_at, updated_at)
+                    SELECT
+                        gen_random_uuid(),
+                        (COALESCE(firstname,'') || ' ' || COALESCE(lastname,''))::text,
+                        username, password_hash,
+                        COALESCE(status, 'ACTIVE'),
+                        phone_number, email_address,
+                        COALESCE(user_category, 'EXTERNAL'),
+                        COALESCE(account_type, 'INDIVIDUAL'),
+                        COALESCE(auth_mode, 'DB'),
+                        0,
+                        false,
+                        false,
+                        now(), now()
+                    FROM user_rows
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM users ex WHERE ex.username = user_rows.username
+                    )
+                    RETURNING id, username;
+                """)
+
+                try:
+                    with db.begin_nested():
+                        res = db.execute(_fallback_insert_sql).mappings().all()
+                        inserted_users += len(res)
+                except Exception as _fe:
+                    errors.append(f"users-insert-failed: {_fe}")
+
+                # Step 2: update existing rows unless caller wants skip_existing
+                if not skip_existing:
+                    _fallback_update_sql = text(f"""
+                        {_users_cte}
+                        UPDATE users u
+                        SET
+                            full_name     = (COALESCE(r.firstname,'') || ' ' || COALESCE(r.lastname,''))::text,
+                            password_hash = r.password_hash,
+                            status        = COALESCE(r.status, 'ACTIVE'),
+                            phone_number  = r.phone_number,
+                            email_address = r.email_address,
+                            user_category = COALESCE(r.user_category, 'EXTERNAL'),
+                            account_type  = COALESCE(r.account_type, 'INDIVIDUAL'),
+                            auth_mode     = COALESCE(r.auth_mode, 'DB'),
+                            updated_at    = now()
+                        FROM user_rows r
+                        WHERE u.username = r.username;
+                    """)
+                    try:
+                        with db.begin_nested():
+                            db.execute(_fallback_update_sql)
+                    except Exception as _ue:
+                        errors.append(f"users-update-failed: {_ue}")
+
+                # Step 3: fetch all matched users for the role-mapping step below
+                try:
+                    with db.begin_nested():
+                        user_rows = db.execute(text("""
+                            SELECT u.id, u.username
+                            FROM users u
+                            JOIN (
+                                SELECT DISTINCT TRIM(username) AS username
+                                FROM staging_lois
+                                WHERE username IS NOT NULL AND TRIM(username) <> ''
+                            ) s ON s.username = u.username
+                        """)).mappings().all()
+                except Exception as _re:
+                    errors.append(f"users-refetch-failed: {_re}")
+                    user_rows = []
+
             if skip_existing and staged_distinct_usernames is not None:
                 skipped += max(0, int(staged_distinct_usernames) - int(inserted_users))
 
@@ -369,7 +516,6 @@ class LoisUsersImportService:
                 staged_distinct_usernames=staged_distinct_usernames,
             )
 
-            errors = []
             # 5) Create mapping rows in bulk
             if mapping_table:
                 _progress("user_roles:map:start", mapping_table=mapping_table)
@@ -389,53 +535,58 @@ class LoisUsersImportService:
                 cols = "user_id, role_id, created_at" if has_created_at else "user_id, role_id"
                 select_now = ", now()" if has_created_at else ""
 
-                mapping_sql_onconflict = text(f"""
-                    INSERT INTO {mapping_table} ({cols})
-                    SELECT DISTINCT u.id, r.id{select_now}
-                    FROM staging_lois s
-                    JOIN users u ON u.username = TRIM(s.username)
-                    JOIN {role_table} r ON UPPER(r.name) = TRIM(UPPER(s.role))
-                    ON CONFLICT (user_id, role_id) DO NOTHING;
-                """)
+                # Detect at runtime whether the mapping table has a unique/PK
+                # constraint on (user_id, role_id).  We avoid trying ON CONFLICT
+                # when no such constraint exists — that would raise an error and
+                # (even inside a savepoint) produce noise in the errors list.
+                _mapping_unique = _has_unique_on(mapping_table, 'user_id', 'role_id')
 
-                # Try the fast ON CONFLICT path inside a savepoint so failures
-                # don't abort the outer transaction (which would drop the temp
-                # table). If that fails (for example because the mapping table
-                # lacks a UNIQUE constraint), fall back to an INSERT ... WHERE
-                # NOT EXISTS pattern which doesn't require a unique constraint.
-                try:
-                    with db.begin_nested():
-                        res = db.execute(mapping_sql_onconflict)
-                        try:
-                            rc = int(res.rowcount)
-                            if rc and rc > 0:
-                                inserted_user_roles += rc
-                        except Exception:
-                            pass
-                except Exception as e:
-                    errors.append(f"mapping-onconflict-failed: {e}")
-                    # Fallback path that works without a UNIQUE constraint.
-                    mapping_sql_fallback = text(f"""
+                if _mapping_unique:
+                    # Fast path: constraint present — use ON CONFLICT DO NOTHING.
+                    mapping_sql = text(f"""
+                        INSERT INTO {mapping_table} ({cols})
+                        SELECT DISTINCT u.id, r.id{select_now}
+                        FROM staging_lois s
+                        JOIN users u ON u.username = TRIM(s.username)
+                        JOIN {role_table} r ON UPPER(r.name) = TRIM(UPPER(s.role))
+                        ON CONFLICT (user_id, role_id) DO NOTHING;
+                    """)
+                    try:
+                        with db.begin_nested():
+                            res = db.execute(mapping_sql)
+                            try:
+                                rc = int(res.rowcount)
+                                if rc and rc > 0:
+                                    inserted_user_roles += rc
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        errors.append(f"mapping-onconflict-failed: {e}")
+                else:
+                    # Slow path: no unique constraint — use WHERE NOT EXISTS.
+                    # This never raises InvalidColumnReference.
+                    mapping_sql = text(f"""
                         INSERT INTO {mapping_table} ({cols})
                         SELECT DISTINCT u.id, r.id{select_now}
                         FROM staging_lois s
                         JOIN users u ON u.username = TRIM(s.username)
                         JOIN {role_table} r ON UPPER(r.name) = TRIM(UPPER(s.role))
                         WHERE NOT EXISTS (
-                            SELECT 1 FROM {mapping_table} m WHERE m.user_id = u.id AND m.role_id = r.id
+                            SELECT 1 FROM {mapping_table} m
+                            WHERE m.user_id = u.id AND m.role_id = r.id
                         );
                     """)
                     try:
-                        res2 = db.execute(mapping_sql_fallback)
-                        try:
-                            rc2 = int(res2.rowcount)
-                            if rc2 and rc2 > 0:
-                                inserted_user_roles += rc2
-                        except Exception:
-                            pass
-                    except Exception as e2:
-                        errors.append(f"mapping-fallback-failed: {e2}")
-                        # Don't re-raise: we want to collect errors and continue.
+                        with db.begin_nested():
+                            res = db.execute(mapping_sql)
+                            try:
+                                rc = int(res.rowcount)
+                                if rc and rc > 0:
+                                    inserted_user_roles += rc
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        errors.append(f"mapping-fallback-failed: {e}")
 
                 _progress("user_roles:map:done", inserted_user_roles=inserted_user_roles)
 
