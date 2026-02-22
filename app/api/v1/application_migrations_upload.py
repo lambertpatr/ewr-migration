@@ -146,6 +146,3 @@ def get_job_status(job_id: str):
 def list_jobs():
     """List all import jobs and their statuses."""
     return _job_status
-
-
-

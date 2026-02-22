@@ -62,13 +62,17 @@ def _parse_int_like(val: Any) -> Optional[int]:
 def _convert_excel_date_to_iso(val: Any) -> Optional[str]:
     """Return YYYY-MM-DD string or None.
 
-    Matches behavior in application_migrations_service but returns string
-    because staging table keeps dates as text.
+    Handles:
+    - pandas Timestamp / datetime objects  (before or after _as_clean_str)
+    - YYYY-MM-DD HH:MM:SS  (pandas stringifies Timestamps this way)
+    - YYYY-MM-DD
+    - DD/MM/YYYY, MM/DD/YYYY, DD-MM-YYYY, YYYY/MM/DD
+    - Excel serial float (e.g. 44927.0)
     """
     if val is None:
         return None
 
-    # Pandas Timestamp/datetime
+    # Pandas Timestamp / datetime — handle BEFORE converting to string
     if hasattr(val, "strftime"):
         try:
             return val.strftime("%Y-%m-%d")
@@ -79,22 +83,31 @@ def _convert_excel_date_to_iso(val: Any) -> Optional[str]:
     if not s or s.lower() in _EMPTY_MARKERS:
         return None
 
-    # Excel serial float dates
+    # Excel serial float dates (e.g. 43979.0 → 2020-06-15)
     try:
         f = float(s)
-        if f > 1000:  # serial dates are large numbers
-            # Excel serial date: day 0 is 1899-12-30 in pandas
+        if f > 1000:  # serial dates are large numbers; guards against tiny ints
             dt = pd.to_datetime(f, unit="D", origin="1899-12-30")
             return dt.strftime("%Y-%m-%d")
     except Exception:
         pass
 
-    # Already looks like date
-    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+    # Try all common string formats (include timestamp variants so
+    # _as_clean_str("2022-11-30 00:00:00") still parses correctly)
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",   # pandas Timestamp stringified → "2022-11-30 00:00:00"
+        "%Y-%m-%d %H:%M:%S.%f",# with microseconds
+        "%Y-%m-%dT%H:%M:%S",   # ISO-8601
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+        "%d-%m-%Y",
+        "%m/%d/%Y",
+        "%Y/%m/%d",
+    ):
         try:
-            dt = datetime.strptime(s, fmt)
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
             continue
 
     return None
@@ -394,6 +407,22 @@ def stage_and_copy_import(
     ensure_staging_schema(db)
     _progress("staging schema recreated")
 
+    # ── Schema guard: ensure applications.completed_at exists ────────────────
+    # This is needed when the live DB was provisioned before align_live_schema
+    # added the column.  Safe to re-run (ADD COLUMN IF NOT EXISTS is idempotent).
+    try:
+        db.execute(text("""
+            ALTER TABLE IF EXISTS public.applications
+                ADD COLUMN IF NOT EXISTS completed_at timestamp NULL
+        """))
+        db.commit()
+    except Exception as _sg_err:
+        logger.warning("[staging-import] schema guard completed_at skipped: %s", _sg_err)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
     # Normalize df columns: strip whitespace AND lowercase so header matching is robust.
     # e.g. "FControlNo" matches "fcontrolno", "Region " matches "region", etc.
     df_cols_original = [str(c) for c in df.columns]
@@ -468,15 +497,41 @@ def stage_and_copy_import(
             # mapped destination doesn't exist in staging schema -> ignore
             continue
         if src in df.columns:
-            df_stage[dst] = df[src]
-        else:
-            df_stage[dst] = None
+            # Only set if destination is still empty (first alias match wins).
+            # This prevents a later absent alias from overwriting a value already
+            # populated by an earlier alias key (e.g. approval_no set by
+            # 'approval_no', then wiped by 'approvalno' which is absent).
+            if dst not in df_stage.columns or df_stage[dst].isna().all():
+                df_stage[dst] = df[src]
+        # If src is absent from df, leave dst as-is (already initialised to None above).
+
+    # ── Normalise date columns to YYYY-MM-DD BEFORE _as_clean_str ────────────
+    # pandas keeps Excel date cells as Timestamp objects; _as_clean_str would
+    # turn them into "2022-11-30 00:00:00" which the later apply() block used
+    # to miss.  Running _convert_excel_date_to_iso first (on the raw Timestamps)
+    # guarantees we always store clean ISO strings in the staging table.
+    _DATE_STAGING_COLS = (
+        "effective_date", "expire_date", "completed_at",
+        "fire_valid_from", "fire_valid_to",
+        "cover_note_start_date", "cover_note_end_date",
+    )
+    for dc in _DATE_STAGING_COLS:
+        if dc in df_stage.columns:
+            df_stage[dc] = df_stage[dc].apply(_convert_excel_date_to_iso)
 
     # Clean common text null markers
     for c in df_stage.columns:
         if c in ("generated_id", "source_row_no"):
             continue
         df_stage[c] = df_stage[c].apply(_as_clean_str)
+
+    # Lowercase username in the DataFrame before COPY so mixed-case duplicates
+    # (e.g. ALLY.GANZO / Ally.Ganzo / ally.ganzo) are already normalised when
+    # they land in the staging table — no post-COPY UPDATE needed.
+    if "username" in df_stage.columns:
+        df_stage["username"] = df_stage["username"].apply(
+            lambda v: v.lower().strip() if isinstance(v, str) and v.strip() else None
+        )
 
     # Normalise integer-like float strings in location columns.
     # Pandas reads integer Excel cells as floats, so str() gives '1553779224293.0'.
@@ -619,10 +674,8 @@ def stage_and_copy_import(
     except Exception:
         logger.exception("diagnostic: failed to print sample staged row")
 
-    # Date columns: convert to ISO so transform.sql can cast reliably
-    for dc in ("effective_date", "expire_date", "completed_at", "fire_valid_from", "fire_valid_to", "cover_note_start_date", "cover_note_end_date"):
-        if dc in df_stage.columns:
-            df_stage[dc] = df_stage[dc].apply(_convert_excel_date_to_iso)
+    # NOTE: date columns were already normalised to YYYY-MM-DD above (before
+    # _as_clean_str), so no second pass is needed here.
 
     # Stage mappings raw fields
     # (these should be populated by caller mapping excel_to_stage)
@@ -761,7 +814,270 @@ def stage_and_copy_import(
             db.commit()
             _progress(f"COPY categories {len(cat_rows)} distinct license types")
 
+    # ── Provision users from staged usernames ──────────────────────────────────
+    # Must run BEFORE transform so that created_by backfill inside the transform
+    # (or subsequent backfill_created_by_from_username) can resolve UUIDs.
+    # Skip entirely if the users/roles tables are unreachable (FDW not configured).
+    _progress("provisioning users begin")
+    _inserted_users = 0
+    _skipped_users = 0
+    _inserted_user_roles = 0
+    _skipped_user_roles = 0
+    try:
+        db.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
+        db.commit()
+    except Exception:
+        pass
+
+    # Quick reachability check: if public.users is an FDW table and the remote
+    # server is unreachable, skip all three provisioning steps rather than
+    # logging three scary errors.
+    _users_reachable = False
+    try:
+        db.execute(text("SELECT 1 FROM public.users LIMIT 1"))
+        _users_reachable = True
+    except Exception as _reach_err:
+        logger.info(
+            "User provisioning skipped — public.users unreachable (FDW not configured "
+            "for this host). To fix: add '10.1.8.157/32' to pg_hba.conf on 10.1.8.144. "
+            "Error: %s", _reach_err
+        )
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    if not _users_reachable:
+        _progress("provisioning users skipped (FDW unreachable)")
+    else:
+        # Normalize usernames to lowercase in staging table before any user insert
+        # so that mixed-case duplicates (e.g. Ally.Ganzo / ALLY.GANZO) collapse to one row.
+        try:
+            db.execute(text("""
+                UPDATE public.stage_ca_applications_raw
+                SET username = lower(trim(username))
+                WHERE username IS NOT NULL
+                  AND username <> lower(trim(username))
+            """))
+            db.commit()
+        except Exception as _ln:
+            logger.warning("Could not lowercase staging usernames: %s", _ln)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        _total_usernames = 0
+
+        try:
+            _ur = db.execute(text("""
+                WITH u AS (
+                    SELECT DISTINCT lower(TRIM(username)) AS username
+                    FROM public.stage_ca_applications_raw
+                    WHERE NULLIF(TRIM(username), '') IS NOT NULL
+                )
+                INSERT INTO public.users (
+                    id, full_name, username, password_hash, status,
+                    phone_number, email_address, user_category,
+                    account_type, auth_mode, failed_attempts,
+                    is_first_login, deleted, created_at, updated_at
+                )
+                SELECT
+                    gen_random_uuid(), u.username, u.username, '',
+                    'ACTIVE', NULL, NULL, 'EXTERNAL', 'INDIVIDUAL', 'DB',
+                    0, false, false, now(), now()
+                FROM u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM public.users eu
+                    WHERE lower(trim(eu.username)) = u.username
+                )
+            """))
+            db.commit()
+            _inserted_users = _ur.rowcount or 0
+            # Distinct usernames in staging minus newly inserted = already existed
+            _total_usernames = db.execute(text(
+                "SELECT COUNT(DISTINCT lower(TRIM(username))) FROM public.stage_ca_applications_raw "
+                "WHERE NULLIF(TRIM(username), '') IS NOT NULL"
+            )).scalar() or 0
+            _skipped_users = max(0, int(_total_usernames) - int(_inserted_users))
+            _progress(f"provisioning users done: inserted={_inserted_users}, already_existed={_skipped_users}")
+        except Exception as _ue:
+            logger.warning("Provision users failed: %s", _ue)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        # Look up APPLICANT ROLE id without scanning public.roles.
+        # public.roles is a FDW foreign table whose remote name differs on the
+        # remote side — any scan fails with "relation public.role does not exist".
+        # We pick the role_id from an existing user_roles row (best-effort).
+        # If no row exists yet, role assignment is skipped gracefully.
+        _applicant_role_id = None
+        try:
+            # Strategy 1: pick any role_id already in user_roles — fastest, no FDW scan.
+            _ur_row = db.execute(text(
+                "SELECT role_id FROM public.user_roles LIMIT 1"
+            )).fetchone()
+            if _ur_row:
+                _applicant_role_id = str(_ur_row[0])
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        if not _applicant_role_id:
+            # public.roles FDW always fails (remote table is named public.role).
+            # We cannot safely scan roles — skip role assignment silently.
+            logger.info("APPLICANT ROLE id not found from user_roles; role assignment skipped (FDW limitation)")
+            _skipped_user_roles = int(_total_usernames)
+
+        # Assign APPLICANT ROLE to all staged users that don't have it yet.
+        # Remote user_roles FDW table only exposes (user_id, role_id).
+        if _applicant_role_id:
+            try:
+                _rr = db.execute(text("""
+                    WITH u AS (
+                        SELECT DISTINCT NULLIF(TRIM(username), '') AS username
+                        FROM public.stage_ca_applications_raw
+                        WHERE NULLIF(TRIM(username), '') IS NOT NULL
+                    )
+                    INSERT INTO public.user_roles (user_id, role_id)
+                    SELECT usr.id, :role_id
+                    FROM u
+                    JOIN public.users usr ON lower(trim(usr.username)) = lower(trim(u.username))
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM public.user_roles ur2
+                        WHERE ur2.user_id = usr.id AND ur2.role_id = :role_id
+                    )
+                """), {"role_id": _applicant_role_id})
+                db.commit()
+                _inserted_user_roles = _rr.rowcount or 0
+                _skipped_user_roles = max(0, int(_total_usernames) - int(_inserted_user_roles))
+                _progress(f"role assignment done: inserted={_inserted_user_roles}, already_had_role={_skipped_user_roles}")
+            except Exception as _ure:
+                logger.warning("Role assignment skipped (non-fatal): %s", _ure)
+                _skipped_user_roles = int(_total_usernames)
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
     # Transform into final
+    # Ensure uq_certificates_application_number exists before running the
+    # transform, which now uses ON CONFLICT (application_number) DO UPDATE.
+    _progress("ensure certificates unique constraint begin")
+    try:
+        db.execute(text("""
+            DO $$
+            DECLARE
+                _rec               RECORD;
+                _schema            text;
+                _cert_apprv_attnum  smallint;
+                _cert_appnum_attnum smallint;
+            BEGIN
+                FOR _schema IN
+                    SELECT nspname FROM pg_namespace
+                    WHERE  nspname IN ('public', 'align_live')
+                    ORDER BY nspname
+                LOOP
+                    IF NOT EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+                                   WHERE n.nspname=_schema AND c.relname='certificates') THEN
+                        CONTINUE;
+                    END IF;
+
+                    SELECT attnum INTO _cert_apprv_attnum
+                    FROM pg_attribute
+                    WHERE attrelid = (SELECT c.oid FROM pg_class c
+                                      JOIN pg_namespace n ON n.oid=c.relnamespace
+                                      WHERE n.nspname=_schema AND c.relname='certificates')
+                      AND attname = 'approval_no';
+
+                    SELECT attnum INTO _cert_appnum_attnum
+                    FROM pg_attribute
+                    WHERE attrelid = (SELECT c.oid FROM pg_class c
+                                      JOIN pg_namespace n ON n.oid=c.relnamespace
+                                      WHERE n.nspname=_schema AND c.relname='certificates')
+                      AND attname = 'application_number';
+
+                    -- Drop any existing unique that mentions approval_no (blocks the new one)
+                    IF _cert_apprv_attnum IS NOT NULL THEN
+                        FOR _rec IN
+                            SELECT con.conname FROM pg_constraint con
+                            JOIN pg_class cls ON cls.oid = con.conrelid
+                            JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+                            WHERE con.contype = 'u'
+                              AND nsp.nspname = _schema AND cls.relname = 'certificates'
+                              AND _cert_apprv_attnum = ANY(con.conkey)
+                        LOOP
+                            EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
+                                           _schema, _rec.conname);
+                        END LOOP;
+                    END IF;
+
+                    -- Drop any existing unique on application_number (we re-add cleanly below)
+                    IF _cert_appnum_attnum IS NOT NULL THEN
+                        FOR _rec IN
+                            SELECT con.conname FROM pg_constraint con
+                            JOIN pg_class cls ON cls.oid = con.conrelid
+                            JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+                            WHERE con.contype = 'u'
+                              AND nsp.nspname = _schema AND cls.relname = 'certificates'
+                              AND _cert_appnum_attnum = ANY(con.conkey)
+                        LOOP
+                            EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
+                                           _schema, _rec.conname);
+                        END LOOP;
+                    END IF;
+
+                    -- Add UNIQUE (application_number) if not present
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint con
+                        JOIN pg_class cls ON cls.oid = con.conrelid
+                        JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+                        WHERE con.contype = 'u'
+                          AND nsp.nspname = _schema AND cls.relname = 'certificates'
+                          AND con.conname = 'uq_certificates_application_number'
+                    ) THEN
+                        -- Dedup first so constraint creation succeeds
+                        EXECUTE format(
+                            'DELETE FROM %I.certificates
+                             WHERE id IN (
+                                 SELECT id FROM (
+                                     SELECT id,
+                                            ROW_NUMBER() OVER (
+                                                PARTITION BY application_number
+                                                ORDER BY updated_at DESC NULLS LAST,
+                                                         created_at  DESC NULLS LAST, id
+                                            ) AS rn
+                                     FROM %I.certificates
+                                     WHERE application_number IS NOT NULL
+                                 ) ranked WHERE rn > 1
+                             )',
+                            _schema, _schema
+                        );
+                        EXECUTE format(
+                            'ALTER TABLE %I.certificates
+                             ADD CONSTRAINT uq_certificates_application_number
+                             UNIQUE (application_number)',
+                            _schema
+                        );
+                        RAISE NOTICE '[staging-import] Added uq_certificates_application_number on %.certificates', _schema;
+                    END IF;
+
+                END LOOP;
+            END $$;
+        """))
+        db.commit()
+        _progress("ensure certificates unique constraint done")
+    except Exception as _uce:
+        logger.warning("ensure certificates unique constraint failed (non-fatal): %s", _uce)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
     _progress("transform into final begin")
     run_transform_into_final(db)
     _progress("transform into final done")
@@ -941,7 +1257,9 @@ def stage_and_copy_import(
     _progress(
         f"summary: staged_apps={staged_apps}, inserted_apps={int(inserted_apps)}, skipped_apps={skipped_apps}; "
         f"staged_docs={staged_docs}, inserted_docs={int(inserted_docs)}; "
-        f"staged_contacts={staged_contacts}, inserted_contacts={int(inserted_contacts)}"
+        f"staged_contacts={staged_contacts}, inserted_contacts={int(inserted_contacts)}; "
+        f"inserted_users={_inserted_users}, skipped_users={_skipped_users}; "
+        f"inserted_user_roles={_inserted_user_roles}, skipped_user_roles={_skipped_user_roles}"
     )
 
     _progress(
@@ -972,6 +1290,11 @@ def stage_and_copy_import(
         "staged_contact_rows": staged_contacts,
         "inserted_contact_rows": int(inserted_contacts),
         "staged_contact_rows_for_skipped_apps": int(staged_contacts_for_skipped_apps),
+
+        "inserted_users": int(_inserted_users),
+        "skipped_users": int(_skipped_users),
+        "inserted_user_roles": int(_inserted_user_roles),
+        "skipped_user_roles": int(_skipped_user_roles),
 
         # Extra: what the SQL transform itself reported (per-table inserted counts).
         "transform_inserted": inserted_from_transform,

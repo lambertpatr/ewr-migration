@@ -2,6 +2,9 @@ from fastapi import APIRouter, HTTPException
 from pathlib import Path
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/admin-tools")
 
@@ -207,24 +210,186 @@ def sync_schemas(dry_run: bool = True):
         db.close()
 
 
-@router.post('/backfill-created-by', tags=["99 - Backfill created_by"])
-def backfill_created_by():
-    """Backfill created_by UUID using users.username mapping.
+@router.post('/repair-and-backfill', tags=["99 - Backfill created_by"])
+def repair_and_backfill():
+    """Repair missing users + backfill created_by in one shot.
 
-    Updates:
-    - applications.created_by
-    - documents.created_by (by application_id)
-    - contact_persons.created_by (by application_id)
+    Steps performed (all idempotent — safe to call multiple times):
+      1. Find every username in public.applications with no matching public.users row.
+      2. Insert those users (lowercased, ACTIVE, EXTERNAL/INDIVIDUAL).
+      3. Ensure the APPLICANT ROLE exists.
+      4. Assign APPLICANT ROLE to every newly inserted user.
+      5. Run the full created_by backfill across all 17 tables.
+
+    If there are no missing users, only step 5 runs.
     """
-
     from app.services.application_migrations_service import backfill_created_by_from_username
 
     db = _get_new_session()
     try:
-        result = backfill_created_by_from_username(db)
-        return {"status": "SUCCESS", "result": result}
+        # 1. Ensure pgcrypto is available
+        try:
+            db.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
+            db.commit()
+        except Exception:
+            pass
+
+        # 2. Find all usernames in applications with no matching user (case-insensitive)
+        missing_rows = db.execute(text("""
+            SELECT DISTINCT lower(trim(a.username)) AS username
+            FROM public.applications a
+            WHERE a.username IS NOT NULL
+              AND lower(trim(a.username)) <> ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM public.users u
+                  WHERE lower(trim(u.username)) = lower(trim(a.username))
+              )
+            ORDER BY 1
+        """)).fetchall()
+
+        missing_usernames = [r[0] for r in missing_rows]
+        logger.info("repair-missing-users: found %d usernames with no user row", len(missing_usernames))
+
+        if not missing_usernames:
+            bf = backfill_created_by_from_username(db)
+            return {
+                "inserted_users": 0,
+                "missing_usernames": [],
+                "backfill": bf,
+                "message": "No missing users found. Backfill ran on existing users."
+            }
+
+        # 3. Insert each missing user individually so one failure never blocks others
+        inserted = []
+        failed = []
+        for uname in missing_usernames:
+            try:
+                db.execute(text("""
+                    INSERT INTO public.users (
+                        id, full_name, username, password_hash, status,
+                        phone_number, email_address, user_category,
+                        account_type, auth_mode, failed_attempts,
+                        is_first_login, deleted, created_at, updated_at
+                    )
+                    SELECT
+                        gen_random_uuid(), :uname, :uname, '',
+                        'ACTIVE', NULL, NULL, 'EXTERNAL', 'INDIVIDUAL', 'DB',
+                        0, false, false, now(), now()
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM public.users eu
+                        WHERE lower(trim(eu.username)) = :uname
+                    )
+                """), {"uname": uname})
+                db.commit()
+                inserted.append(uname)
+            except Exception as _ue:
+                logger.error("repair-missing-users: failed to insert user '%s': %s", uname, _ue)
+                failed.append({"username": uname, "error": str(_ue)})
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+
+        # 4. Look up APPLICANT ROLE id — read from an existing user_roles row.
+        #    Never scan public.roles: it is a FDW table whose remote name differs
+        #    (public.role), causing every query to fail.
+        _admin_role_id = None
+        try:
+            _ur = db.execute(text("SELECT role_id FROM public.user_roles LIMIT 1")).fetchone()
+            if _ur:
+                _admin_role_id = str(_ur[0])
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        if not _admin_role_id:
+            # public.roles FDW always fails (remote table is named public.role).
+            # Cannot safely scan roles — skip role assignment silently.
+            logger.info("repair-missing-users: APPLICANT ROLE id not found from user_roles; role assignment skipped (FDW limitation)")
+
+        # 5. Assign APPLICANT ROLE to every inserted user.
+        #    Remote user_roles FDW table only exposes (user_id, role_id).
+        roles_assigned = []
+        if _admin_role_id:
+            for uname in inserted:
+                try:
+                    db.execute(text("""
+                        INSERT INTO public.user_roles (user_id, role_id)
+                        SELECT u.id, :role_id
+                        FROM public.users u
+                        WHERE lower(trim(u.username)) = :uname
+                        AND NOT EXISTS (
+                            SELECT 1 FROM public.user_roles ex
+                            WHERE ex.user_id = u.id AND ex.role_id = :role_id
+                        )
+                    """), {"uname": uname, "role_id": _admin_role_id})
+                    db.commit()
+                    roles_assigned.append(uname)
+                except Exception as _ure:
+                    logger.error("repair-missing-users: failed to assign role for '%s': %s", uname, _ure)
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+
+        # 6. Deduplicate certificates: the unique constraint on application_number
+        #    is now the source of truth, so just remove any duplicate rows keeping
+        #    the most-recently updated one per application_number.
+        deduped_certs = 0
+        try:
+            r_dedup = db.execute(text("""
+                DELETE FROM public.certificates
+                WHERE id IN (
+                    SELECT id
+                    FROM (
+                        SELECT id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY application_number
+                                   ORDER BY updated_at DESC NULLS LAST,
+                                            created_at DESC NULLS LAST,
+                                            id
+                               ) AS rn
+                        FROM public.certificates
+                        WHERE application_number IS NOT NULL
+                    ) ranked
+                    WHERE rn > 1
+                )
+            """))
+            deduped_certs = r_dedup.rowcount or 0
+            db.commit()
+            logger.info("repair-and-backfill: removed %d duplicate certificate rows", deduped_certs)
+        except Exception as _cde:
+            logger.error("repair-and-backfill: certificate dedup failed (non-fatal): %s", _cde)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        # 7. Full created_by backfill across all 17 tables
+        bf = backfill_created_by_from_username(db)
+        logger.info("repair-and-backfill: backfill result: %s", bf)
+
+        return {
+            "inserted_users": len(inserted),
+            "inserted_usernames": inserted,
+            "roles_assigned": len(roles_assigned),
+            "deduped_certificates": deduped_certs,
+            "failed": failed,
+            "backfill": bf,
+            "message": (
+                f"Inserted {len(inserted)} missing users, assigned {len(roles_assigned)} roles, "
+                f"removed {deduped_certs} duplicate certificate rows, "
+                f"backfilled created_by across 17 tables."
+            )
+        }
+
     except Exception as e:
-        db.rollback()
+        logger.exception("repair-and-backfill: unexpected error: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()

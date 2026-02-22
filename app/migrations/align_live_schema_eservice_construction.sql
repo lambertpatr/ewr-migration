@@ -12,6 +12,94 @@
 
 BEGIN;
 
+---------------------------------------------------------------------
+-- Electrical installation imports: align columns used by supervisors/
+-- work_experience and self_employed loaders.
+--
+-- Requirements:
+--  - Live DB sometimes has voltage_level fixed to 'NONE' while Excel provides
+--    the real voltage in voltagelevel; we store that value in a new `voltage`.
+--  - Legacy/live DB may have an FK on work_experience.supervisor_details_id
+--    that blocks bulk inserts; drop any FK constraints on that column.
+---------------------------------------------------------------------
+
+--  E1) Drop FK constraint(s) on work_experience.supervisor_details_id (any name)
+DO $$
+DECLARE
+    r record;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_class WHERE oid = 'public.work_experience'::regclass) THEN
+        FOR r IN (
+            SELECT c.conname
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = t.relnamespace
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+            WHERE c.contype = 'f'
+              AND n.nspname = 'public'
+              AND t.relname = 'work_experience'
+              AND a.attname = 'supervisor_details_id'
+        ) LOOP
+            EXECUTE format('ALTER TABLE public.work_experience DROP CONSTRAINT IF EXISTS %I', r.conname);
+            RAISE NOTICE 'Dropped FK constraint on public.work_experience.supervisor_details_id: %', r.conname;
+        END LOOP;
+    END IF;
+END $$;
+
+--  E1b) Drop UNIQUE constraint(s) on work_experience.supervisor_details_id (any name)
+DO $$
+DECLARE
+    r record;
+    _attnum smallint;
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_class WHERE oid = 'public.work_experience'::regclass) THEN
+        SELECT attnum INTO _attnum
+        FROM pg_attribute
+        WHERE attrelid = 'public.work_experience'::regclass
+          AND attname = 'supervisor_details_id';
+
+        IF _attnum IS NOT NULL THEN
+            FOR r IN (
+                SELECT conname
+                FROM pg_constraint
+                WHERE conrelid = 'public.work_experience'::regclass
+                  AND contype = 'u'
+                  AND conkey = ARRAY[_attnum]
+            ) LOOP
+                EXECUTE format('ALTER TABLE public.work_experience DROP CONSTRAINT IF EXISTS %I', r.conname);
+                RAISE NOTICE 'Dropped UNIQUE constraint on public.work_experience.supervisor_details_id: %', r.conname;
+            END LOOP;
+        END IF;
+    END IF;
+END $$;
+
+--  E2) work_experience: add `voltage` and ensure voltage_level default
+ALTER TABLE IF EXISTS public.work_experience
+    ADD COLUMN IF NOT EXISTS voltage character varying(255);
+
+ALTER TABLE IF EXISTS public.work_experience
+    ALTER COLUMN voltage_level SET DEFAULT 'NONE';
+
+--  E3) self_employed: add `voltage` and ensure voltage_level default
+ALTER TABLE IF EXISTS public.self_employed
+    ADD COLUMN IF NOT EXISTS voltage character varying(255);
+
+-- Some environments don't have application_id on self_employed/custom_details.
+-- The importer joins applications and stores it for easier reporting.
+ALTER TABLE IF EXISTS public.self_employed
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.self_employed
+    ALTER COLUMN voltage_level SET DEFAULT 'NONE';
+
+-- custom_details: keep application_id for easier reporting/queries (nullable)
+ALTER TABLE IF EXISTS public.custom_details
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+-- Allow long custom details strings (some uploads exceed 255 chars)
+ALTER TABLE IF EXISTS public.custom_details
+    ALTER COLUMN name TYPE text;
+
 -- NOTE: Do NOT try to create extensions here.
 -- Some managed/Postgres installs don't ship with pgcrypto control files and
 -- CREATE EXTENSION will fail even with IF NOT EXISTS.
@@ -181,21 +269,22 @@ BEGIN
 END $$;
 
 ---------------------------------------------------------------------
--- 3b) Relax unique constraints on applications & certificates
+-- 3b) Relax unique constraints on applications & certificates, then
+--     add UNIQUE (application_number) on certificates.
 --
 -- Business rule:
---   • The same approval_no can appear in certificates with DIFFERENT
---     application_certificate_type values (e.g. a NEW and a RENEW
---     certificate can share the same licence/approval number).
---   • The same application_number can therefore have multiple certificate
---     rows — one per certificate type.
+--   • One certificate row per application_number — this is now the
+--     conflict key for all import pipelines (ON CONFLICT (application_number)).
+--   • The old composite UNIQUE (approval_no, application_certificate_type)
+--     and any other unique on approval_no / application_number are removed
+--     first so there is no conflicting constraint.
 --
 -- Action (for EVERY schema that exists on this DB):
 --   REMOVE  single-column UNIQUE on applications.approval_no
---   REMOVE  single-column UNIQUE on certificates.approval_no
---   REMOVE  single-column UNIQUE on certificates.application_number
---   ADD     composite UNIQUE (approval_no, application_certificate_type)
---           — prevents true duplicates while allowing cross-type reuse
+--   REMOVE  ANY   unique on certificates that includes approval_no
+--   REMOVE  ANY   unique on certificates that includes application_number
+--   ADD     UNIQUE (application_number) on certificates
+--             — one cert row per application, conflict key for upserts
 --
 -- All constraint names are Hibernate-generated hashes that differ per
 -- environment, so we look them up dynamically from pg_constraint.
@@ -203,13 +292,12 @@ END $$;
 ---------------------------------------------------------------------
 DO $$
 DECLARE
-    _rec              RECORD;
-    _schema           text;
-    _app_attnum       smallint;
-    _cert_attnum      smallint;
+    _rec               RECORD;
+    _schema            text;
+    _app_attnum        smallint;
+    _cert_apprv_attnum smallint;
     _cert_appno_attnum smallint;
 BEGIN
-    -- Only iterate over schemas that ACTUALLY EXIST on this database
     FOR _schema IN
         SELECT nspname FROM pg_namespace
         WHERE  nspname IN ('public', 'align_live')
@@ -245,11 +333,12 @@ BEGIN
             END IF;
         END IF;
 
-        -- ── B & C. Drop single-column UNIQUEs on certificates ─────────
+        -- ── B & C. Drop ALL unique constraints on certificates that include
+        --          approval_no OR application_number (single or composite) ──
         IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                    WHERE n.nspname=_schema AND c.relname='certificates') THEN
 
-            SELECT attnum INTO _cert_attnum
+            SELECT attnum INTO _cert_apprv_attnum
             FROM pg_attribute
             WHERE attrelid = (SELECT c.oid FROM pg_class c
                               JOIN pg_namespace n ON n.oid=c.relnamespace
@@ -263,8 +352,8 @@ BEGIN
                               WHERE n.nspname=_schema AND c.relname='certificates')
               AND attname = 'application_number';
 
-            -- Drop UNIQUE(approval_no)
-            IF _cert_attnum IS NOT NULL THEN
+            -- Drop any unique that mentions approval_no (single OR composite)
+            IF _cert_apprv_attnum IS NOT NULL THEN
                 FOR _rec IN
                     SELECT con.conname
                     FROM   pg_constraint con
@@ -273,7 +362,7 @@ BEGIN
                     WHERE  con.contype = 'u'
                       AND  nsp.nspname = _schema
                       AND  cls.relname = 'certificates'
-                      AND  con.conkey = ARRAY[_cert_attnum]
+                      AND  _cert_apprv_attnum = ANY(con.conkey)
                 LOOP
                     EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
                                    _schema, _rec.conname);
@@ -281,7 +370,8 @@ BEGIN
                 END LOOP;
             END IF;
 
-            -- Drop UNIQUE(application_number) — same app can have NEW + RENEW + UPGRADE
+            -- Drop any existing unique that mentions application_number
+            -- (we are about to re-add a clean single-column one below)
             IF _cert_appno_attnum IS NOT NULL THEN
                 FOR _rec IN
                     SELECT con.conname
@@ -291,7 +381,7 @@ BEGIN
                     WHERE  con.contype = 'u'
                       AND  nsp.nspname = _schema
                       AND  cls.relname = 'certificates'
-                      AND  con.conkey = ARRAY[_cert_appno_attnum]
+                      AND  _cert_appno_attnum = ANY(con.conkey)
                 LOOP
                     EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
                                    _schema, _rec.conname);
@@ -299,7 +389,7 @@ BEGIN
                 END LOOP;
             END IF;
 
-            -- ── D. Add composite UNIQUE (approval_no, application_certificate_type) ──
+            -- ── D. Add UNIQUE (application_number) — the upsert conflict key ──
             IF NOT EXISTS (
                 SELECT 1 FROM pg_constraint con
                 JOIN pg_class     cls ON cls.oid = con.conrelid
@@ -307,15 +397,34 @@ BEGIN
                 WHERE  con.contype = 'u'
                   AND  nsp.nspname = _schema
                   AND  cls.relname = 'certificates'
-                  AND  con.conname = 'certificates_approval_no_cert_type_uq'
+                  AND  con.conname = 'uq_certificates_application_number'
             ) THEN
+                -- Dedup first so the constraint can be created cleanly
+                EXECUTE format(
+                    'DELETE FROM %I.certificates
+                     WHERE id IN (
+                         SELECT id FROM (
+                             SELECT id,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY application_number
+                                        ORDER BY updated_at DESC NULLS LAST,
+                                                 created_at  DESC NULLS LAST,
+                                                 id
+                                    ) AS rn
+                             FROM %I.certificates
+                             WHERE application_number IS NOT NULL
+                         ) ranked
+                         WHERE rn > 1
+                     )',
+                    _schema, _schema
+                );
                 EXECUTE format(
                     'ALTER TABLE %I.certificates
-                     ADD CONSTRAINT certificates_approval_no_cert_type_uq
-                     UNIQUE (approval_no, application_certificate_type)',
+                     ADD CONSTRAINT uq_certificates_application_number
+                     UNIQUE (application_number)',
                     _schema
                 );
-                RAISE NOTICE 'Added certificates_approval_no_cert_type_uq on %.certificates', _schema;
+                RAISE NOTICE 'Added uq_certificates_application_number on %.certificates', _schema;
             END IF;
 
         END IF; -- certificates table exists
@@ -394,5 +503,36 @@ BEGIN
         RAISE NOTICE 'Dropped foreign key constraint: %', r.conname;
     END LOOP;
 END $$;
+
+---------------------------------------------------------------------
+-- Certificate verification: add from_date / to_date timestamp columns
+--
+-- The electrical certificate verifications importer stores from_date and
+-- to_date as timestamps; add them if they are not present yet.
+---------------------------------------------------------------------
+
+ALTER TABLE IF EXISTS public.certificate_verification
+    ADD COLUMN IF NOT EXISTS from_date  timestamp NULL,
+    ADD COLUMN IF NOT EXISTS to_date    timestamp NULL;
+
+COMMENT ON COLUMN public.certificate_verification.from_date
+    IS 'Start date of the certificate / qualification period (from Excel fromdate column).';
+COMMENT ON COLUMN public.certificate_verification.to_date
+    IS 'End date of the certificate / qualification period (from Excel todate column).';
+
+---------------------------------------------------------------------
+-- Applications: add completed_at timestamp column
+--
+-- Stores the date the application was completed/approved as provided in the
+-- Excel source file (completed_at column).  Used by the staging-copy importer
+-- and the direct import path; included in ON CONFLICT DO UPDATE so re-uploads
+-- fill in missing values without overwriting existing ones.
+---------------------------------------------------------------------
+
+ALTER TABLE IF EXISTS public.applications
+    ADD COLUMN IF NOT EXISTS completed_at timestamp NULL;
+
+COMMENT ON COLUMN public.applications.completed_at
+    IS 'Completion / approval timestamp migrated from the LOIS Excel export (completed_at column).';
 
 COMMIT;

@@ -2,6 +2,7 @@
 # use-env.sh — switch the active .env for ewura-migration
 #
 # Usage:
+#   ./use-env.sh dev         → point .env at .env.dev
 #   ./use-env.sh test        → point .env at .env.test
 #   ./use-env.sh staging     → point .env at .env.staging
 #   ./use-env.sh production  → point .env at .env.production  ⚠️  LIVE
@@ -14,7 +15,7 @@ ENV_FILE="$SCRIPT_DIR/.env"
 TARGET="${1:-show}"
 
 case "$TARGET" in
-  test|staging|production)
+  dev|test|staging|production)
     SRC="$SCRIPT_DIR/.env.$TARGET"
     if [[ ! -f "$SRC" ]]; then
       echo "ERROR: $SRC not found." >&2
@@ -49,7 +50,7 @@ case "$TARGET" in
     fi
     ;;
   *)
-    echo "Usage: $0 {test|staging|production|show}" >&2
+    echo "Usage: $0 {dev|test|staging|production|show}" >&2
     exit 1
     ;;
 esac

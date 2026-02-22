@@ -371,10 +371,30 @@ def _build_default_mappings():
         'certificate_of_incorporation_no': 'certificate_of_incorporation_no',
         # application meta
         'application_number':              'application_number',
+        'appno':                           'application_number',
+        'app_number':                      'application_number',
+        'apprefno':                        'application_number',
         'application_type':                'application_type',
         'approval_no':                     'approval_no',
+        'approvalno':                      'approval_no',
+        'approval_number':                 'approval_no',
+        'licenceno':                       'approval_no',
+        'license_no':                      'approval_no',
         'effective_date':                  'effective_date',
+        'effectivedate':                   'effective_date',
+        'date_effective':                  'effective_date',
+        'start_date':                      'effective_date',
+        'startdate':                       'effective_date',
         'expire_date':                     'expire_date',
+        'expiry_date':                     'expire_date',
+        'expiredate':                      'expire_date',
+        'expired_date':                    'expire_date',
+        'expirydate':                      'expire_date',
+        'expdate':                         'expire_date',
+        'date_expire':                     'expire_date',
+        'date_expiry':                     'expire_date',
+        'end_date':                        'expire_date',
+        'enddate':                         'expire_date',
         'completed_at':                    'completed_at',
         'license_type':                    'license_type',
         'license_category_id':             'license_category_id',
@@ -554,10 +574,30 @@ def _build_stage_mappings():
         'certificate_of_incorporation_no': 'certificate_of_incorporation_no',
         # ── APPLICATION META ─────────────────────────────────────────────────
         'application_number':              'application_number',
+        'appno':                           'application_number',
+        'app_number':                      'application_number',
+        'apprefno':                        'application_number',
         'application_type':                'application_type',
         'approval_no':                     'approval_no',
+        'approvalno':                      'approval_no',
+        'approval_number':                 'approval_no',
+        'licenceno':                       'approval_no',
+        'license_no':                      'approval_no',
         'effective_date':                  'effective_date',
+        'effectivedate':                   'effective_date',
+        'date_effective':                  'effective_date',
+        'start_date':                      'effective_date',
+        'startdate':                       'effective_date',
         'expire_date':                     'expire_date',
+        'expiry_date':                     'expire_date',
+        'expiredate':                      'expire_date',
+        'expired_date':                    'expire_date',
+        'expirydate':                      'expire_date',
+        'expdate':                         'expire_date',
+        'date_expire':                     'expire_date',
+        'date_expiry':                     'expire_date',
+        'end_date':                        'expire_date',
+        'enddate':                         'expire_date',
         'completed_at':                    'completed_at',
         'license_type':                    'license_type',
         'license_category_id':             'license_category_raw',        # raw text -> resolved in transform
@@ -619,8 +659,8 @@ def import_applications_via_staging_copy(
 
 
 def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, batch_size: int = 1000):
-    """Import application rows and their attachments into ca_applications and
-    ca_documents using the provided SQLAlchemy Session-like `db`.
+    """Import application rows and their attachments into applications and
+    documents using the provided SQLAlchemy Session-like `db`.
 
     This mirrors the previous attachments migration logic but lives under the
     `application_migrations` name as requested.
@@ -631,6 +671,10 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
     inserted_docs = 0
     skipped_docs_total = 0
     failed_app_rows = 0
+    inserted_users = 0
+    skipped_users = 0
+    inserted_user_roles = 0
+    skipped_user_roles = 0
 
     # Build explicit mappings and attachment spec per requirements
     excel_to_app, attachments_spec = _build_default_mappings()
@@ -763,9 +807,9 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
         if (id_col is None or id_col in df_columns) or (fname_col is not None and fname_col in df_columns):
             attachment_pairs.append((id_col, fname_col, label))
 
-    # Determine which application columns we can copy into ca_applications
+    # Determine which application columns we can copy into applications
     # by intersecting excel_to_app keys with the destination table columns.
-    ca_cols = [r[0] for r in db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='ca_applications' ")).fetchall()]
+    ca_cols = [r[0] for r in db.execute(text("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='applications' ")).fetchall()]
     # Build list of target app columns we will set (exclude id and created_at since we add created_at=now() manually)
     copy_cols = []
     for excel_col, app_col in excel_to_app.items():
@@ -819,28 +863,15 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
             def __exit__(self, exc_type, exc, tb):
                 return False
 
-        # If the incoming Session already has an active transaction,
-        # we will commit it at the end of the batch to ensure partial progress is saved
-        # and to prevent long-running transaction timeouts.
-        context_manager = db.begin_nested() if hasattr(db, 'begin_nested') else db.begin() 
-        # Note: We aren't using the precise check for existing transaction anymore because
-        # we WANT to force a commit per batch. However, db.begin() fails if transaction exists.
-        # So we use a pattern that allows us to commit:
-        
         try:
-             # Just do work without a block-scoped transaction manager for the whole batch
-             # We will manage commit manually at end of batch processing
-             pass
-        except Exception:
-             pass
+            app_inserts: List[Dict[str, Any]] = []
+            doc_inserts: List[Dict[str, Any]] = []
 
-        # Manual entry/exit logic replaced by direct operations inside loop
-        # But keeping structure:
-        try:
-                app_inserts: List[Dict[str, Any]] = []
-                doc_inserts: List[Dict[str, Any]] = []
+            # Collect usernames (Excel userid) for this batch so we can ensure
+            # corresponding users exist and have the APPLICANT ROLE.
+            batch_usernames: set[str] = set()
 
-                for _, row in batch.iterrows():
+            for _, row in batch.iterrows():
                     # If the user wants DB to assign IDs, don't provide 'id' here.
                     # We keep a temporary row index to map returned DB ids back to
                     # document rows after the INSERT ... RETURNING id step.
@@ -868,6 +899,16 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                         # NOTE: keep username/userid exactly as provided (no uppercasing).
                         if excel_col == 'application_type' and isinstance(val, str):
                             val = val.strip().upper()
+
+                        # Capture userid/username values (for users table creation)
+                        if app_col == 'username' and val not in (None, ''):
+                            try:
+                                s_un = str(val).strip().lower()
+                                if s_un and s_un not in ('nan', 'nat', 'none', 'null'):
+                                    batch_usernames.add(s_un)
+                                    val = s_un  # also store lowercased in app_row
+                            except Exception:
+                                pass
                         # If region column contains an id, map it to the name.
                         # IMPORTANT: only map for the application-level "region" column,
                         # not fire-prefixed delimitations (fregion/fdistrict/fward).
@@ -1031,8 +1072,100 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                         order += 1
                         doc_inserts.append(doc)
 
-                # Explicit commit after each batch to avoid timeouts and save progress
-                db.commit()
+            # ── Ensure users exist and have APPLICANT ROLE ─────────────────
+            # For every userid collected from Excel in this batch, create a
+            # users row if it doesn't exist yet, then ensure the role
+            # "APPLICANT ROLE" exists and is assigned to each user.
+            if batch_usernames:
+                # Ensure pgcrypto is available for gen_random_uuid()
+                try:
+                    db.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
+                    db.commit()
+                except Exception:
+                    pass
+
+                # Insert each user individually so one bad row never blocks others.
+                for _uname in batch_usernames:
+                    try:
+                        _ur = db.execute(text("""
+                            INSERT INTO public.users (
+                                id, full_name, username, password_hash, status,
+                                phone_number, email_address, user_category,
+                                account_type, auth_mode, failed_attempts,
+                                is_first_login, deleted, created_at, updated_at
+                            )
+                            SELECT
+                                gen_random_uuid(), :uname, :uname, '',
+                                'ACTIVE', NULL, NULL, 'EXTERNAL', 'INDIVIDUAL', 'DB',
+                                0, false, false, now(), now()
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM public.users eu
+                                WHERE lower(trim(eu.username)) = :uname
+                            )
+                        """), {"uname": _uname.lower().strip()})
+                        db.commit()
+                        if (_ur.rowcount or 0) > 0:
+                            inserted_users += 1
+                        else:
+                            skipped_users += 1
+                    except Exception as _ue:
+                        logger.error("Failed to insert user '%s': %s", _uname, _ue)
+                        skipped_users += 1
+                        try:
+                            db.rollback()
+                        except Exception:
+                            pass
+
+                # Look up APPLICANT ROLE id — read from an existing user_roles row.
+                # Never scan public.roles: it is a FDW foreign table whose remote name
+                # differs (public.role), causing every query to fail.
+                # If no user_roles row exists yet, skip role assignment gracefully.
+                _applicant_role_id = None
+                try:
+                    _ur_row = db.execute(text(
+                        "SELECT role_id FROM public.user_roles LIMIT 1"
+                    )).fetchone()
+                    if _ur_row:
+                        _applicant_role_id = str(_ur_row[0])
+                except Exception:
+                    try:
+                        db.rollback()
+                    except Exception:
+                        pass
+
+                if not _applicant_role_id:
+                    # public.roles FDW always fails (remote table is named public.role).
+                    # Cannot safely scan roles — skip role assignment silently.
+                    logger.info("APPLICANT ROLE id not found from user_roles; role assignment skipped (FDW limitation)")
+                    skipped_user_roles += len(batch_usernames)
+
+                # Assign APPLICANT ROLE to each user individually.
+                # Remote user_roles FDW table only exposes (user_id, role_id).
+                if _applicant_role_id:
+                    for _uname in batch_usernames:
+                        try:
+                            _rr = db.execute(text("""
+                                INSERT INTO public.user_roles (user_id, role_id)
+                                SELECT u.id, :role_id
+                                FROM public.users u
+                                WHERE lower(trim(u.username)) = :uname
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM public.user_roles ex
+                                    WHERE ex.user_id = u.id AND ex.role_id = :role_id
+                                )
+                            """), {"uname": _uname.lower().strip(), "role_id": _applicant_role_id})
+                            db.commit()
+                            if (_rr.rowcount or 0) > 0:
+                                inserted_user_roles += 1
+                            else:
+                                skipped_user_roles += 1
+                        except Exception as _ure:
+                            logger.warning("Failed to assign role for user '%s': %s", _uname, _ure)
+                            skipped_user_roles += 1
+                            try:
+                                db.rollback()
+                            except Exception:
+                                pass
 
         except Exception as _batch_exc:
             # Log, rollback session to leave it in a clean state, and re-raise
@@ -1043,15 +1176,108 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                 pass
             raise
 
-            inserted_app_ids = []
-            if app_inserts:
+        inserted_app_ids = []
+        if app_inserts:
                 # determine real columns to insert (exclude temporary keys)
                 sample = app_inserts[0]
                 col_names = [c for c in sample.keys() if not c.startswith('_')]
+
+                # ── Deduplicate within this batch on application_number ──────
+                # If the same application_number appears multiple times in the
+                # Excel file keep only the first occurrence.
+                _seen_app_nums: set = set()
+                deduped_inserts = []
+                for _a in app_inserts:
+                    _anum = str(_a.get('application_number') or '').strip()
+                    if _anum and _anum in _seen_app_nums:
+                        logger.debug("Skipping duplicate application_number in batch: %s", _anum)
+                        continue
+                    if _anum:
+                        _seen_app_nums.add(_anum)
+                    deduped_inserts.append(_a)
+                app_inserts = deduped_inserts
+
+                # ── Skip rows already in the DB by application_number ─────────
+                # Collect existing application_numbers from the DB for this batch.
+                batch_app_nums = [str(a.get('application_number') or '').strip()
+                                  for a in app_inserts
+                                  if a.get('application_number')]
+                existing_app_nums: set = set()
+                if batch_app_nums:
+                    try:
+                        chunk_size = 500
+                        for _i in range(0, len(batch_app_nums), chunk_size):
+                            _chunk = batch_app_nums[_i:_i + chunk_size]
+                            _placeholders = ','.join([f':p{j}' for j in range(len(_chunk))])
+                            _params = {f'p{j}': v for j, v in enumerate(_chunk)}
+                            _rows = db.execute(
+                                text(f"SELECT application_number FROM public.applications WHERE application_number IN ({_placeholders})"),
+                                _params
+                            ).fetchall()
+                            existing_app_nums.update(r[0] for r in _rows if r[0])
+                    except Exception as _lookup_err:
+                        logger.warning("Could not pre-check existing application_numbers: %s", _lookup_err)
+
+                new_inserts = []
+                update_rows = []
+                for _a in app_inserts:
+                    _anum = str(_a.get('application_number') or '').strip()
+                    if _anum and _anum in existing_app_nums:
+                        update_rows.append(_a)
+                    else:
+                        new_inserts.append(_a)
+
+                # ── UPDATE existing applications (non-null columns only) ───────
+                if update_rows and col_names:
+                    _update_cols = [c for c in col_names
+                                    if c not in ('id', 'application_number', 'created_at')]
+                    if _update_cols:
+                        _set_sql = ', '.join([f"{c} = COALESCE(:{c}, {c})" for c in _update_cols])
+                        _upd_sql = text(
+                            f"UPDATE public.applications SET {_set_sql}, updated_at = now() "
+                            f"WHERE application_number = :application_number "
+                            f"RETURNING id"
+                        )
+                        for _upd in update_rows:
+                            try:
+                                _res = db.execute(_upd_sql, _upd)
+                                _row = _res.fetchone()
+                                if _row:
+                                    inserted_app_ids.append(str(_row[0]))
+                                else:
+                                    # fallback: look up existing id
+                                    _eid = db.execute(
+                                        text("SELECT id FROM public.applications WHERE application_number = :n"),
+                                        {"n": str(_upd.get('application_number') or '').strip()}
+                                    ).scalar()
+                                    inserted_app_ids.append(str(_eid) if _eid else None)
+                            except Exception as _ue:
+                                logger.warning("Update skipped for %s: %s",
+                                               _upd.get('application_number'), _ue)
+                                inserted_app_ids.append(None)
+
+                # replace app_inserts with only the genuinely new rows
+                app_inserts = new_inserts
+
                 cols_sql = ','.join(col_names)
                 vals_sql = ','.join([f":{c}" for c in col_names])
+                # Build ON CONFLICT DO UPDATE — fill any column that is currently
+                # NULL in the DB with the incoming value (COALESCE keeps existing
+                # non-null values, so reruns are safe and additive).
+                _conflict_update_cols = [
+                    c for c in col_names
+                    if c not in ('id', 'application_number', 'created_at')
+                ]
+                _set_conflict_sql = ', '.join(
+                    [f"{c} = COALESCE(EXCLUDED.{c}, public.applications.{c})"
+                     for c in _conflict_update_cols]
+                ) + ", updated_at = now()"
                 # ask DB to RETURNING id so we can map document rows to real ids
-                insert_sql = text(f"INSERT INTO ca_applications ({cols_sql}) VALUES ({vals_sql}) RETURNING id")
+                insert_sql = text(
+                    f"INSERT INTO public.applications ({cols_sql}) VALUES ({vals_sql}) "
+                    f"ON CONFLICT (application_number) DO UPDATE SET {_set_conflict_sql} "
+                    f"RETURNING id"
+                )
                 logger.debug("Insert columns: %s", col_names)
 
                 # Attempt fastest path: use PostgreSQL COPY FROM STDIN when
@@ -1097,7 +1323,7 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                             sio.seek(0)
                             copy_cols_sql = ','.join(cols)
                             # copy_cols_sql = ','.join(cols) + ', created_at'
-                            copy_sql = f"COPY ca_applications ({copy_cols_sql}) FROM STDIN WITH CSV"
+                            copy_sql = f"COPY public.applications ({copy_cols_sql}) FROM STDIN WITH CSV"
                             cur.copy_expert(copy_sql, sio)
                             raw_conn.commit()
                             # On success, collect the ids we assigned
@@ -1198,22 +1424,24 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                                 failed_app_rows += 1
                         inserted_apps += len(app_inserts)
 
-            # Safety: we must have the real application ids to correctly reference
-            # documents. If the DB didn't return ids, only proceed to insert documents
-            # if every app_inserts provided its own 'id' (preserve_source_id flow).
-            if not inserted_app_ids:
-                # check whether all app_inserts have an explicit 'id'
-                all_have_ids = all(('id' in a and a['id']) for a in app_inserts)
-                if not all_have_ids:
-                    # abort to avoid inserting documents with simulated ids
-                    raise RuntimeError("Database did not return inserted application IDs; cannot safely insert documents referencing them.")
+        # Safety: we must have the real application ids to correctly reference
+        # documents. If the DB didn't return ids, only proceed to insert documents
+        # if every app_inserts provided its own 'id' (preserve_source_id flow).
+        if not inserted_app_ids:
+            # check whether all app_inserts have an explicit 'id'
+            all_have_ids = all(('id' in a and a['id']) for a in app_inserts)
+            if not all_have_ids:
+                # abort to avoid inserting documents with simulated ids
+                raise RuntimeError(
+                    "Database did not return inserted application IDs; cannot safely insert documents referencing them."
+                )
 
-            # If DB didn't return ids, collect ids from app_inserts
-            app_ids_in_order: List[str] = []
-            if inserted_app_ids:
-                app_ids_in_order = inserted_app_ids
-            else:
-                for a in app_inserts:
+        # If DB didn't return ids, collect ids from app_inserts
+        app_ids_in_order: List[str] = []
+        if inserted_app_ids:
+            app_ids_in_order = inserted_app_ids
+        else:
+            for a in app_inserts:
                     if 'id' in a:
                         app_ids_in_order.append(str(a['id']))
                     else:
@@ -1246,7 +1474,10 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                 doc_cols = ['id', 'document_name', 'document_url', 'application_id', 'file_name', 'documents_order', 'logic_doc_id']
                 cols_sql = ','.join(doc_cols) + ', created_at'
                 vals_sql = ','.join([f':{c}' for c in doc_cols]) + ', now()'
-                insert_docs_sql = text(f"INSERT INTO ca_documents ({cols_sql}) VALUES ({vals_sql})")
+                insert_docs_sql = text(
+                    f"INSERT INTO public.documents ({cols_sql}) VALUES ({vals_sql}) "
+                    f"ON CONFLICT (id) DO NOTHING"
+                )
                 
                 # OPTIMIZATION: Try bulk insert first (much faster)
                 # We chunk by 1000 to be safe with parameter binding limits
@@ -1272,31 +1503,178 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                             except Exception as e:
                                 errors.append(f"Failed to insert document {d.get('id')}: {e}")
 
-    result = {
-        'total_rows': total_rows,
-        'inserted_applications': inserted_apps,
-        'failed_applications': failed_app_rows,
-        'inserted_documents': inserted_docs,
-        'skipped_documents': skipped_docs_total,
-    }
-    
-    # Add summary message if there were failures
-    if failed_app_rows > 0:
-        result['failure_summary'] = (
-            f"{failed_app_rows} application rows failed to insert. "
-            f"{skipped_docs_total} documents were skipped because their parent applications failed. "
-            f"See 'errors' array for details on each failed row."
-        )
-    
-    # Convert sample sets to lists for serialization and include mapping stats
-    # (limit unmapped samples to small lists)
-    for k in ('region_unmapped_samples', 'district_unmapped_samples', 'ward_unmapped_samples', 'legal_status_unmapped_samples', 'license_category_unmapped_samples'):
-        if k in mapping_stats and isinstance(mapping_stats[k], set):
-            mapping_stats[k] = list(mapping_stats[k])
-    result['mapping_stats'] = mapping_stats
-    if errors:
-        result['errors'] = errors
-    return result
+        # ── Certificates insert ────────────────────────────────────────────
+        # Every application must end up with a certificates row. We insert one
+        # row per application that was loaded in this batch (deduplicated on
+        # application_number). The conflict target is application_number so
+        # reruns are idempotent — we UPDATE key fields on conflict.
+        inserted_certs = 0
+        try:
+            # Guard: ON CONFLICT (application_number) requires a UNIQUE/EXCLUDE
+            # constraint. Ensure it exists (and dedup first so creation succeeds).
+            db.execute(text("""
+                DO $$
+                BEGIN
+                    -- Deduplicate by application_number (keep newest row).
+                    WITH ranked AS (
+                        SELECT
+                            id,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY application_number
+                                ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC, id
+                            ) AS rn
+                        FROM public.certificates
+                        WHERE application_number IS NOT NULL
+                          AND NULLIF(TRIM(application_number), '') IS NOT NULL
+                    )
+                    DELETE FROM public.certificates c
+                    USING ranked r
+                    WHERE c.id = r.id
+                      AND r.rn > 1;
+
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM   pg_constraint con
+                        JOIN   pg_class rel ON rel.oid = con.conrelid
+                        JOIN   pg_namespace nsp ON nsp.oid = rel.relnamespace
+                        WHERE  nsp.nspname = 'public'
+                          AND  rel.relname = 'certificates'
+                          AND  con.conname = 'uq_certificates_application_number'
+                    ) THEN
+                        ALTER TABLE public.certificates
+                            ADD CONSTRAINT uq_certificates_application_number
+                            UNIQUE (application_number);
+                    END IF;
+                END $$;
+            """))
+            db.commit()
+
+            r_certs = db.execute(text("""
+                WITH src AS (
+                    SELECT DISTINCT ON (a.application_number)
+                        a.id                  AS application_id,
+                        a.application_number,
+                        a.approval_no,
+                        a.effective_date,
+                        a.expire_date,
+                        a.license_type,
+                        a.category_license_type,
+                        a.zone_id,
+                        a.zone_name,
+                        COALESCE(NULLIF(UPPER(TRIM(a.application_type)), ''), 'NEW') AS application_certificate_type
+                    FROM public.applications a
+                    WHERE a.is_from_lois = true
+                      AND a.application_number IS NOT NULL
+                    ORDER BY a.application_number, a.created_at DESC
+                )
+                INSERT INTO public.certificates (
+                    id,
+                    created_at,
+                    updated_at,
+                    application_id,
+                    application_number,
+                    approval_no,
+                    effective_date,
+                    expire_date,
+                    license_type,
+                    category_license_type,
+                    zone_id,
+                    zone_name,
+                    application_certificate_type
+                )
+                SELECT
+                    -- id is a surrogate PK; the unique conflict key is application_number.
+                    gen_random_uuid(),
+                    now(),
+                    now(),
+                    src.application_id,
+                    src.application_number,
+                    src.approval_no,
+                    src.effective_date,
+                    src.expire_date,
+                    src.license_type,
+                    src.category_license_type,
+                    src.zone_id,
+                    src.zone_name,
+                    src.application_certificate_type
+                FROM src
+                ON CONFLICT (application_number) DO UPDATE
+                SET
+                    approval_no               = COALESCE(EXCLUDED.approval_no,               public.certificates.approval_no),
+                    application_id            = EXCLUDED.application_id,
+                    effective_date            = COALESCE(EXCLUDED.effective_date,            public.certificates.effective_date),
+                    expire_date               = COALESCE(EXCLUDED.expire_date,               public.certificates.expire_date),
+                    license_type              = COALESCE(EXCLUDED.license_type,              public.certificates.license_type),
+                    category_license_type     = COALESCE(EXCLUDED.category_license_type,     public.certificates.category_license_type),
+                    application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
+                    zone_id                   = COALESCE(EXCLUDED.zone_id,                   public.certificates.zone_id),
+                    zone_name                 = COALESCE(EXCLUDED.zone_name,                 public.certificates.zone_name),
+                    updated_at                = now()
+            """))
+            inserted_certs = r_certs.rowcount or 0
+            db.commit()
+            logger.info("Certificates upserted: %d", inserted_certs)
+
+            # Back-fill applications.certificate_id where still NULL
+            db.execute(text("""
+                UPDATE public.applications a
+                SET    certificate_id = c.id,
+                       updated_at     = now()
+                FROM   public.certificates c
+                WHERE  c.application_id = a.id
+                  AND  a.certificate_id IS NULL
+                  AND  a.is_from_lois = true
+            """))
+            db.commit()
+            logger.info("Back-filled applications.certificate_id")
+        except Exception as _ce:
+            logger.warning("Certificates insert failed (non-fatal): %s", _ce)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        result = {
+            'total_rows': total_rows,
+            'inserted_applications': inserted_apps,
+            'inserted_certificates': inserted_certs,
+            'failed_applications': failed_app_rows,
+            'inserted_documents': inserted_docs,
+            'skipped_documents': skipped_docs_total,
+            'inserted_users': inserted_users,
+            'skipped_users': skipped_users,
+            'inserted_user_roles': inserted_user_roles,
+            'skipped_user_roles': skipped_user_roles,
+        }
+
+        # Add summary message if there were failures
+        if failed_app_rows > 0:
+            result['failure_summary'] = (
+                f"{failed_app_rows} application rows failed to insert. "
+                f"{skipped_docs_total} documents were skipped because their parent applications failed. "
+                f"See 'errors' array for details on each failed row."
+            )
+
+        # Convert sample sets to lists for serialization and include mapping stats
+        # (limit unmapped samples to small lists)
+        for k in ('region_unmapped_samples', 'district_unmapped_samples', 'ward_unmapped_samples', 'legal_status_unmapped_samples', 'license_category_unmapped_samples'):
+            if k in mapping_stats and isinstance(mapping_stats[k], set):
+                mapping_stats[k] = list(mapping_stats[k])
+        result['mapping_stats'] = mapping_stats
+        if errors:
+            result['errors'] = errors
+
+        # ── Auto backfill created_by from username ─────────────────────────
+        # Run after all inserts so every user that was provisioned above gets
+        # their UUID reflected on applications + all child tables.
+        try:
+            _bf = backfill_created_by_from_username(db)
+            logger.info("Auto backfill created_by: %s", _bf)
+            result['backfill_created_by'] = _bf
+        except Exception as _bfe:
+            logger.warning("Auto backfill created_by failed (non-fatal): %s", _bfe)
+
+        return result
 
 
 def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
@@ -1335,7 +1713,7 @@ def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
             FROM public.applications a
             JOIN public.users usr
               ON lower(trim(usr.username)) = lower(trim(a.username))
-            WHERE a.username IS NOT NULL AND trim(a.username) <> ''
+            WHERE a.username IS NOT NULL AND lower(trim(a.username)) <> ''
         )
     """
 
@@ -1349,7 +1727,7 @@ def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
             JOIN public.applications a ON a.id = asd.application_id
             JOIN public.users usr
               ON lower(trim(usr.username)) = lower(trim(a.username))
-            WHERE a.username IS NOT NULL AND trim(a.username) <> ''
+            WHERE a.username IS NOT NULL AND lower(trim(a.username)) <> ''
         )
     """
 

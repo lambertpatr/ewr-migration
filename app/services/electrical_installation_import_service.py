@@ -497,45 +497,42 @@ def import_electrical_installation_via_staging_copy(
     db.commit()
     _progress("schema:guard:done")
 
-    # ── 6½. Relax unique constraints on certificates to allow LOIS data model ──
+    # ── 6½. Ensure uq_certificates_application_number exists ──────────
     #
-    # Business rule: the same approval_no can appear in certificates with different
-    # application_certificate_type values (NEW vs RENEW vs UPGRADE share a licence number).
-    # The same application_number can also have multiple certificates — one per type.
+    # Business rule: one certificate row per application_number.
+    # All import pipelines now use ON CONFLICT (application_number) DO UPDATE.
+    # We must:
+    #   1. Drop any existing unique on certificates that includes approval_no
+    #      or application_number (could conflict with the new constraint).
+    #   2. Dedup any duplicate application_number rows, then
+    #   3. Add UNIQUE (application_number) if not already present.
     #
-    # For EVERY schema that actually exists on this DB ('public' and 'align_live' if present):
-    #   REMOVE  single-column UNIQUE on applications.approval_no
-    #   REMOVE  single-column UNIQUE on certificates.approval_no
-    #   REMOVE  single-column UNIQUE on certificates.application_number
-    #   ADD     composite UNIQUE (approval_no, application_certificate_type)
-    #
-    # All constraint names are Hibernate-generated hashes that differ per environment,
-    # so they are looked up dynamically — nothing is hardcoded.
+    # Applies to 'public' and 'align_live' schemas if they exist.
     _progress("schema:relax-certificates-constraints")
     db.execute(text("""
         DO $$
         DECLARE
-            _rec        RECORD;
-            _schema     text;
-            _app_attnum smallint;
-            _cert_attnum smallint;
-            _cert_type_attnum smallint;
+            _rec               RECORD;
+            _schema            text;
+            _app_attnum        smallint;
+            _cert_apprv_attnum  smallint;
+            _cert_appnum_attnum smallint;
         BEGIN
-            -- Iterate only over schemas that actually exist on this database
             FOR _schema IN
                 SELECT nspname FROM pg_namespace
                 WHERE  nspname IN ('public', 'align_live')
                 ORDER BY nspname
             LOOP
 
-                -- ── A. Drop single-column UNIQUE on applications.approval_no ──
+                -- ── A. Drop ANY unique on applications.approval_no ────────────
                 IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                            WHERE n.nspname=_schema AND c.relname='applications') THEN
                     SELECT attnum INTO _app_attnum
                     FROM pg_attribute
-                    WHERE attrelid = (SELECT c.oid FROM pg_class c
-                                      JOIN pg_namespace n ON n.oid=c.relnamespace
-                                      WHERE n.nspname=_schema AND c.relname='applications')
+                    WHERE attrelid = (
+                              SELECT c.oid FROM pg_class c
+                              JOIN pg_namespace n ON n.oid=c.relnamespace
+                              WHERE n.nspname=_schema AND c.relname='applications')
                       AND attname = 'approval_no';
 
                     IF _app_attnum IS NOT NULL THEN
@@ -547,36 +544,38 @@ def import_electrical_installation_via_staging_copy(
                             WHERE  con.contype = 'u'
                               AND  nsp.nspname = _schema
                               AND  cls.relname = 'applications'
-                              AND  con.conkey = ARRAY[_app_attnum]
+                              AND  _app_attnum = ANY(con.conkey)
                         LOOP
                             EXECUTE format('ALTER TABLE %I.applications DROP CONSTRAINT IF EXISTS %I',
                                            _schema, _rec.conname);
-                            RAISE NOTICE 'Dropped %.applications.%', _schema, _rec.conname;
+                            RAISE NOTICE 'Dropped applications unique on approval_no: %.%', _schema, _rec.conname;
                         END LOOP;
                     END IF;
                 END IF;
 
-                -- ── B & C. Drop single-column UNIQUEs on certificates ─────────
+                -- ── B & C. Drop ALL unique constraints on certificates that include
+                --          approval_no OR application_number (single or composite) ──
                 IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
                            WHERE n.nspname=_schema AND c.relname='certificates') THEN
 
-                    -- Get column numbers for approval_no and application_number
-                    SELECT attnum INTO _cert_attnum
+                    SELECT attnum INTO _cert_apprv_attnum
                     FROM pg_attribute
-                    WHERE attrelid = (SELECT c.oid FROM pg_class c
-                                      JOIN pg_namespace n ON n.oid=c.relnamespace
-                                      WHERE n.nspname=_schema AND c.relname='certificates')
+                    WHERE attrelid = (
+                              SELECT c.oid FROM pg_class c
+                              JOIN pg_namespace n ON n.oid=c.relnamespace
+                              WHERE n.nspname=_schema AND c.relname='certificates')
                       AND attname = 'approval_no';
 
-                    SELECT attnum INTO _cert_type_attnum
+                    SELECT attnum INTO _cert_appnum_attnum
                     FROM pg_attribute
-                    WHERE attrelid = (SELECT c.oid FROM pg_class c
-                                      JOIN pg_namespace n ON n.oid=c.relnamespace
-                                      WHERE n.nspname=_schema AND c.relname='certificates')
+                    WHERE attrelid = (
+                              SELECT c.oid FROM pg_class c
+                              JOIN pg_namespace n ON n.oid=c.relnamespace
+                              WHERE n.nspname=_schema AND c.relname='certificates')
                       AND attname = 'application_number';
 
-                    -- Drop UNIQUE(approval_no)
-                    IF _cert_attnum IS NOT NULL THEN
+                    -- Drop any unique that mentions approval_no (single OR composite)
+                    IF _cert_apprv_attnum IS NOT NULL THEN
                         FOR _rec IN
                             SELECT con.conname
                             FROM   pg_constraint con
@@ -585,16 +584,17 @@ def import_electrical_installation_via_staging_copy(
                             WHERE  con.contype = 'u'
                               AND  nsp.nspname = _schema
                               AND  cls.relname = 'certificates'
-                              AND  con.conkey = ARRAY[_cert_attnum]
+                              AND  _cert_apprv_attnum = ANY(con.conkey)
                         LOOP
                             EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
                                            _schema, _rec.conname);
-                            RAISE NOTICE 'Dropped %.certificates.% (approval_no)', _schema, _rec.conname;
+                            RAISE NOTICE 'Dropped certificates unique on approval_no: %.%', _schema, _rec.conname;
                         END LOOP;
                     END IF;
 
-                    -- Drop UNIQUE(application_number)  — same app can have NEW + RENEW + UPGRADE
-                    IF _cert_type_attnum IS NOT NULL THEN
+                    -- Drop any existing unique that mentions application_number
+                    -- (we are about to re-add a clean single-column one below)
+                    IF _cert_appnum_attnum IS NOT NULL THEN
                         FOR _rec IN
                             SELECT con.conname
                             FROM   pg_constraint con
@@ -603,16 +603,15 @@ def import_electrical_installation_via_staging_copy(
                             WHERE  con.contype = 'u'
                               AND  nsp.nspname = _schema
                               AND  cls.relname = 'certificates'
-                              AND  con.conkey = ARRAY[_cert_type_attnum]
+                              AND  _cert_appnum_attnum = ANY(con.conkey)
                         LOOP
                             EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
                                            _schema, _rec.conname);
-                            RAISE NOTICE 'Dropped %.certificates.% (application_number)', _schema, _rec.conname;
+                            RAISE NOTICE 'Dropped certificates unique on application_number: %.%', _schema, _rec.conname;
                         END LOOP;
                     END IF;
 
-                    -- ── D. Add composite UNIQUE (approval_no, application_certificate_type) ──
-                    --    Real dedup key: same approval_no is fine across different cert types.
+                    -- ── D. Add UNIQUE (application_number) ── the upsert conflict key ──
                     IF NOT EXISTS (
                         SELECT 1 FROM pg_constraint con
                         JOIN pg_class     cls ON cls.oid = con.conrelid
@@ -620,15 +619,34 @@ def import_electrical_installation_via_staging_copy(
                         WHERE  con.contype = 'u'
                           AND  nsp.nspname = _schema
                           AND  cls.relname = 'certificates'
-                          AND  con.conname = 'certificates_approval_no_cert_type_uq'
+                          AND  con.conname = 'uq_certificates_application_number'
                     ) THEN
+                        -- Dedup first so the constraint can be created cleanly
+                        EXECUTE format(
+                            'DELETE FROM %I.certificates
+                             WHERE id IN (
+                                 SELECT id FROM (
+                                     SELECT id,
+                                            ROW_NUMBER() OVER (
+                                                PARTITION BY application_number
+                                                ORDER BY updated_at DESC NULLS LAST,
+                                                         created_at  DESC NULLS LAST,
+                                                         id
+                                            ) AS rn
+                                     FROM %I.certificates
+                                     WHERE application_number IS NOT NULL
+                                 ) ranked
+                                 WHERE rn > 1
+                             )',
+                            _schema, _schema
+                        );
                         EXECUTE format(
                             'ALTER TABLE %I.certificates
-                             ADD CONSTRAINT certificates_approval_no_cert_type_uq
-                             UNIQUE (approval_no, application_certificate_type)',
+                             ADD CONSTRAINT uq_certificates_application_number
+                             UNIQUE (application_number)',
                             _schema
                         );
-                        RAISE NOTICE 'Added certificates_approval_no_cert_type_uq on %.certificates', _schema;
+                        RAISE NOTICE 'Added uq_certificates_application_number on %.certificates', _schema;
                     END IF;
 
                 END IF; -- certificates table exists
@@ -640,6 +658,98 @@ def import_electrical_installation_via_staging_copy(
     _progress("schema:relax-certificates-constraints:done")
     # Commit constraint changes before data inserts
     db.commit()
+
+    # ── STEP A0: ensure users exist for userid values in the Excel ─────
+    # Done FIRST — before inserting applications — so that created_by can
+    # be back-filled from users.id immediately after applications are inserted.
+    _progress("transform:users_from_userid")
+    db.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
+    # Normalize userids to lowercase in staging table so mixed-case duplicates collapse
+    db.execute(text("""
+        UPDATE public.stage_elec_install_raw
+        SET userid = lower(trim(userid))
+        WHERE userid IS NOT NULL
+    """))
+    _elec_users_result = db.execute(text("""
+        WITH u AS (
+            SELECT DISTINCT lower(trim(s.userid)) AS username
+            FROM public.stage_elec_install_raw s
+            WHERE NULLIF(trim(s.userid), '') IS NOT NULL
+        )
+        INSERT INTO public.users (
+            id, full_name, username, password_hash, status,
+            phone_number, email_address, user_category,
+            account_type, auth_mode, failed_attempts,
+            is_first_login, deleted, created_at, updated_at
+        )
+        SELECT
+            gen_random_uuid(), u.username, u.username, '',
+            'ACTIVE', NULL, NULL, 'EXTERNAL', 'INDIVIDUAL', 'DB',
+            0, false, false, now(), now()
+        FROM u
+        WHERE NOT EXISTS (
+            SELECT 1 FROM public.users eu
+            WHERE lower(trim(eu.username)) = u.username
+        );
+    """))
+    _inserted_users = _elec_users_result.rowcount or 0
+    _total_elec_usernames = db.execute(text(
+        "SELECT COUNT(DISTINCT lower(trim(userid))) FROM public.stage_elec_install_raw "
+        "WHERE NULLIF(trim(userid), '') IS NOT NULL"
+    )).scalar() or 0
+    _skipped_users = max(0, int(_total_elec_usernames) - int(_inserted_users))
+    _progress(f"transform:users_from_userid: inserted={_inserted_users}, already_existed={_skipped_users}")
+
+    # Look up APPLICANT ROLE id — read from an existing user_roles row.
+    # Never scan public.roles: it is a FDW foreign table whose remote name
+    # differs (public.role), causing every query to fail.
+    _elec_role_id = None
+    _inserted_user_roles = 0
+    _skipped_user_roles = 0
+    try:
+        _ur = db.execute(text("SELECT role_id FROM public.user_roles LIMIT 1")).fetchone()
+        if _ur:
+            _elec_role_id = str(_ur[0])
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    if not _elec_role_id:
+        # public.roles FDW always fails (remote table is named public.role).
+        # Cannot safely scan roles — skip role assignment silently.
+        logger.info("APPLICANT ROLE id not found from user_roles; role assignment skipped (FDW limitation)")
+        _skipped_user_roles = int(_total_elec_usernames)
+
+    # Assign APPLICANT ROLE — remote user_roles FDW only exposes (user_id, role_id).
+    if _elec_role_id:
+        try:
+            _rr = db.execute(text("""
+                INSERT INTO public.user_roles (user_id, role_id)
+                SELECT u.id, :role_id
+                FROM public.users u
+                WHERE EXISTS (
+                    SELECT 1 FROM public.stage_elec_install_raw s
+                    WHERE NULLIF(trim(s.userid), '') IS NOT NULL
+                      AND lower(trim(s.userid)) = lower(trim(u.username))
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM public.user_roles ex
+                    WHERE ex.user_id = u.id AND ex.role_id = :role_id
+                )
+            """), {"role_id": _elec_role_id})
+            db.commit()
+            _inserted_user_roles = _rr.rowcount or 0
+            _skipped_user_roles = max(0, int(_total_elec_usernames) - int(_inserted_user_roles))
+            _progress(f"transform:role_assignment: inserted={_inserted_user_roles}, already_had_role={_skipped_user_roles}")
+        except Exception as _ure:
+            logger.warning("Role assignment skipped (non-fatal): %s", _ure)
+            _skipped_user_roles = int(_total_elec_usernames)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+    _progress("transform:users_from_userid:done")
 
     # ── 7. Set-based SQL transform across all 8 tables ────────────────
     _progress("transform:sql:start")
@@ -692,11 +802,29 @@ def import_electrical_installation_via_staging_copy(
                      THEN trim(ea.completed_at)::date END,
                 'LICENSE_ELECTRICITY_INSTALLATION',  -- license_type: fixed per check constraint
                 'OPERATIONAL',                       -- category_license_type: fixed per check constraint
-                -- license_category_id: try as UUID directly, else NULL
-                CASE WHEN NULLIF(trim(ea.license_category_id),'') IS NOT NULL
-                     THEN (CASE WHEN trim(ea.license_category_id) ~ '^[0-9a-fA-F-]{36}$'
-                                THEN trim(ea.license_category_id)::uuid
-                                ELSE NULL END)
+                -- category_id: map licensecategoryclass (e.g. "CLASS A") → uuid from categories table.
+                -- Mapping derived from: SELECT id, code FROM public.categories WHERE deleted_at IS NULL
+                --   A  → 6dd52222-0eb2-471e-830d-1ee943177f93
+                --   B  → fb74cf81-0cf5-4a7d-98e5-5ac4d500a879
+                --   C  → feaed553-4247-4d99-9e80-cbc3665b690f
+                --   D  → 2c4d6a4d-b13e-4130-bc64-6e06143e53ba
+                --   W  → 15f47ccc-215f-4640-855d-25d522fb0b90
+                --   S1 → 0bf197a8-38a9-490e-9e63-239ddc5a5d5f
+                --   S2 → 21b7dcf1-cbbb-4cfb-9df2-18be275c2a00
+                --   S3 → 90aae050-6eef-452d-8bb6-fd0e08c567c9
+                CASE UPPER(REGEXP_REPLACE(TRIM(ea.licensecategoryclass), '\\s+', ' '))
+                    WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
+                    WHEN 'CLASS B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
+                    WHEN 'CLASS C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
+                    WHEN 'CLASS D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
+                    WHEN 'CLASS W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
+                    WHEN 'CLASS S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
+                    WHEN 'CLASS S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
+                    WHEN 'CLASS S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
+                    -- fallback: if already a raw UUID string, cast directly
+                    ELSE (CASE WHEN NULLIF(TRIM(ea.licensecategoryclass),'') ~ '^[0-9a-fA-F-]{36}$'
+                               THEN TRIM(ea.licensecategoryclass)::uuid
+                               ELSE NULL END)
                 END,
                 CASE WHEN NULLIF(trim(ea.effective_date),'') IS NOT NULL
                      THEN trim(ea.effective_date)::date END,
@@ -714,7 +842,21 @@ def import_electrical_installation_via_staging_copy(
                 ),
                 now()
             FROM deduped ea
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (application_number) DO UPDATE SET
+                -- Only fill NULLs — never overwrite existing non-null values (COALESCE pattern).
+                application_type          = COALESCE(public.applications.application_type,          EXCLUDED.application_type),
+                approval_no               = COALESCE(public.applications.approval_no,               EXCLUDED.approval_no),
+                approval_date             = COALESCE(public.applications.approval_date,             EXCLUDED.approval_date),
+                category_id               = COALESCE(public.applications.category_id,               EXCLUDED.category_id),
+                effective_date            = COALESCE(public.applications.effective_date,            EXCLUDED.effective_date),
+                expire_date               = COALESCE(public.applications.expire_date,               EXCLUDED.expire_date),
+                old_parent_application_id = COALESCE(public.applications.old_parent_application_id, EXCLUDED.old_parent_application_id),
+                username                  = COALESCE(public.applications.username,                  EXCLUDED.username),
+                old_created_by            = COALESCE(public.applications.old_created_by,            EXCLUDED.old_created_by),
+                -- These two are always enforced for electrical installation imports.
+                status                    = 'APPROVED',
+                is_from_lois              = true,
+                updated_at                = now()
             RETURNING id
         )
         SELECT COUNT(*) AS inserted_apps FROM ins_apps;
@@ -723,63 +865,67 @@ def import_electrical_installation_via_staging_copy(
     ins_apps = int(r.get("inserted_apps", 0) or 0)
     _progress(f"transform:applications inserted={ins_apps}")
 
-    # Ensure all matching rows (including pre-existing) have status=APPROVED and is_from_lois=true
+    # Ensure all matching rows (including pre-existing) have status=APPROVED and is_from_lois=true,
+    # and back-fill category_id where it was previously NULL (e.g. rows inserted before the
+    # licensecategoryclass mapping was added).
     db.execute(text("""
         UPDATE public.applications a
         SET    status       = 'APPROVED',
                is_from_lois = true,
+               category_id  = COALESCE(
+                   a.category_id,
+                   CASE UPPER(REGEXP_REPLACE(TRIM(s.licensecategoryclass), '\\s+', ' '))
+                       WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
+                       WHEN 'CLASS B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
+                       WHEN 'CLASS C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
+                       WHEN 'CLASS D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
+                       WHEN 'CLASS W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
+                       WHEN 'CLASS S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
+                       WHEN 'CLASS S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
+                       WHEN 'CLASS S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
+                       WHEN 'A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
+                       WHEN 'B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
+                       WHEN 'C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
+                       WHEN 'D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
+                       WHEN 'W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
+                       WHEN 'S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
+                       WHEN 'S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
+                       WHEN 'S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
+                       ELSE NULL
+                   END
+               ),
                updated_at   = now()
         FROM   public.stage_elec_install_raw s
         WHERE  a.application_number = trim(s.application_number)
-          AND  (a.status != 'APPROVED' OR a.is_from_lois IS DISTINCT FROM true);
+          AND  (
+               a.status != 'APPROVED'
+            OR a.is_from_lois IS DISTINCT FROM true
+            OR a.category_id IS NULL
+          );
     """))
     db.commit()
-    _progress("transform:applications status+is_from_lois enforced")
+    _progress("transform:applications status+is_from_lois+category_id enforced")
 
     # ── STEP A½: certificates ──────────────────────────────────────────
-    # Business rule: one certificate row per (application_number, application_certificate_type).
-    # Same approval_no can appear with different types (NEW, RENEW, UPGRADE etc.)
-    # — the composite unique (approval_no, application_certificate_type) guards real duplicates.
+    # Business rule: one certificate row per application_number.
+    # Different application_numbers may share the same approval_no — that is fine,
+    # each application owns its own certificate row keyed by application_number.
+    # Re-uploads update the existing row rather than fail on approval_no conflicts.
     #
     # license_type and category_license_type are copied directly from the already-inserted
     # applications row (joined via application_id) so both tables always share the same values.
     r1b = db.execute(text("""
         WITH eligible AS (
-            -- One row per (application_number, application_certificate_type) pair.
-            -- This allows multiple certificate types for the same application_number
-            -- (e.g. a NEW and a subsequent RENEW), while still deduplicating within
-            -- the same type.
-            SELECT DISTINCT ON (trim(s.application_number), COALESCE(NULLIF(trim(s.application_type),''), 'NEW'))
+            -- One row per application_number (first occurrence in the file).
+            SELECT DISTINCT ON (trim(s.application_number))
                    s.*,
                    a.id                    AS resolved_app_id,
+                   a.category_id           AS resolved_category_id,
                    a.license_type          AS resolved_license_type,
                    a.category_license_type AS resolved_category_license_type
             FROM public.stage_elec_install_raw s
             JOIN public.applications a ON a.application_number = trim(s.application_number)
-            WHERE NOT EXISTS (
-                SELECT 1 FROM public.certificates c
-                WHERE c.application_id = a.id
-                  AND c.application_certificate_type = COALESCE(NULLIF(trim(s.application_type),''), 'NEW')
-            )
-            ORDER BY trim(s.application_number),
-                     COALESCE(NULLIF(trim(s.application_type),''), 'NEW'),
-                     s.row_no
-        ),
-        -- Second dedup layer: within the INSERT batch, two different application_numbers
-        -- may share the same approval_no. ON CONFLICT DO UPDATE cannot hit the same
-        -- (approval_no, application_certificate_type) target twice in one command,
-        -- so keep only the first row per conflict key.
-        deduped AS (
-            SELECT DISTINCT ON (
-                NULLIF(trim(e.approval_no), ''),
-                COALESCE(NULLIF(trim(e.application_type), ''), 'NEW')
-            )
-                e.*
-            FROM eligible e
-            ORDER BY
-                NULLIF(trim(e.approval_no), ''),
-                COALESCE(NULLIF(trim(e.application_type), ''), 'NEW'),
-                e.row_no
+            ORDER BY trim(s.application_number), s.row_no
         ),
         ins AS (
             INSERT INTO public.certificates (
@@ -797,36 +943,35 @@ def import_electrical_installation_via_staging_copy(
                 created_at, updated_at
             )
             SELECT
-                e.cert_id,
+                -- id is just a surrogate PK; conflict key is application_number (unique).
+                gen_random_uuid(),
                 e.resolved_app_id,
                 trim(e.application_number),
                 NULLIF(trim(e.certificate_owner), ''),
                 NULLIF(trim(e.approval_no), ''),
-                -- completed_at → approval_date
                 CASE WHEN NULLIF(trim(e.completed_at),'') IS NOT NULL
                      THEN trim(e.completed_at)::date END,
-                -- mirror the application's own values — single source of truth
                 e.resolved_category_license_type,
                 e.resolved_license_type,
                 CASE WHEN NULLIF(trim(e.effective_date),'') IS NOT NULL
                      THEN trim(e.effective_date)::date END,
                 CASE WHEN NULLIF(trim(e.expire_date),'') IS NOT NULL
                      THEN trim(e.expire_date)::date END,
-                -- application_certificate_type: use the already-normalised application_type
-                -- (NEW/RENEW/UPGRADE/APPEAL) — same allowed values, defaulting to 'NEW'
                 COALESCE(NULLIF(trim(e.application_type), ''), 'NEW'),
                 now(), now()
-            FROM deduped e
-            ON CONFLICT (approval_no, application_certificate_type) DO UPDATE
+            FROM eligible e
+            ON CONFLICT (application_number) DO UPDATE
             SET
-                license_type          = EXCLUDED.license_type,
-                category_license_type = EXCLUDED.category_license_type,
-                application_id        = EXCLUDED.application_id,
-                effective_date        = EXCLUDED.effective_date,
-                expire_date           = EXCLUDED.expire_date,
-                approval_date         = EXCLUDED.approval_date,
-                certificate_owner     = COALESCE(EXCLUDED.certificate_owner, public.certificates.certificate_owner),
-                updated_at            = now()
+                approval_no               = COALESCE(EXCLUDED.approval_no,               public.certificates.approval_no),
+                approval_date             = COALESCE(EXCLUDED.approval_date,             public.certificates.approval_date),
+                license_type              = EXCLUDED.license_type,
+                category_license_type     = EXCLUDED.category_license_type,
+                application_id            = EXCLUDED.application_id,
+                effective_date            = COALESCE(EXCLUDED.effective_date,            public.certificates.effective_date),
+                expire_date               = COALESCE(EXCLUDED.expire_date,               public.certificates.expire_date),
+                certificate_owner         = COALESCE(EXCLUDED.certificate_owner,         public.certificates.certificate_owner),
+                application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
+                updated_at                = now()
             RETURNING id
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -852,21 +997,34 @@ def import_electrical_installation_via_staging_copy(
     # the Excel column `approvedclass`.
     r2 = db.execute(text("""
         WITH eligible AS (
-            SELECT s.*,
+            SELECT DISTINCT ON (a.id)
+                   s.*,
                    a.id AS resolved_app_id,
-                   (
-                       SELECT lc.id
-                       FROM public.categories lc
-                       WHERE lc.deleted_at IS NULL
-                         AND LOWER(TRIM(lc.name)) = LOWER(TRIM(s.approvedclass))
-                       LIMIT 1
-                   ) AS resolved_approved_class_id
+                   -- approved_class_id: map approvedclass (e.g. "CLASS A") → uuid.
+                   -- DB categories table has code "A","B",... but Excel sends "CLASS A","CLASS B",...
+                   CASE UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
+                       WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
+                       WHEN 'CLASS B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
+                       WHEN 'CLASS C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
+                       WHEN 'CLASS D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
+                       WHEN 'CLASS W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
+                       WHEN 'CLASS S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
+                       WHEN 'CLASS S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
+                       WHEN 'CLASS S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
+                       -- fallback: bare code without "CLASS " prefix
+                       WHEN 'A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
+                       WHEN 'B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
+                       WHEN 'C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
+                       WHEN 'D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
+                       WHEN 'W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
+                       WHEN 'S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
+                       WHEN 'S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
+                       WHEN 'S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
+                       ELSE NULL
+                   END AS resolved_approved_class_id
             FROM public.stage_elec_install_raw s
             JOIN public.applications a ON a.application_number = trim(s.application_number)
-            WHERE NOT EXISTS (
-                SELECT 1 FROM public.application_electrical_installation x
-                WHERE x.application_id = a.id
-            )
+            ORDER BY a.id, s.row_no
         ),
         ins AS (
             INSERT INTO public.application_electrical_installation (
@@ -876,7 +1034,8 @@ def import_electrical_installation_via_staging_copy(
                 is_from_lois, created_at, updated_at
             )
             SELECT
-                e.aei_id,
+                -- Stable id: md5(application_id || '|aei') so reruns are idempotent.
+                md5(e.resolved_app_id::text || '|aei')::uuid,
                 e.resolved_app_id,
                 -- applicant_name from company_name per mapping spec
                 NULLIF(trim(e.company_name), ''),
@@ -884,7 +1043,12 @@ def import_electrical_installation_via_staging_copy(
                 e.resolved_approved_class_id,
                 true, now(), now()
             FROM eligible e
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                applicant_name      = COALESCE(EXCLUDED.applicant_name, public.application_electrical_installation.applicant_name),
+                experience_type     = COALESCE(EXCLUDED.experience_type, public.application_electrical_installation.experience_type),
+                approved_class_id   = COALESCE(EXCLUDED.approved_class_id, public.application_electrical_installation.approved_class_id),
+                is_from_lois        = true,
+                updated_at          = now()
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -921,7 +1085,9 @@ def import_electrical_installation_via_staging_copy(
                 created_at, updated_at
             )
             SELECT
-                e.cd_id,
+                -- Stable id derived from aei_id so re-uploads always produce the
+                -- same UUID and ON CONFLICT (id) deduplicates correctly.
+                md5(e.resolved_aei_id::text || '|cd')::uuid,
                 e.resolved_app_id,
                 e.resolved_aei_id,
                 NULLIF(trim(e.region), ''),
@@ -933,7 +1099,15 @@ def import_electrical_installation_via_staging_copy(
                 NULLIF(trim(e.po_box), ''),
                 now(), now()
             FROM eligible e
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                region     = COALESCE(EXCLUDED.region,    public.contact_details.region),
+                district   = COALESCE(EXCLUDED.district,  public.contact_details.district),
+                ward       = COALESCE(EXCLUDED.ward,      public.contact_details.ward),
+                email      = COALESCE(EXCLUDED.email,     public.contact_details.email),
+                mobile_no  = COALESCE(EXCLUDED.mobile_no, public.contact_details.mobile_no),
+                plot_no    = COALESCE(EXCLUDED.plot_no,   public.contact_details.plot_no),
+                po_box     = COALESCE(EXCLUDED.po_box,    public.contact_details.po_box),
+                updated_at = now()
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -969,7 +1143,9 @@ def import_electrical_installation_via_staging_copy(
                 created_at, updated_at
             )
             SELECT
-                e.pd_id,
+                -- Stable id derived from aei_id so re-uploads always produce the
+                -- same UUID and ON CONFLICT (id) deduplicates correctly.
+                md5(e.resolved_aei_id::text || '|pd')::uuid,
                 e.resolved_app_id,
                 e.resolved_aei_id,
                 CASE WHEN NULLIF(trim(e.date_of_birth),'') IS NOT NULL
@@ -985,7 +1161,12 @@ def import_electrical_installation_via_staging_copy(
                 NULLIF(trim(e.work_permit_no), ''),
                 now(), now()
             FROM eligible e
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                date_of_birth  = COALESCE(EXCLUDED.date_of_birth,  public.personal_details.date_of_birth),
+                nationality    = COALESCE(EXCLUDED.nationality,    public.personal_details.nationality),
+                gender         = COALESCE(EXCLUDED.gender,         public.personal_details.gender),
+                work_permit_no = COALESCE(EXCLUDED.work_permit_no, public.personal_details.work_permit_no),
+                updated_at     = now()
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -1024,7 +1205,9 @@ def import_electrical_installation_via_staging_copy(
                 created_at, updated_at
             )
             SELECT
-                e.att_id,
+                -- Stable id derived from aei_id so re-uploads always produce the
+                -- same UUID and ON CONFLICT (id) deduplicates correctly.
+                md5(e.resolved_aei_id::text || '|att')::uuid,
                 e.resolved_app_id,
                 e.resolved_aei_id,
                 NULLIF(trim(e.identification), ''),
@@ -1033,7 +1216,12 @@ def import_electrical_installation_via_staging_copy(
                 NULLIF(trim(e.passport_name), ''),
                 now(), now()
             FROM eligible e
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                identification      = COALESCE(EXCLUDED.identification,      public.attachments.identification),
+                identification_name = COALESCE(EXCLUDED.identification_name, public.attachments.identification_name),
+                passport            = COALESCE(EXCLUDED.passport,            public.attachments.passport),
+                passport_name       = COALESCE(EXCLUDED.passport_name,       public.attachments.passport_name),
+                updated_at          = now()
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -1080,11 +1268,68 @@ def import_electrical_installation_via_staging_copy(
     ins_we = 0
     _progress("transform:work_experience skipped (voltage_level data not in this file)")
 
-    # ── STEP G: self_employed — SKIPPED on this import ────────────────
-    # self_employed is only created for SELF_EMPLOYED experience rows, which
-    # require work_experience to exist first. Deferred to the follow-up import.
-    ins_se = 0
-    _progress("transform:self_employed skipped (depends on work_experience)")
+    # ── STEP G: self_employed — insert for SELF_EMPLOYED applicants ──────────
+    # The main file has employmentstatus → experience_type = 'SELF_EMPLOYED'
+    # already staged in stage_elec_install_raw.experience_type.
+    # We insert one self_employed row per application whose experience_type
+    # is SELF_EMPLOYED. work_experience / voltage_level fields are not in this
+    # file; use NULL / 'NONE' placeholders — they will be enriched by the
+    # supervisors/work-experience upload later.
+    r6 = db.execute(text("""
+        WITH eligible AS (
+            SELECT DISTINCT ON (aei.id)
+                -- Use aei.id as the stable seed so supervisors upload can find
+                -- and enrich the same row using md5(aei.id::text || '|se')::uuid
+                md5(aei.id::text || '|se')::uuid AS se_id,
+                a.id   AS resolved_app_id,
+                aei.id AS resolved_aei_id
+            FROM public.stage_elec_install_raw s
+            JOIN public.applications a
+                ON a.application_number = trim(s.application_number)
+            JOIN public.application_electrical_installation aei
+                ON aei.application_id = a.id
+            WHERE UPPER(TRIM(s.experience_type)) = 'SELF_EMPLOYED'
+              AND NULLIF(trim(s.application_number), '') IS NOT NULL
+            ORDER BY aei.id, s.row_no
+        ),
+        ins AS (
+            INSERT INTO public.self_employed (
+                id,
+                application_id,
+                application_electrical_installation_id,
+                from_date,
+                to_date,
+                project_performed,
+                voltage_level,
+                voltage,
+                created_at,
+                updated_at
+            )
+            SELECT
+                e.se_id,
+                e.resolved_app_id,
+                e.resolved_aei_id,
+                NULL,       -- from_date: populated by supervisors upload
+                NULL,       -- to_date:   populated by supervisors upload
+                NULL,       -- project_performed: populated by supervisors upload
+                'NONE',     -- voltage_level: satisfies NOT NULL / CHECK if any
+                NULL,       -- voltage: populated by supervisors upload
+                now(),
+                now()
+            FROM eligible e
+            ON CONFLICT (id) DO UPDATE SET
+                application_electrical_installation_id = COALESCE(
+                    EXCLUDED.application_electrical_installation_id,
+                    public.self_employed.application_electrical_installation_id
+                ),
+                updated_at = now()
+            RETURNING 1
+        )
+        SELECT COUNT(*) AS cnt FROM ins;
+    """)).mappings().first() or {}
+    ins_se = int(r6.get("cnt", 0) or 0)
+    _progress(f"transform:self_employed inserted={ins_se}")
+    db.commit()
 
     # ── STEP H: certificate_verifications — SKIPPED on this import ───
     # The table does not exist yet; it will be populated from a separate
@@ -1253,9 +1498,50 @@ def import_electrical_installation_via_staging_copy(
 
     _progress("done")
 
+    # ── Auto backfill created_by from username ─────────────────────────
+    # Now that users exist and applications are inserted, fill created_by
+    # on all child tables using username → users.id matching.
+    _progress("backfill:created_by:start")
+    _backfill_counts: dict = {}
+    _backfill_tables = [
+        ("public.applications",                       "application_id", "id"),
+        ("public.certificates",                       "application_id", None),
+        ("public.application_electrical_installation","application_id", None),
+        ("public.contact_details",                    "application_id", None),
+        ("public.personal_details",                   "application_id", None),
+        ("public.attachments",                        "application_id", None),
+    ]
+    for _tbl, _fk, _self_join in _backfill_tables:
+        try:
+            _r = db.execute(text(f"""
+                UPDATE {_tbl} t
+                SET created_by = u.id, updated_at = now()
+                FROM public.applications a
+                JOIN public.users u
+                  ON lower(trim(u.username)) = lower(trim(a.username))
+                WHERE {"t.id = a.id" if _self_join else f"t.{_fk} = a.id"}
+                  AND a.username IS NOT NULL
+                  AND trim(a.username) <> ''
+                  AND t.created_by IS NULL
+            """))
+            _backfill_counts[_tbl] = _r.rowcount or 0
+        except Exception as _be:
+            logger.warning("backfill created_by skipped for %s: %s", _tbl, _be)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            _backfill_counts[_tbl] = -1
+    db.commit()
+    _progress("backfill:created_by:done")
+
     return {
         "total_rows_in_file": total_rows,
         "staged_total": staged,
+        "inserted_users": int(_inserted_users),
+        "skipped_users": int(_skipped_users),
+        "inserted_user_roles": int(_inserted_user_roles),
+        "skipped_user_roles": int(_skipped_user_roles),
         "inserted": {
             "applications": {
                 "count": ins_apps,
@@ -1289,7 +1575,7 @@ def import_electrical_installation_via_staging_copy(
             "self_employed": {
                 "count": ins_se,
                 "rows": [],
-                "note": "skipped — depends on work_experience",
+                "note": "inserted for all applications where employmentstatus = Self-Employed; work details enriched later by supervisors upload",
             },
             "certificate_verifications": {
                 "count": ins_cv,

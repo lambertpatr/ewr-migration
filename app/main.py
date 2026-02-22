@@ -15,6 +15,8 @@ from app.api.v1.electrical_installations_certificate_verifications_upload import
 	router as electrical_installations_cert_verifications_router,
 )
 from app.api.v1.sync_license_type import router as sync_license_type_router
+from app.api.v1.supervisor_details_upload import router as supervisor_details_router
+from app.api.v1.self_employed_upload import router as self_employed_upload_router
 import app.api.v1.categories_upload as categories_upload
 
 app = FastAPI(title="EWURA LOIS Migration API")
@@ -39,3 +41,5 @@ app.include_router(electrical_installations_supervisors_router)
 app.include_router(electrical_installations_cert_verifications_router)
 app.include_router(categories_upload.router)
 app.include_router(sync_license_type_router)
+app.include_router(supervisor_details_router)
+app.include_router(self_employed_upload_router)

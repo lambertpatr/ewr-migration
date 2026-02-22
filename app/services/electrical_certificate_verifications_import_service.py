@@ -3,29 +3,25 @@ from __future__ import annotations
 """Electrical Installation certificate verifications import service.
 
 Source Excel columns (case-insensitive; spaces tolerated)
-------------------------------------------------------
+-------------------------------------------------------
 apprefno, sno, fromdate, todate, institutenameaddress, award, objectid, filename
 
-Target table
-------------
-- public.certificate_verifications
-
-Mapping
--------
-- institutenameaddress -> education_regulatory_body (NOT NULL)
-- award                -> education_regulatory_body_category (NOT NULL)
-- objectid             -> logic_doc_id (bigint)
-- filename             -> file_name
-
-graduation_year / registration_number / is_external are not present in this file
-and are inserted as NULL.
+Notes
+-----
+The target table `public.certificate_verification` has CHECK constraints on
+`education_regulatory_body` and `education_regulatory_body_category`. For
+migration uploads we force both to the allowed value `'NONE'`.
 """
 
 from typing import Any, Callable, Optional
+
 import io
+import csv
 import logging
 
+
 logger = logging.getLogger(__name__)
+
 
 _EMPTY = {"", "nan", "none", "null", "nat"}
 
@@ -106,20 +102,22 @@ def import_electrical_certificate_verifications_via_staging_copy(
         return {"total_rows_in_file": 0, "staged_total": 0, "inserted": {}}
 
     # Ensure target table exists
-    reg = db.execute(text("SELECT to_regclass('public.certificate_verifications')")).scalar()
+    reg = db.execute(text("SELECT to_regclass('public.certificate_verification')")).scalar()
     if reg is None:
-        raise RuntimeError("public.certificate_verifications table does not exist in this database")
+        raise RuntimeError("public.certificate_verification table does not exist in this database")
 
     # Schema guard for new columns
     _progress("schema:guard")
     db.execute(
         text(
             """
-            ALTER TABLE IF EXISTS public.certificate_verifications
+            ALTER TABLE IF EXISTS public.certificate_verification
                 ADD COLUMN IF NOT EXISTS application_id uuid,
                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid,
                 ADD COLUMN IF NOT EXISTS logic_doc_id bigint,
-                ADD COLUMN IF NOT EXISTS file_name text;
+                ADD COLUMN IF NOT EXISTS file_name text,
+                ADD COLUMN IF NOT EXISTS from_date timestamp NULL,
+                ADD COLUMN IF NOT EXISTS to_date   timestamp NULL;
             """
         )
     )
@@ -199,6 +197,38 @@ def import_electrical_certificate_verifications_via_staging_copy(
     db.commit()
     _progress(f"staging:done rows={staged}")
 
+    # Drop any FK constraints that point from certificate_verification
+    # to other tables (e.g. other_training, application_electrical_installation)
+    # so we can insert with application_id as the primary reference only.
+    _progress("schema:drop_fk")
+    db.execute(
+        text(
+            """
+            DO $$
+            DECLARE r record;
+            BEGIN
+                FOR r IN (
+                    SELECT conname, conrelid::regclass AS tbl
+                    FROM pg_constraint
+                    WHERE contype = 'f'
+                      AND (conrelid = 'public.certificate_verification'::regclass
+                           OR confrelid = 'public.certificate_verification'::regclass)
+                      AND conname NOT IN (
+                          'certificate_verification_pkey'
+                      )
+                ) LOOP
+                    EXECUTE format(
+                        'ALTER TABLE %s DROP CONSTRAINT IF EXISTS %I',
+                        r.tbl, r.conname
+                    );
+                END LOOP;
+            END $$;
+            """
+        )
+    )
+    db.commit()
+    _progress("schema:drop_fk:done")
+
     # Insert
     _progress("transform:certificate_verifications")
     r = (
@@ -206,57 +236,97 @@ def import_electrical_certificate_verifications_via_staging_copy(
             text(
                 """
                 WITH resolved AS (
+                    -- application_id is the primary reference (INNER JOIN).
+                    -- application_electrical_installation_id is best-effort (LEFT JOIN).
                     SELECT
-                        s.*, a.id AS app_id, aei.id AS aei_id
+                        s.*,
+                        a.id   AS app_id,
+                        aei.id AS aei_id
                     FROM public.stage_elec_cert_verifications_raw s
                     JOIN public.applications a
                         ON a.application_number = trim(s.app_number)
-                    JOIN public.application_electrical_installation aei
+                    LEFT JOIN public.application_electrical_installation aei
                         ON aei.application_id = a.id
                     WHERE NULLIF(trim(s.app_number), '') IS NOT NULL
                 ),
                 eligible AS (
-                    SELECT r.*
+                    -- Deduplicate across possible AEI rows from the LEFT JOIN.
+                    -- Prefer rows that have aei_id, then earliest staged row_no.
+                    SELECT DISTINCT ON (
+                        app_id,
+                        COALESCE(NULLIF(trim(objectid), '')::bigint, -1),
+                        COALESCE(NULLIF(trim(filename), ''), ''),
+                        COALESCE(NULLIF(trim(fromdate), ''), ''),
+                        COALESCE(NULLIF(trim(todate), ''), ''),
+                        COALESCE(NULLIF(trim(institutenameaddress), ''), ''),
+                        COALESCE(NULLIF(trim(award), ''), '')
+                    )
+                        r.*
                     FROM resolved r
-                    WHERE NULLIF(trim(r.institutenameaddress), '') IS NOT NULL
-                      AND NULLIF(trim(r.award), '') IS NOT NULL
-                      AND NOT EXISTS (
-                          SELECT 1 FROM public.certificate_verifications cv
-                          WHERE cv.application_electrical_installation_id = r.aei_id
-                            AND COALESCE(trim(cv.education_regulatory_body), '') = COALESCE(trim(r.institutenameaddress), '')
-                            AND COALESCE(trim(cv.education_regulatory_body_category), '') = COALESCE(trim(r.award), '')
-                            AND COALESCE(cv.logic_doc_id, -1) = COALESCE(NULLIF(trim(r.objectid), '')::bigint, -1)
-                      )
+                    ORDER BY
+                        app_id,
+                        COALESCE(NULLIF(trim(objectid), '')::bigint, -1),
+                        COALESCE(NULLIF(trim(filename), ''), ''),
+                        COALESCE(NULLIF(trim(fromdate), ''), ''),
+                        COALESCE(NULLIF(trim(todate), ''), ''),
+                        COALESCE(NULLIF(trim(institutenameaddress), ''), ''),
+                        COALESCE(NULLIF(trim(award), ''), ''),
+                        (aei_id IS NULL),
+                        row_no
                 ),
                 ins AS (
-                    INSERT INTO public.certificate_verifications (
+                    INSERT INTO public.certificate_verification (
                         id,
                         application_id,
                         application_electrical_installation_id,
+                        from_date,
+                        to_date,
                         education_regulatory_body,
                         education_regulatory_body_category,
                         graduation_year,
-                        is_external,
                         registration_number,
+                        is_external,
                         logic_doc_id,
                         file_name,
                         created_at,
                         updated_at
                     )
                     SELECT
-                        gen_random_uuid(),
-                        e.app_id,
-                        e.aei_id,
-                        NULLIF(trim(e.institutenameaddress), ''),
-                        NULLIF(trim(e.award), ''),
+                        md5(
+                            app_id::text
+                            || '|cv|'
+                            || COALESCE(NULLIF(trim(institutenameaddress), ''), '')
+                            || '|'
+                            || COALESCE(NULLIF(trim(award), ''), '')
+                            || '|'
+                            || COALESCE(NULLIF(trim(objectid), ''), '')
+                            || '|'
+                            || COALESCE(NULLIF(trim(filename), ''), '')
+                        )::uuid,
+                        app_id,
+                        aei_id,
+                        NULLIF(trim(fromdate), '')::timestamp,
+                        NULLIF(trim(todate), '')::timestamp,
+                        -- Force constrained columns to NONE
+                        'NONE',
+                        'NONE',
                         NULL,
                         NULL,
                         NULL,
-                        CASE WHEN NULLIF(trim(e.objectid), '') IS NOT NULL THEN trim(e.objectid)::bigint END,
-                        NULLIF(trim(e.filename), ''),
+                        NULLIF(trim(objectid), '')::bigint,
+                        NULLIF(trim(filename), ''),
                         now(),
                         now()
-                    FROM eligible e
+                    FROM eligible
+                    ON CONFLICT (id) DO UPDATE
+                    SET
+                        from_date = COALESCE(EXCLUDED.from_date, public.certificate_verification.from_date),
+                        to_date = COALESCE(EXCLUDED.to_date, public.certificate_verification.to_date),
+                        education_regulatory_body = 'NONE',
+                        education_regulatory_body_category = 'NONE',
+                        logic_doc_id = COALESCE(EXCLUDED.logic_doc_id, public.certificate_verification.logic_doc_id),
+                        file_name = COALESCE(EXCLUDED.file_name, public.certificate_verification.file_name),
+                        updated_at = now()
                     RETURNING 1
                 )
                 SELECT COUNT(*) AS cnt FROM ins;

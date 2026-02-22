@@ -5,6 +5,145 @@ BEGIN
     RAISE NOTICE '[staging-transform] starting (new normalized schema)';
 END $$;
 
+-------------------------------------------------------------------------------
+-- 0-pre) Drop blocking unique constraints on certificates and applications
+--
+-- Hibernate generates unique constraints on approval_no (single-column) and
+-- sometimes on application_number. These block our upserts which use
+-- ON CONFLICT (id). Drop ALL unique constraints that mention approval_no or
+-- application_number on certificates, and approval_no on applications.
+-- We do NOT re-add them — ON CONFLICT (id) is sufficient and id is always PK.
+-------------------------------------------------------------------------------
+DO $$
+DECLARE
+    _rec                  RECORD;
+    _schema               text := 'public';
+    _app_attnum           smallint;
+    _cert_apprv_attnum    smallint;
+    _cert_appnum_attnum   smallint;
+BEGIN
+    -- ── applications.approval_no ─────────────────────────────────────────────
+    SELECT attnum INTO _app_attnum
+    FROM pg_attribute
+    WHERE attrelid = (SELECT c.oid FROM pg_class c
+                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                      WHERE n.nspname = _schema AND c.relname = 'applications')
+      AND attname = 'approval_no';
+
+    IF _app_attnum IS NOT NULL THEN
+        FOR _rec IN
+            SELECT con.conname
+            FROM   pg_constraint con
+            JOIN   pg_class cls ON cls.oid = con.conrelid
+            JOIN   pg_namespace nsp ON nsp.oid = cls.relnamespace
+            WHERE  con.contype = 'u'
+              AND  nsp.nspname = _schema
+              AND  cls.relname = 'applications'
+              AND  _app_attnum = ANY(con.conkey)
+        LOOP
+            EXECUTE format('ALTER TABLE %I.applications DROP CONSTRAINT IF EXISTS %I',
+                           _schema, _rec.conname);
+            RAISE NOTICE '[staging-transform] Dropped applications unique on approval_no: %', _rec.conname;
+        END LOOP;
+    END IF;
+
+    -- ── certificates: any unique mentioning approval_no ──────────────────────
+    SELECT attnum INTO _cert_apprv_attnum
+    FROM pg_attribute
+    WHERE attrelid = (SELECT c.oid FROM pg_class c
+                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                      WHERE n.nspname = _schema AND c.relname = 'certificates')
+      AND attname = 'approval_no';
+
+    IF _cert_apprv_attnum IS NOT NULL THEN
+        FOR _rec IN
+            SELECT con.conname
+            FROM   pg_constraint con
+            JOIN   pg_class cls ON cls.oid = con.conrelid
+            JOIN   pg_namespace nsp ON nsp.oid = cls.relnamespace
+            WHERE  con.contype = 'u'
+              AND  nsp.nspname = _schema
+              AND  cls.relname = 'certificates'
+              AND  _cert_apprv_attnum = ANY(con.conkey)
+        LOOP
+            EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
+                           _schema, _rec.conname);
+            RAISE NOTICE '[staging-transform] Dropped certificates unique on approval_no: %', _rec.conname;
+        END LOOP;
+    END IF;
+
+    -- ── certificates: drop any unique mentioning application_number EXCEPT our own ──
+    -- We KEEP uq_certificates_application_number because ON CONFLICT (application_number)
+    -- in section 2b depends on it. Drop only other conflicting uniques on that column.
+    SELECT attnum INTO _cert_appnum_attnum
+    FROM pg_attribute
+    WHERE attrelid = (SELECT c.oid FROM pg_class c
+                      JOIN pg_namespace n ON n.oid = c.relnamespace
+                      WHERE n.nspname = _schema AND c.relname = 'certificates')
+      AND attname = 'application_number';
+
+    IF _cert_appnum_attnum IS NOT NULL THEN
+        FOR _rec IN
+            SELECT con.conname
+            FROM   pg_constraint con
+            JOIN   pg_class cls ON cls.oid = con.conrelid
+            JOIN   pg_namespace nsp ON nsp.oid = cls.relnamespace
+            WHERE  con.contype = 'u'
+              AND  nsp.nspname = _schema
+              AND  cls.relname = 'certificates'
+              AND  _cert_appnum_attnum = ANY(con.conkey)
+              AND  con.conname <> 'uq_certificates_application_number'  -- keep our required constraint
+        LOOP
+            EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
+                           _schema, _rec.conname);
+            RAISE NOTICE '[staging-transform] Dropped certificates unique on application_number: %', _rec.conname;
+        END LOOP;
+    END IF;
+
+END $$;
+
+-------------------------------------------------------------------------------
+-- 0-pre-b) Ensure uq_certificates_application_number exists before section 2b.
+-- ON CONFLICT (application_number) requires this unique constraint.
+-- Dedup first so the constraint creation does not fail on existing duplicates.
+-------------------------------------------------------------------------------
+DO $$
+BEGIN
+    -- Deduplicate certificates by application_number (keep newest row).
+    WITH ranked AS (
+        SELECT
+            id,
+            ROW_NUMBER() OVER (
+                PARTITION BY application_number
+                ORDER BY COALESCE(updated_at, created_at) DESC, created_at DESC, id
+            ) AS rn
+        FROM public.certificates
+        WHERE application_number IS NOT NULL
+          AND NULLIF(TRIM(application_number), '') IS NOT NULL
+    )
+    DELETE FROM public.certificates c
+    USING ranked r
+    WHERE c.id = r.id
+      AND r.rn > 1;
+
+    IF NOT EXISTS (
+        SELECT 1
+        FROM   pg_constraint con
+        JOIN   pg_class rel ON rel.oid = con.conrelid
+        JOIN   pg_namespace nsp ON nsp.oid = rel.relnamespace
+        WHERE  nsp.nspname = 'public'
+          AND  rel.relname = 'certificates'
+          AND  con.conname = 'uq_certificates_application_number'
+    ) THEN
+        ALTER TABLE public.certificates
+            ADD CONSTRAINT uq_certificates_application_number
+            UNIQUE (application_number);
+        RAISE NOTICE '[staging-transform] Created uq_certificates_application_number';
+    ELSE
+        RAISE NOTICE '[staging-transform] uq_certificates_application_number already exists – skipped';
+    END IF;
+END $$;
+
 -- Transform staging rows into the NEW normalized application schema.
 --
 -- Assumptions (new schema):
@@ -193,6 +332,7 @@ BEGIN
 
         effective_date,
         expire_date,
+        completed_at,
 
         application_number,
         application_type,
@@ -220,7 +360,8 @@ BEGIN
         zone_name,
         payer_code,
         current_step_name,
-        pending_actions
+        pending_actions,
+        old_parent_application_id
     )
     SELECT
         s.generated_id AS id,
@@ -235,8 +376,15 @@ BEGIN
         NULL::timestamp AS updated_at,
         NULL::uuid AS updated_by,
 
-    NULLIF(NULLIF(s.effective_date, ''), '\\N')::date AS effective_date,
-    NULLIF(NULLIF(s.expire_date, ''), '\\N')::date AS expire_date,
+    CASE WHEN NULLIF(NULLIF(trim(s.effective_date), ''), '\N') IS NOT NULL
+         THEN NULLIF(NULLIF(trim(s.effective_date), ''), '\N')::timestamp::date
+         ELSE NULL END AS effective_date,
+    CASE WHEN NULLIF(NULLIF(trim(s.expire_date), ''), '\N') IS NOT NULL
+         THEN NULLIF(NULLIF(trim(s.expire_date), ''), '\N')::timestamp::date
+         ELSE NULL END AS expire_date,
+    CASE WHEN NULLIF(NULLIF(trim(s.completed_at), ''), '\N') IS NOT NULL
+         THEN NULLIF(NULLIF(trim(s.completed_at), ''), '\N')::timestamp
+         ELSE NULL END AS completed_at,
 
         NULLIF(s.application_number, '') AS application_number,
         NULLIF(upper(s.application_type), '') AS application_type,
@@ -244,7 +392,7 @@ BEGIN
         NULLIF(trim(s.approval_no), '') AS approval_no,
     'APPROVED'::text AS status,
 
-    NULLIF(trim(s.username), '') AS username,
+    lower(NULLIF(trim(s.username), '')) AS username,
 
     true AS is_from_lois,
 
@@ -291,19 +439,16 @@ BEGIN
         NULL::text AS zone_name,
         NULL::text AS payer_code,
         NULL::text AS current_step_name,
-        NULL::text AS pending_actions
+        NULL::text AS pending_actions,
+        -- parent application reference from LOIS (stored as raw text, not a FK)
+        NULLIF(trim(s.old_parent_application_id), '') AS old_parent_application_id
     FROM (
-        -- Dedupe inside this load by approval_no first.
-        -- This is REQUIRED when using ON CONFLICT(approval_no) DO UPDATE;
-        -- otherwise Postgres can attempt to update the same target row multiple times
-        -- in one statement and raises CardinalityViolation.
-        --
-        -- If approval_no is blank (should already be filtered out), fall back to
-        -- application_number, else generated_id.
+        -- Dedupe inside this load by application_number first.
+        -- This is REQUIRED when using ON CONFLICT(application_number) DO UPDATE;
+        -- same application_number in the staging table must only produce one row.
         SELECT s.*,
                row_number() OVER (
                    PARTITION BY COALESCE(
-                       NULLIF(trim(s.approval_no), ''),
                        NULLIF(s.application_number, ''),
                        s.generated_id::text
                    )
@@ -314,25 +459,23 @@ BEGIN
     LEFT JOIN public.categories cat ON LOWER(TRIM(cat.name)) = LOWER(TRIM(s.license_type))
     LEFT JOIN public.sectors     sec ON sec.id = cat.sector_id
     WHERE s.rn = 1
-      AND NULLIF(trim(s.approval_no), '') IS NOT NULL
-      AND NOT EXISTS (
-          SELECT 1
-                    FROM public.applications a
-                    WHERE a.application_number IS NOT DISTINCT FROM NULLIF(s.application_number, '')
-      )
-        -- Some DBs enforce UNIQUE(approval_no). If the approval_no already exists,
-        -- update the existing record with the staged values (id and metadata are preserved).
-        ON CONFLICT (approval_no) DO UPDATE
+      AND NULLIF(trim(s.application_number), '') IS NOT NULL
+        ON CONFLICT (application_number) DO UPDATE
         SET
-            effective_date = EXCLUDED.effective_date,
-            expire_date = EXCLUDED.expire_date,
-            application_number = COALESCE(EXCLUDED.application_number, public.applications.application_number),
+            effective_date   = COALESCE(EXCLUDED.effective_date,   public.applications.effective_date),
+            expire_date      = COALESCE(EXCLUDED.expire_date,      public.applications.expire_date),
+            completed_at     = COALESCE(EXCLUDED.completed_at,     public.applications.completed_at),
+            approval_no      = COALESCE(EXCLUDED.approval_no,      public.applications.approval_no),
             application_type = COALESCE(EXCLUDED.application_type, public.applications.application_type),
-            status = COALESCE(EXCLUDED.status, public.applications.status),
-            username = COALESCE(EXCLUDED.username, public.applications.username),
-            is_from_lois = true,
-            license_type = EXCLUDED.license_type,
-            updated_at = now();
+            status           = COALESCE(EXCLUDED.status,           public.applications.status),
+            username         = COALESCE(EXCLUDED.username,         public.applications.username),
+            is_from_lois     = true,
+            license_type     = COALESCE(EXCLUDED.license_type,     public.applications.license_type),
+            category_id      = COALESCE(EXCLUDED.category_id,      public.applications.category_id),
+            zone_id          = COALESCE(EXCLUDED.zone_id,          public.applications.zone_id),
+            zone_name        = COALESCE(EXCLUDED.zone_name,        public.applications.zone_name),
+            old_parent_application_id = COALESCE(EXCLUDED.old_parent_application_id, public.applications.old_parent_application_id),
+            updated_at       = now();
 
     GET DIAGNOSTICS v_apps_inserted = ROW_COUNT;
     RAISE NOTICE '[staging-transform] inserted apps=%', v_apps_inserted;
@@ -375,9 +518,9 @@ BEGIN
         zone_name
     )
     SELECT
-        -- Stable ID: hash of (application_id, application_certificate_type) so reruns
-        -- are idempotent and one application can have multiple certificate type rows.
-        md5(a.id::text || '|' || COALESCE(NULLIF(UPPER(TRIM(s.application_type)), ''), 'NEW'))::uuid AS id,
+        -- Use gen_random_uuid() – the stable business key for conflict resolution
+        -- is now application_number (unique constraint), not the id.
+        gen_random_uuid() AS id,
         now() AS created_at,
         NULL::uuid AS created_by,
         NULL::timestamptz AS deleted_at,
@@ -403,40 +546,34 @@ BEGIN
         a.zone_id,
         a.zone_name
     FROM public.applications a
-    -- Join back to staging to get application_type for this specific row.
-    -- Dedupe: one certificate per (application_number, application_certificate_type).
+    -- One certificate row per application_number (first occurrence in staging).
     JOIN (
-        SELECT DISTINCT ON (application_number, COALESCE(NULLIF(UPPER(TRIM(application_type)), ''), 'NEW'))
+        SELECT DISTINCT ON (application_number)
                application_number,
                application_type
         FROM   public.stage_ca_applications_raw
         ORDER  BY application_number,
-                  COALESCE(NULLIF(UPPER(TRIM(application_type)), ''), 'NEW'),
                   source_row_no
     ) s ON s.application_number = a.application_number
-    WHERE a.approval_no IS NOT NULL
-      AND NOT EXISTS (
-          SELECT 1
-          FROM   public.certificates c
-          WHERE  c.application_id = a.id
-            AND  c.application_certificate_type = COALESCE(NULLIF(UPPER(TRIM(s.application_type)), ''), 'NEW')
-      )
-    -- Conflict on the composite unique (approval_no, application_certificate_type).
-    -- Same approval_no with a different type (NEW vs RENEW) inserts a new row; same
-    -- approval_no + same type refreshes the existing row.
-    ON CONFLICT (approval_no, application_certificate_type) DO UPDATE
+    WHERE NULLIF(trim(a.application_number), '') IS NOT NULL
+    -- Use the unique constraint on application_number for conflict detection.
+    -- This is simpler and more reliable than the old md5-id approach.
+    ON CONFLICT (application_number) DO UPDATE
     SET
-        application_number   = EXCLUDED.application_number,
-        effective_date       = EXCLUDED.effective_date,
-        expire_date          = EXCLUDED.expire_date,
-        intimate_date        = EXCLUDED.intimate_date,
-        months_eligible      = EXCLUDED.months_eligible,
-        approval_date        = EXCLUDED.approval_date,
-        licence_path         = EXCLUDED.licence_path,
+        application_number   = COALESCE(EXCLUDED.application_number,   public.certificates.application_number),
+        approval_no          = COALESCE(EXCLUDED.approval_no,          public.certificates.approval_no),
+        application_id       = EXCLUDED.application_id,
+        effective_date       = COALESCE(EXCLUDED.effective_date,       public.certificates.effective_date),
+        expire_date          = COALESCE(EXCLUDED.expire_date,          public.certificates.expire_date),
+        intimate_date        = COALESCE(EXCLUDED.intimate_date,        public.certificates.intimate_date),
+        months_eligible      = COALESCE(EXCLUDED.months_eligible,      public.certificates.months_eligible),
+        approval_date        = COALESCE(EXCLUDED.approval_date,        public.certificates.approval_date),
+        licence_path         = COALESCE(EXCLUDED.licence_path,         public.certificates.licence_path),
         license_type         = EXCLUDED.license_type,
         category_license_type = EXCLUDED.category_license_type,
-        zone_id              = EXCLUDED.zone_id,
-        zone_name            = EXCLUDED.zone_name,
+        application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
+        zone_id              = COALESCE(EXCLUDED.zone_id,              public.certificates.zone_id),
+        zone_name            = COALESCE(EXCLUDED.zone_name,            public.certificates.zone_name),
         updated_at           = now();
 
     GET DIAGNOSTICS v_cert_inserted = ROW_COUNT;
