@@ -11,6 +11,13 @@ from datetime import datetime, timedelta
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
+from app.utils.lookup_cache import (
+    load_legal_status_map,
+    load_category_map,
+    load_applicant_role_id,
+    load_zone_map,
+)
+
 # Setup logger
 logger = logging.getLogger(__name__)
 
@@ -83,6 +90,15 @@ def _normalize_numeric_string(val: str) -> str:
     # fallback: return original
     _normalize_cache[sval] = sval
     return sval
+
+
+def _is_uuid(val: str) -> bool:
+    """Return True if *val* looks like a valid UUID string."""
+    try:
+        uuid.UUID(val)
+        return True
+    except Exception:
+        return False
 
 
 def _extract_db_error_detail(exc: Exception) -> str:
@@ -632,6 +648,125 @@ def _build_stage_mappings():
     return excel_to_stage, attachments_spec
 
 
+def _ensure_child_table_columns(db: Any) -> None:
+    """Ensure all child-table columns required by the import pipeline exist.
+
+    This runs ADD COLUMN IF NOT EXISTS for every column the transform and
+    import code writes to — so imports succeed even when the DB was provisioned
+    before a schema migration was applied.  All statements are idempotent and
+    wrapped in individual try/except so one missing table never blocks the rest.
+
+    Call this at the START of every import entry-point (both the staging-COPY
+    path and the row-by-row path).
+    """
+    guards: list[tuple[str, str]] = [
+        # (table, ALTER TABLE ... ADD COLUMN ... statement)
+        ("applications",
+         """ALTER TABLE public.applications
+                ADD COLUMN IF NOT EXISTS completed_at          timestamp         NULL,
+                ADD COLUMN IF NOT EXISTS old_parent_application_id text          NULL,
+                ADD COLUMN IF NOT EXISTS is_from_lois          boolean           NOT NULL DEFAULT false,
+                ADD COLUMN IF NOT EXISTS certificate_id        uuid              NULL"""),
+        ("documents",
+         """ALTER TABLE public.documents
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid        NULL,
+                ADD COLUMN IF NOT EXISTS logic_doc_id                bigint       NULL,
+                ADD COLUMN IF NOT EXISTS documents_order             integer      NULL"""),
+        ("contact_persons",
+         """ALTER TABLE public.contact_persons
+                ADD COLUMN IF NOT EXISTS application_id        uuid              NULL,
+                ADD COLUMN IF NOT EXISTS app_sector_detail_id  uuid              NULL"""),
+        ("fire",
+         """ALTER TABLE public.fire
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid        NULL"""),
+        ("insurance_cover_details",
+         """ALTER TABLE public.insurance_cover_details
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid        NULL"""),
+        ("certificates",
+         """ALTER TABLE public.certificates
+                ADD COLUMN IF NOT EXISTS application_id        uuid              NULL,
+                ADD COLUMN IF NOT EXISTS application_number    text              NULL,
+                ADD COLUMN IF NOT EXISTS application_certificate_type text       NULL"""),
+        ("supervisor_details",
+         """ALTER TABLE public.supervisor_details
+                ADD COLUMN IF NOT EXISTS mobile_no             text              NULL,
+                ADD COLUMN IF NOT EXISTS email                 text              NULL"""),
+        ("shareholders",
+         """ALTER TABLE public.shareholders
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid        NULL"""),
+        ("managing_directors",
+         """ALTER TABLE public.managing_directors
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid        NULL"""),
+        ("ardhi_information",
+         """ALTER TABLE public.ardhi_information
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid        NULL"""),
+        # ── Electrical installation child tables ──────────────────────────
+        ("application_electrical_installation",
+         """ALTER TABLE public.application_electrical_installation
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS is_from_lois               boolean      DEFAULT false"""),
+        ("personal_details",
+         """ALTER TABLE public.personal_details
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid NULL"""),
+        ("contact_details",
+         """ALTER TABLE public.contact_details
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid NULL"""),
+        ("attachments",
+         """ALTER TABLE public.attachments
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid NULL"""),
+        ("work_experience",
+         """ALTER TABLE public.work_experience
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid NULL"""),
+        ("self_employed",
+         """ALTER TABLE public.self_employed
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid NULL"""),
+        ("supervisor_details",
+         """ALTER TABLE public.supervisor_details
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid NULL"""),
+        ("costumer_details",
+         """ALTER TABLE public.costumer_details
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid NULL"""),
+        ("certificate_verifications",
+         """ALTER TABLE public.certificate_verifications
+                ADD COLUMN IF NOT EXISTS application_id              uuid         NULL,
+                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid NULL"""),
+    ]
+
+    for table, ddl in guards:
+        try:
+            # Check table exists first so we don't error on optional tables
+            exists = db.execute(
+                text("SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                     "WHERE n.nspname = 'public' AND c.relname = :t"),
+                {"t": table}
+            ).scalar()
+            if not exists:
+                continue
+            db.execute(text(ddl))
+            db.commit()
+        except Exception as _e:
+            logger.warning("[schema-guard] %s skipped: %s", table, _e)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    logger.info("[schema-guard] child table columns ensured")
+
+
 def import_applications_via_staging_copy(
     db: Any,
     df,
@@ -644,6 +779,9 @@ def import_applications_via_staging_copy(
     """High-volume import (recommended for 500k+ remote DB): staging + COPY + SQL transform."""
     # Local import to avoid adding import-time dependencies for users that don't use this path.
     from scripts.stage_and_copy_import import stage_and_copy_import
+
+    # Ensure all child-table columns exist BEFORE the staging transform runs.
+    _ensure_child_table_columns(db)
 
     excel_to_stage, attachments_spec = _build_stage_mappings()
     return stage_and_copy_import(
@@ -666,6 +804,10 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
     `application_migrations` name as requested.
     """
     logger.info("Starting import_applications_from_df with %d rows, batch_size=%d", len(df), batch_size)
+
+    # Ensure all child-table columns exist before any INSERT runs.
+    _ensure_child_table_columns(db)
+
     errors: List[str] = []
     inserted_apps = 0
     inserted_docs = 0
@@ -703,100 +845,36 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
     norm_region_map = _build_normalized_map(region_map)
     norm_district_map = _build_normalized_map(district_map)
 
-    # Application legal status mapping: map human-readable names to UUID ids
-    application_legal_status_map = {
-        'co-operative society': '1047cb8f-0919-410f-888c-7688bf7f0711',
-        'government agency': '3012d756-9582-42ef-bff0-04f5a79de2f2',
-        'joint venture': '66e097e7-c712-4b53-bdda-821a4197cea8',
-        'others': '7153f4dd-d7e4-4b1b-bae9-e16187dcb264',
-        'parastatal organization': '66149389-3eb1-4146-938f-d704c7ea89fb',
-        'partnership': 'f84abd71-9d8b-4f38-8ed6-1a212e0f7b83',
-        'private limited liability company': '79fa4906-7861-4413-bb18-253a508f0981',
-        'public limited liability company': '7233cdfe-4cc8-4324-a8b0-90e896961f24',
-        'sole proprietor': '650d5f5b-75a2-46a1-b52a-02c3fd6eec84',
-        'sole proprietor in a column': '650d5f5b-75a2-46a1-b52a-02c3fd6eec84',
-    }
+    # Application legal status mapping — resolved dynamically from the connected DB.
+    # UUIDs differ per environment (test / staging / production); querying at
+    # runtime guarantees we always get the right IDs.  Missing rows are inserted
+    # automatically (ON CONFLICT DO NOTHING) so the map is always complete.
+    application_legal_status_map = load_legal_status_map(db)
 
-    # License category mapping: map license category names to UUID ids
-    license_category_map = {
-        'petroleum station': '515addf4-d984-4de2-bf39-1e3cc900bde8',
-        'village petroleum station': '6979a7b2-f4fd-4f83-b960-8bee565b616f',
-        'pipeline transportation (above 100 km)': '3e1c85ef-e1cf-42ea-9d7a-5bef66ffa264',
-        'petroleum petcoke construction approval': 'ba56d45a-1794-4d85-b5d6-8b4f209b044a',
-        'petroleum bitumen manufacturing plant construction approval': '25414332-6af1-409f-ab54-13f5a00d1f82',
-        'petroleum waste oil recycling plant construction approval': '09ab7f80-b6d3-48f4-a2ba-9d2e07cd5a93',
-        'petroleum marine loading and offloading facility construction approval': '8f92caed-5a26-4674-bda5-07f3e1a4669c',
-        'petroleum refinery plant construction approval': 'ca38cca2-5124-4b8c-bae7-11cd8adff416',
-        'lpg wholesalers business': '0f840ba7-7026-4153-8478-5361bef40116',
-        'petroleum bitumen wholesale licence': 'b56149bd-3311-4e90-914c-8be9edd1a872',
-        'condensate dealership licence': '698742db-7e61-47b6-b5b1-c3a9862e6149',
-        'natural gas compression licence': '247fbcbb-0fd0-4191-a4d6-7140c6f145d7',
-        'petroleum consumer installation (mining)': '55491e17-b2e8-4808-84d4-c562f3ee018e',
-        'lpg distribution (super dealer)': 'a7196b7a-54f5-466b-a7ed-99115ea23c90',
-        'bunkering licence': 'bfbab183-c707-4096-86b8-9a29b2c54170',
-        'compressed natural gas supply licence': '09f147ac-d2e3-4f45-aa4a-30ea968b721a',
-        'pipeline transportation (up to 100 km)': '29471cf6-eaf0-4332-a8bd-d36a6fd06f12',
-        'consumer  installation  (transporter)': '0358e5c2-21e8-423a-a59c-39ad00664541',
-        'consumer installation (transporter)': '0358e5c2-21e8-423a-a59c-39ad00664541',
-        'petroleum retail': '141d4c39-9074-4b03-aab4-123544f2d6c2',
-        'petroleum storage business': 'b57047bd-40c8-4bf4-bd6e-7087be1b1052',
-        'petroleum wholesales': '7e96b73f-0939-40d0-be55-3b3b856e6e95',
-        'township and village petroleum retail': '7397f78a-db27-4c44-a7b2-273450ce7969',
-        'petroleum petcoke wholesale licence': '97e01662-8460-4562-8dae-db13e8cc1ad2',
-        'waste recycling operations licence': '48a36120-0ae4-4ed2-b1e0-98992294b19d',
-        'petroleum marine loading and offloading operations licence': '73718924-f79f-4484-a0d6-36bc9671a5de',
-        'petroleum independent marine surveyor registration': 'b2257345-eebc-4aa6-85d6-c9467ef17143',
-        'petroleum refinery operation licence': '7a1c13aa-179b-4e90-810a-114fdecd0557',
-        'pipeline transportation licence up to 100 km': '91c77552-1358-4df1-8060-c53821ae3c74',
-        'pipeline transportation licence above to 100 km': 'fd70a40c-faf7-4cd5-a480-b0ac78d84b8c',
-        'petroleum consumer installation (transporter)': '4d13db31-5f63-4e43-b4ce-e10a9fb325cb',
-        'bulk water supply': 'b990c603-bcf3-4faa-8081-4c876253104d',
-        'leasing assets': '17c8ac8f-56ee-47d1-be43-e091205e2920',
-        'operatorship': '24019a94-7ca2-4e87-99bd-7d90e12e54b5',
-        'sanitation services': 'a54c1852-df5c-4d25-9f34-fec6be6d96d9',
-        'water supply': '2ad69837-1352-4089-944c-85bd9b1d0298',
-        'water supply and sanitation services': '18d8eef0-9bd0-42c0-b45e-9179d0e90ba5',
-        'natural gas processing licence': 'c572ecb4-8691-4556-b492-22120ef06011',
-        'natural gas transmission licence': '20f72572-7ec8-4385-a906-dc0f606c212e',
-        'natural gas storage licence': 'afbf0275-7b4e-454d-b9cb-2cd9af122fac',
-        'natural gas distribution licence': '8c191527-6b6d-4745-a7c0-db8bc674ba9d',
-        'condensate storage construction approval': 'd6b95f40-99f6-44e7-a687-64f947e0267f',
-        'lubricant blending plant': 'af3c1cdd-45e7-4d4a-b217-63e3ac537697',
-        'lpg storage and filling plant': '0c428af8-4952-43b5-ae16-c62172d51923',
-        'consumer  installation (agriculture)': '8a50348f-7ad3-4a4e-a75a-b87192b10556',
-        'consumer installation (agriculture)': '8a50348f-7ad3-4a4e-a75a-b87192b10556',
-        'natural gas re – gasification construction approval': '55b16e2e-ce0a-4eb9-9f65-19fc929702ce',
-        'natural gas re-gasification construction approval': '55b16e2e-ce0a-4eb9-9f65-19fc929702ce',
-        'compressed natural gas (own use) construction approval': '06f3c79c-e625-4cfd-8c2e-ab200271d09e',
-        'compressed natural gas filling station construction approval': '57c7779c-a7cb-473f-8b6a-9595a013f2e0',
-        'natural gas compression construction approval': '39e38ad3-973f-4a39-8b90-7f18e48504f3',
-        'natural gas distribution – construction approval (up to 10 km)': 'a0849bc9-f907-4df2-8b4b-4cf0f9102e81',
-        'natural gas distribution - construction approval (up to 10 km)': 'a0849bc9-f907-4df2-8b4b-4cf0f9102e81',
-        'natural gas transmission construction approval (above 100 km)': '2cfd589a-f1c0-41db-a1dc-86e3d98be29d',
-        'natural gas distribution – construction approval (above 10 km)': '7e3c08e6-6cc0-45c0-880f-bce39f3f98d5',
-        'natural gas distribution - construction approval (above 10 km)': '7e3c08e6-6cc0-45c0-880f-bce39f3f98d5',
-        'natural gas processing construction approval': '18c27158-28e5-4337-9d78-4d591099eb9f',
-        'natural gas aggregation licence': '4d91d10a-b57f-49cc-bd02-d316ae55d538',
-        'compressed natural gas (own use) licence': '93acb1b5-a186-4594-8398-021ebdbec10d',
-        'compressed natural gas filling station licence': '1b5eb856-c3f0-49e1-b770-4d909d14c8e8',
-        'natural gas re-gasification licence': 'd039e1b5-b06a-4fe2-b466-4a44f81c0f30',
-        'lng transportation (local) licence': '6dad8f8a-a63d-4e31-a713-1596e1f01944',
-        'natural gas supply and marketing licence': '87a57b7c-05a6-4d1d-8fcc-2842193f29bd',
-        'consumer  installation  (mining)': '1313b25f-153e-4cb4-94dc-ac073f40694e',
-        'consumer installation (mining)': '1313b25f-153e-4cb4-94dc-ac073f40694e',
-        'cross border trade in electricity': '2eea9d2f-5060-40d0-8c02-2bfef0459955',
-        'distribution': 'bdbe1c0f-d80c-46cf-a24c-c4c2d08fa1eb',
-        'generation': 'd0afb437-7bdf-4d49-b0c6-6c2341455470',
-        'independent system operator': 'e3d78c31-0272-4ac7-ab59-08a64ec3cf3c',
-        'physical and financial trade in electricity': 'c9b6c1b4-2643-453b-a7ab-53b8a4fade79',
-        'supply': 'fd5aa885-89e6-49a1-91c0-6b8aee91b173',
-        'transmission': '1232d724-0fb7-4b4a-8c99-0d91921ecb2d',
-        'lubricant distribution business': '3e61eb70-1292-4bc7-bbfe-42c466eff47a',
-        'lubricant wholesales business': 'fed36103-f180-4708-aaa5-6ea56434dd92',
-        'export abroad': '624b062d-9bd3-42e4-b6b5-5c5a943ac650',
-        'natural gas transmission construction approval (up to 100 km)': 'c07308c5-c245-4c97-80bd-45fd5535d999',
-        'consumer installation': '275f64c7-6e02-4f33-97f1-092ae49b33bf',
-    }
+    # License category mapping — resolved dynamically from the connected DB.
+    # All sectors are loaded so the single dict covers Petroleum, Electricity,
+    # Natural Gas, and Water categories without any sector filter.
+    # Extract every unique category name the Excel file mentions so that
+    # load_category_map can INSERT any that don't exist yet.
+    _cat_col = None
+    for _candidate in ("license_category_id", "licensecategory"):
+        if _candidate in df.columns:
+            _cat_col = _candidate
+            break
+    _excel_cat_names: list[str] = []
+    if _cat_col is not None:
+        _excel_cat_names = [
+            str(v).strip()
+            for v in df[_cat_col].dropna().unique()
+            if str(v).strip()
+            and str(v).strip().lower() not in ("nan", "none", "null", "")
+            and not _is_uuid(str(v).strip())   # skip values that are already UUIDs
+        ]
+    license_category_map = load_category_map(db, ensure_names=_excel_cat_names)
+
+    # Zone mapping — resolved dynamically from napa_regions JOIN zones.
+    # Keyed by lower(region_name); value is zone_id (text UUID).
+    zone_map = load_zone_map(db)
 
     # columns in the incoming dataframe
     df_columns = [str(c).strip() for c in df.columns]
@@ -1023,6 +1101,14 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                     if 'is_from_lois' in ca_cols:
                         app_row['is_from_lois'] = True
 
+                    # zone_id: derive from the already-resolved region name.
+                    if 'zone_id' in ca_cols:
+                        _region_key = str(app_row.get('region') or '').strip().lower()
+                        if _region_key:
+                            _zid = zone_map.get(_region_key)
+                            if _zid:
+                                app_row['zone_id'] = _zid
+
                     app_inserts.append(app_row)
 
                     order = 1
@@ -1116,46 +1202,32 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                         except Exception:
                             pass
 
-                # Look up APPLICANT ROLE id — read from an existing user_roles row.
-                # Never scan public.roles: it is a FDW foreign table whose remote name
-                # differs (public.role), causing every query to fail.
-                # If no user_roles row exists yet, skip role assignment gracefully.
-                _applicant_role_id = None
-                try:
-                    _ur_row = db.execute(text(
-                        "SELECT role_id FROM public.user_roles LIMIT 1"
-                    )).fetchone()
-                    if _ur_row:
-                        _applicant_role_id = str(_ur_row[0])
-                except Exception:
-                    try:
-                        db.rollback()
-                    except Exception:
-                        pass
+                # Resolve APPLICANT role_id dynamically — works on every environment.
+                _applicant_role_id = load_applicant_role_id(db)
 
                 if not _applicant_role_id:
-                    # public.roles FDW always fails (remote table is named public.role).
-                    # Cannot safely scan roles — skip role assignment silently.
-                    logger.info("APPLICANT ROLE id not found from user_roles; role assignment skipped (FDW limitation)")
+                    logger.info("APPLICANT role not resolved; role assignment skipped for this batch")
                     skipped_user_roles += len(batch_usernames)
 
-                # Assign APPLICANT ROLE to each user individually.
-                # Remote user_roles FDW table only exposes (user_id, role_id).
+                # Assign APPLICANT ROLE to each user.
                 if _applicant_role_id:
                     for _uname in batch_usernames:
                         try:
-                            _rr = db.execute(text("""
-                                INSERT INTO public.user_roles (user_id, role_id)
-                                SELECT u.id, :role_id
+                            _row = db.execute(text("""
+                                SELECT u.id
                                 FROM public.users u
                                 WHERE lower(trim(u.username)) = :uname
                                 AND NOT EXISTS (
                                     SELECT 1 FROM public.user_roles ex
                                     WHERE ex.user_id = u.id AND ex.role_id = :role_id
                                 )
-                            """), {"uname": _uname.lower().strip(), "role_id": _applicant_role_id})
-                            db.commit()
-                            if (_rr.rowcount or 0) > 0:
+                            """), {"uname": _uname.lower().strip(), "role_id": _applicant_role_id}).fetchone()
+                            if _row:
+                                db.execute(text("""
+                                    INSERT INTO public.user_roles (user_id, role_id, deleted, created_at)
+                                    VALUES (:user_id, :role_id, false, now())
+                                """), {"user_id": _row[0], "role_id": _applicant_role_id})
+                                db.commit()
                                 inserted_user_roles += 1
                             else:
                                 skipped_user_roles += 1
@@ -1474,9 +1546,16 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                 doc_cols = ['id', 'document_name', 'document_url', 'application_id', 'file_name', 'documents_order', 'logic_doc_id']
                 cols_sql = ','.join(doc_cols) + ', created_at'
                 vals_sql = ','.join([f':{c}' for c in doc_cols]) + ', now()'
+                # Build ON CONFLICT SET dynamically from doc_cols so adding a column
+                # here automatically appears in the upsert without manual edits.
+                _doc_conflict_cols = [c for c in doc_cols if c not in ('id', 'created_at')]
+                _doc_set_sql = ', '.join(
+                    f"{c} = COALESCE(EXCLUDED.{c}, public.documents.{c})"
+                    for c in _doc_conflict_cols
+                ) + ", updated_at = now()"
                 insert_docs_sql = text(
                     f"INSERT INTO public.documents ({cols_sql}) VALUES ({vals_sql}) "
-                    f"ON CONFLICT (id) DO NOTHING"
+                    f"ON CONFLICT (id) DO UPDATE SET {_doc_set_sql}"
                 )
                 
                 # OPTIMIZATION: Try bulk insert first (much faster)
@@ -1664,6 +1743,16 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
         if errors:
             result['errors'] = errors
 
+        # ── Auto backfill application_id on all child tables ─────────────
+        # Run before created_by backfill so that the created_by pass can use
+        # the freshly populated application_id to resolve users on every table.
+        try:
+            _abf = backfill_application_id_on_child_tables(db)
+            logger.info("Auto backfill application_id: %s", _abf)
+            result['backfill_application_id'] = _abf
+        except Exception as _abfe:
+            logger.warning("Auto backfill application_id failed (non-fatal): %s", _abfe)
+
         # ── Auto backfill created_by from username ─────────────────────────
         # Run after all inserts so every user that was provisioned above gets
         # their UUID reflected on applications + all child tables.
@@ -1675,6 +1764,331 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
             logger.warning("Auto backfill created_by failed (non-fatal): %s", _bfe)
 
         return result
+
+
+def backfill_application_id_on_child_tables(db: Any) -> Dict[str, int]:
+    """Backfill application_id (and app_sector_detail_id where applicable) on
+    ALL child tables that sit below applications in the hierarchy.
+
+    This is the single authoritative place that propagates application_id
+    downwards so that every child row can be directly joined to its parent
+    application for reporting — without having to traverse
+    application_sector_details every time.
+
+    Resolution order
+    ────────────────
+    1. Via application_sector_details (preferred – covers staging-COPY imports):
+       child.application_sector_detail_id  →  asd.id  →  asd.application_id
+
+    2. Direct via application_number (covers row-by-row imports where
+       application_sector_detail_id may be NULL):
+       child.application_number  →  applications.id
+
+    Tables covered
+    ──────────────
+    Group A — petroleum / construction (via application_sector_details):
+        documents, contact_persons, fire, insurance_cover_details,
+        shareholders, managing_directors, ardhi_information
+
+    Group B — electrical installation (via application_electrical_installation):
+        application_electrical_installation, personal_details,
+        contact_details, attachments, work_experience, self_employed,
+        supervisor_details, costumer_details, certificate_verifications
+
+    All UPDATEs are idempotent (WHERE application_id IS NULL).
+    Optional tables are silently skipped if they don't exist yet.
+    """
+    counts: Dict[str, int] = {}
+
+    def _table_exists(table_name: str) -> bool:
+        """Return True if public.<table_name> exists, False otherwise."""
+        try:
+            result = db.execute(
+                text("SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                     "WHERE n.nspname = 'public' AND c.relname = :t"),
+                {"t": table_name}
+            ).scalar()
+            return bool(result)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return False
+
+    def _run(sql: str, key: str, *, table: str | None = None) -> None:
+        # Skip silently if the target table does not exist
+        if table and not _table_exists(table):
+            counts[key] = 0
+            return
+        try:
+            counts[key] = db.execute(text(sql)).rowcount or 0
+            db.commit()
+        except Exception as exc:
+            logger.warning("backfill_application_id: skipped %s — %s", key, exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            counts[key] = -1
+
+    # ── documents ──────────────────────────────────────────────────────────
+    _run("""
+        UPDATE public.documents d
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  d.application_sector_detail_id = asd.id
+          AND  d.application_id IS NULL
+          AND  asd.application_id IS NOT NULL
+    """, "documents_via_asd")
+
+    # ── contact_persons (FK: app_sector_detail_id) ─────────────────────────
+    _run("""
+        UPDATE public.contact_persons cp
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  cp.app_sector_detail_id = asd.id
+          AND  cp.application_id IS NULL
+          AND  asd.application_id IS NOT NULL
+    """, "contact_persons_via_asd")
+
+    # ── fire ───────────────────────────────────────────────────────────────
+    _run("""
+        UPDATE public.fire f
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  f.application_sector_detail_id = asd.id
+          AND  f.application_id IS NULL
+          AND  asd.application_id IS NOT NULL
+    """, "fire_via_asd")
+
+    # ── insurance_cover_details ────────────────────────────────────────────
+    _run("""
+        UPDATE public.insurance_cover_details icd
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  icd.application_sector_detail_id = asd.id
+          AND  icd.application_id IS NULL
+          AND  asd.application_id IS NOT NULL
+    """, "insurance_cover_details_via_asd")
+
+    # ── shareholders (optional table) ──────────────────────────────────────
+    _run("""
+        UPDATE public.shareholders s
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  s.application_sector_detail_id = asd.id
+          AND  s.application_id IS NULL
+          AND  asd.application_id IS NOT NULL
+    """, "shareholders_via_asd")
+
+    # ── managing_directors (optional table) ───────────────────────────────
+    _run("""
+        UPDATE public.managing_directors md
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  md.application_sector_detail_id = asd.id
+          AND  md.application_id IS NULL
+          AND  asd.application_id IS NOT NULL
+    """, "managing_directors_via_asd")
+
+    # ── ardhi_information (optional table) ────────────────────────────────
+    _run("""
+        UPDATE public.ardhi_information ai
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  ai.application_sector_detail_id = asd.id
+          AND  ai.application_id IS NULL
+          AND  asd.application_id IS NOT NULL
+    """, "ardhi_information_via_asd")
+
+    # ── Second pass: fill remaining NULLs via application_number ─────────
+    # Covers rows imported via the row-by-row path that have no
+    # application_sector_detail_id at all. Join key: child.application_number
+    # (or documents linked via application_sector_details → applications).
+    # Also re-fills rows whose application_sector_detail_id was set but ASD
+    # didn't carry application_id yet (e.g. first upload before ASD was written).
+
+    # documents — join via application_sector_details.application_number
+    _run("""
+        UPDATE public.documents d
+        SET    application_id = a.id
+        FROM   public.application_sector_details asd
+        JOIN   public.applications a ON a.id = asd.application_id
+        WHERE  d.application_sector_detail_id = asd.id
+          AND  d.application_id IS NULL
+          AND  a.id IS NOT NULL
+    """, "documents_via_asd_2nd")
+
+    # contact_persons — via app_sector_detail_id → application_number
+    _run("""
+        UPDATE public.contact_persons cp
+        SET    application_id = a.id
+        FROM   public.application_sector_details asd
+        JOIN   public.applications a ON a.id = asd.application_id
+        WHERE  cp.app_sector_detail_id = asd.id
+          AND  cp.application_id IS NULL
+          AND  a.id IS NOT NULL
+    """, "contact_persons_via_asd_2nd")
+
+    # fire — 2nd pass
+    _run("""
+        UPDATE public.fire f
+        SET    application_id = a.id
+        FROM   public.application_sector_details asd
+        JOIN   public.applications a ON a.id = asd.application_id
+        WHERE  f.application_sector_detail_id = asd.id
+          AND  f.application_id IS NULL
+          AND  a.id IS NOT NULL
+    """, "fire_via_asd_2nd")
+
+    # insurance_cover_details — 2nd pass
+    _run("""
+        UPDATE public.insurance_cover_details icd
+        SET    application_id = a.id
+        FROM   public.application_sector_details asd
+        JOIN   public.applications a ON a.id = asd.application_id
+        WHERE  icd.application_sector_detail_id = asd.id
+          AND  icd.application_id IS NULL
+          AND  a.id IS NOT NULL
+    """, "insurance_cover_details_via_asd_2nd")
+
+    # shareholders — 2nd pass
+    _run("""
+        UPDATE public.shareholders s
+        SET    application_id = a.id
+        FROM   public.application_sector_details asd
+        JOIN   public.applications a ON a.id = asd.application_id
+        WHERE  s.application_sector_detail_id = asd.id
+          AND  s.application_id IS NULL
+          AND  a.id IS NOT NULL
+    """, "shareholders_via_asd_2nd")
+
+    # managing_directors — 2nd pass
+    _run("""
+        UPDATE public.managing_directors md
+        SET    application_id = a.id
+        FROM   public.application_sector_details asd
+        JOIN   public.applications a ON a.id = asd.application_id
+        WHERE  md.application_sector_detail_id = asd.id
+          AND  md.application_id IS NULL
+          AND  a.id IS NOT NULL
+    """, "managing_directors_via_asd_2nd")
+
+    # ardhi_information — 2nd pass
+    _run("""
+        UPDATE public.ardhi_information ai
+        SET    application_id = a.id
+        FROM   public.application_sector_details asd
+        JOIN   public.applications a ON a.id = asd.application_id
+        WHERE  ai.application_sector_detail_id = asd.id
+          AND  ai.application_id IS NULL
+          AND  a.id IS NOT NULL
+    """, "ardhi_information_via_asd_2nd")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Group B — electrical installation child tables
+    #
+    # Resolution path:
+    #   child.application_electrical_installation_id
+    #     → application_electrical_installation.id
+    #     → application_electrical_installation.application_id
+    # ══════════════════════════════════════════════════════════════════════
+
+    # ── application_electrical_installation ─────────────────────────────
+    # AEI itself gets application_id via applications.application_number
+    # during import, but rows from older imports may have NULL.
+    _run("""
+        UPDATE public.application_electrical_installation aei
+        SET    application_id = a.id
+        FROM   public.applications a
+        WHERE  a.application_number = aei.application_number
+          AND  aei.application_id IS NULL
+          AND  a.id IS NOT NULL
+    """, "aei_via_app_number", table="application_electrical_installation")
+
+    # ── personal_details ──────────────────────────────────────────────────
+    _run("""
+        UPDATE public.personal_details pd
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  pd.application_electrical_installation_id = aei.id
+          AND  pd.application_id IS NULL
+          AND  aei.application_id IS NOT NULL
+    """, "personal_details_via_aei", table="personal_details")
+
+    # ── contact_details ───────────────────────────────────────────────────
+    _run("""
+        UPDATE public.contact_details cd
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  cd.application_electrical_installation_id = aei.id
+          AND  cd.application_id IS NULL
+          AND  aei.application_id IS NOT NULL
+    """, "contact_details_via_aei", table="contact_details")
+
+    # ── attachments ───────────────────────────────────────────────────────
+    _run("""
+        UPDATE public.attachments att
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  att.application_electrical_installation_id = aei.id
+          AND  att.application_id IS NULL
+          AND  aei.application_id IS NOT NULL
+    """, "attachments_via_aei", table="attachments")
+
+    # ── work_experience ───────────────────────────────────────────────────
+    _run("""
+        UPDATE public.work_experience we
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  we.application_electrical_installation_id = aei.id
+          AND  we.application_id IS NULL
+          AND  aei.application_id IS NOT NULL
+    """, "work_experience_via_aei", table="work_experience")
+
+    # ── self_employed ─────────────────────────────────────────────────────
+    _run("""
+        UPDATE public.self_employed se
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  se.application_electrical_installation_id = aei.id
+          AND  se.application_id IS NULL
+          AND  aei.application_id IS NOT NULL
+    """, "self_employed_via_aei", table="self_employed")
+
+    # ── supervisor_details ────────────────────────────────────────────────
+    _run("""
+        UPDATE public.supervisor_details sd
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  sd.application_electrical_installation_id = aei.id
+          AND  sd.application_id IS NULL
+          AND  aei.application_id IS NOT NULL
+    """, "supervisor_details_via_aei", table="supervisor_details")
+
+    # ── costumer_details ──────────────────────────────────────────────────
+    _run("""
+        UPDATE public.costumer_details cud
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  cud.application_electrical_installation_id = aei.id
+          AND  cud.application_id IS NULL
+          AND  aei.application_id IS NOT NULL
+    """, "costumer_details_via_aei", table="costumer_details")
+
+    # ── certificate_verifications ─────────────────────────────────────────
+    _run("""
+        UPDATE public.certificate_verifications cv
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  cv.application_electrical_installation_id = aei.id
+          AND  cv.application_id IS NULL
+          AND  aei.application_id IS NOT NULL
+    """, "certificate_verifications_via_aei", table="certificate_verifications")
+
+    logger.info("[backfill-app-id] results: %s", counts)
+    return counts
 
 
 def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
@@ -1718,13 +2132,17 @@ def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
     """
 
     # ------------------------------------------------------------------
-    # Reusable CTE SQL fragment (Group B — via application_sector_details)
+    # Reusable CTE SQL fragment (Group B — direct application_id)
+    #
+    # Now that all child tables carry their own application_id column we
+    # can resolve the user in a single join (applications → users) instead
+    # of going through application_sector_details.  The fallback for rows
+    # whose application_id is still NULL goes through asd as before.
     # ------------------------------------------------------------------
     _ASD_CTE = """
         WITH u AS (
-            SELECT asd.id AS asd_id, usr.id AS user_id
-            FROM public.application_sector_details asd
-            JOIN public.applications a ON a.id = asd.application_id
+            SELECT a.id AS application_id, usr.id AS user_id
+            FROM public.applications a
             JOIN public.users usr
               ON lower(trim(usr.username)) = lower(trim(a.username))
             WHERE a.username IS NOT NULL AND lower(trim(a.username)) <> ''
@@ -1733,7 +2151,26 @@ def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
 
     counts: Dict[str, int] = {}
 
-    def _run(sql: str, key: str) -> None:
+    def _cb_table_exists(table_name: str) -> bool:
+        """Return True if public.<table_name> exists, False otherwise."""
+        try:
+            result = db.execute(
+                text("SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                     "WHERE n.nspname = 'public' AND c.relname = :t"),
+                {"t": table_name}
+            ).scalar()
+            return bool(result)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return False
+
+    def _run(sql: str, key: str, *, table: str | None = None) -> None:
+        if table and not _cb_table_exists(table):
+            counts[key] = 0
+            return
         try:
             counts[key] = db.execute(text(sql)).rowcount or 0
         except Exception as exc:
@@ -1812,56 +2249,113 @@ def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
         WHERE ar.application_id = u.application_id AND ar.created_by IS NULL
     """, "application_reviews")
 
-    # ── Group B ──────────────────────────────────────────────────────
+    # ── Group B — direct application_id join (no asd detour) ───────
     _run(_ASD_CTE + """
         UPDATE public.documents d
         SET created_by = u.user_id
         FROM u
-        WHERE d.application_sector_detail_id = u.asd_id AND d.created_by IS NULL
+        WHERE d.application_id = u.application_id AND d.created_by IS NULL
     """, "documents")
 
-    # contact_persons uses app_sector_detail_id (different FK column name)
+    # contact_persons
     _run(_ASD_CTE + """
         UPDATE public.contact_persons cp
         SET created_by = u.user_id
         FROM u
-        WHERE cp.app_sector_detail_id = u.asd_id AND cp.created_by IS NULL
+        WHERE cp.application_id = u.application_id AND cp.created_by IS NULL
     """, "contact_persons")
 
     _run(_ASD_CTE + """
         UPDATE public.shareholders s
         SET created_by = u.user_id
         FROM u
-        WHERE s.application_sector_detail_id = u.asd_id AND s.created_by IS NULL
+        WHERE s.application_id = u.application_id AND s.created_by IS NULL
     """, "shareholders")
 
     _run(_ASD_CTE + """
         UPDATE public.managing_directors md
         SET created_by = u.user_id
         FROM u
-        WHERE md.application_sector_detail_id = u.asd_id AND md.created_by IS NULL
+        WHERE md.application_id = u.application_id AND md.created_by IS NULL
     """, "managing_directors")
 
     _run(_ASD_CTE + """
         UPDATE public.fire f
         SET created_by = u.user_id
         FROM u
-        WHERE f.application_sector_detail_id = u.asd_id AND f.created_by IS NULL
+        WHERE f.application_id = u.application_id AND f.created_by IS NULL
     """, "fire")
 
     _run(_ASD_CTE + """
         UPDATE public.insurance_cover_details icd
         SET created_by = u.user_id
         FROM u
-        WHERE icd.application_sector_detail_id = u.asd_id AND icd.created_by IS NULL
+        WHERE icd.application_id = u.application_id AND icd.created_by IS NULL
     """, "insurance_cover_details")
 
     _run(_ASD_CTE + """
         UPDATE public.ardhi_information ai
         SET created_by = u.user_id
         FROM u
-        WHERE ai.application_sector_detail_id = u.asd_id AND ai.created_by IS NULL
+        WHERE ai.application_id = u.application_id AND ai.created_by IS NULL
     """, "ardhi_information")
+
+    # ── Group C — electrical installation child tables (via application_id) ─
+    _run(_APP_CTE + """
+        UPDATE public.personal_details pd
+        SET created_by = u.user_id
+        FROM u
+        WHERE pd.application_id = u.application_id AND pd.created_by IS NULL
+    """, "personal_details", table="personal_details")
+
+    _run(_APP_CTE + """
+        UPDATE public.contact_details cd
+        SET created_by = u.user_id
+        FROM u
+        WHERE cd.application_id = u.application_id AND cd.created_by IS NULL
+    """, "contact_details", table="contact_details")
+
+    _run(_APP_CTE + """
+        UPDATE public.attachments att
+        SET created_by = u.user_id
+        FROM u
+        WHERE att.application_id = u.application_id AND att.created_by IS NULL
+    """, "attachments", table="attachments")
+
+    _run(_APP_CTE + """
+        UPDATE public.work_experience we
+        SET created_by = u.user_id
+        FROM u
+        WHERE we.application_id = u.application_id AND we.created_by IS NULL
+    """, "work_experience", table="work_experience")
+
+    _run(_APP_CTE + """
+        UPDATE public.self_employed se
+        SET created_by = u.user_id
+        FROM u
+        WHERE se.application_id = u.application_id AND se.created_by IS NULL
+    """, "self_employed", table="self_employed")
+
+    _run(_APP_CTE + """
+        UPDATE public.supervisor_details sd
+        SET created_by = u.user_id
+        FROM u
+        WHERE sd.application_id = u.application_id AND sd.created_by IS NULL
+    """, "supervisor_details", table="supervisor_details")
+
+    _run(_APP_CTE + """
+        UPDATE public.costumer_details cud
+        SET created_by = u.user_id
+        FROM u
+        WHERE cud.application_id = u.application_id AND cud.created_by IS NULL
+    """, "costumer_details", table="costumer_details")
+
+    _run(_APP_CTE + """
+        UPDATE public.certificate_verifications cv
+        SET created_by = u.user_id
+        FROM u
+        WHERE cv.application_id = u.application_id AND cv.created_by IS NULL
+    """, "certificate_verifications", table="certificate_verifications")
 
     db.commit()
     return counts
