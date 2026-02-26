@@ -190,9 +190,15 @@ def ensure_staging_schema(db: Any):
             pass
 
 
-def run_transform_into_final(db: Any):
+def run_transform_into_final(db: Any, sector_name: str = "PETROLEUM"):
     sql_path = os.path.join(os.path.dirname(__file__), "..", "app", "migrations", "transform_into_final.sql")
     sql_path = os.path.abspath(sql_path)
+    # Expose sector_name as a Postgres session variable so the SQL transform
+    # can read it via current_setting('migration.sector_name', true).
+    # This lets individual DO blocks skip logic that doesn't apply to the sector
+    # (e.g. block 7b — electrical installation backfill — is skipped for non-ELECTRICITY
+    # sectors uploaded via the applications migration endpoint).
+    db.execute(text(f"SET LOCAL \"migration.sector_name\" = '{sector_name}'"))
     with open(sql_path, "r", encoding="utf-8") as f:
         db.execute(text(f.read()))
     db.commit()
@@ -407,21 +413,16 @@ def stage_and_copy_import(
     ensure_staging_schema(db)
     _progress("staging schema recreated")
 
-    # ── Schema guard: ensure applications.completed_at exists ────────────────
-    # This is needed when the live DB was provisioned before align_live_schema
-    # added the column.  Safe to re-run (ADD COLUMN IF NOT EXISTS is idempotent).
+    # ── Schema guard: ensure all child-table columns exist ───────────────────
+    # Delegates to the centralised helper so the staging pipeline and the
+    # row-by-row pipeline always apply the same set of ADD COLUMN IF NOT EXISTS
+    # guards — no manual sync needed between the two code paths.
     try:
-        db.execute(text("""
-            ALTER TABLE IF EXISTS public.applications
-                ADD COLUMN IF NOT EXISTS completed_at timestamp NULL
-        """))
-        db.commit()
+        from app.services.application_migrations_service import _ensure_child_table_columns
+        _ensure_child_table_columns(db)
+        _progress("schema guard: child table columns ensured")
     except Exception as _sg_err:
-        logger.warning("[staging-import] schema guard completed_at skipped: %s", _sg_err)
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        logger.warning("[staging-import] schema guard skipped: %s", _sg_err)
 
     # Normalize df columns: strip whitespace AND lowercase so header matching is robust.
     # e.g. "FControlNo" matches "fcontrolno", "Region " matches "region", etc.
@@ -934,7 +935,6 @@ def stage_and_copy_import(
             _skipped_user_roles = int(_total_usernames)
 
         # Assign APPLICANT ROLE to all staged users that don't have it yet.
-        # Remote user_roles FDW table only exposes (user_id, role_id).
         if _applicant_role_id:
             try:
                 _rr = db.execute(text("""
@@ -943,8 +943,8 @@ def stage_and_copy_import(
                         FROM public.stage_ca_applications_raw
                         WHERE NULLIF(TRIM(username), '') IS NOT NULL
                     )
-                    INSERT INTO public.user_roles (user_id, role_id)
-                    SELECT usr.id, :role_id
+                    INSERT INTO public.user_roles (user_id, role_id, deleted, created_at)
+                    SELECT usr.id, :role_id, false, now()
                     FROM u
                     JOIN public.users usr ON lower(trim(usr.username)) = lower(trim(u.username))
                     WHERE NOT EXISTS (
@@ -1079,7 +1079,7 @@ def stage_and_copy_import(
             pass
 
     _progress("transform into final begin")
-    run_transform_into_final(db)
+    run_transform_into_final(db, sector_name=sector_name)
     _progress("transform into final done")
 
     # Collect server notices after the commit so all DO blocks have flushed their RAISE NOTICE.

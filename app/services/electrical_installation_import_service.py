@@ -31,6 +31,14 @@ import pandas as pd
 import logging
 import io
 
+from app.utils.lookup_cache import (
+    load_elec_category_map,
+    push_category_map_temp_table,
+    load_applicant_role_id,
+    ELEC_CAT_MAP_TEMP,
+    load_zone_map,
+)
+
 logger = logging.getLogger(__name__)
 
 _EMPTY = {"", "nan", "none", "null", "nat"}
@@ -39,6 +47,26 @@ _EMPTY = {"", "nan", "none", "null", "nat"}
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _build_conflict_set(insert_cols: list[str], table: str, *,
+                        skip: tuple[str, ...] = ("id", "created_at")) -> str:
+    """Return the SET clause for ON CONFLICT (id) DO UPDATE SET.
+
+    For every column that was inserted (except the PK and created_at), emit:
+        col = COALESCE(EXCLUDED.col, public.<table>.col)
+    plus a trailing ``updated_at = now()``.
+
+    This means adding a new column to an INSERT automatically appears in the
+    conflict-update without any manual edits here.
+    """
+    parts = [
+        f"{c} = COALESCE(EXCLUDED.{c}, public.{table}.{c})"
+        for c in insert_cols
+        if c not in skip
+    ]
+    parts.append("updated_at = now()")
+    return ",\n                ".join(parts)
+
 
 def _c(v) -> str:
     """Clean: strip whitespace, return '' for null/nan."""
@@ -245,6 +273,9 @@ def import_electrical_installation_via_staging_copy(
     district_map = _load_map("district_map_csv")
     ward_map     = _load_map("ward_map_csv")
 
+    # Zone mapping — region name → zone_id (text UUID) via napa_regions JOIN zones.
+    zone_map_elec = load_zone_map(db)
+
     # ── 4. Build per-row Python frame ─────────────────────────────────
     _progress(f"prepare: building export frame rows={total_rows}")
 
@@ -265,6 +296,12 @@ def import_electrical_installation_via_staging_copy(
 
     # ── 5. DROP + CREATE staging table ────────────────────────────────
     _progress("staging:create")
+    # Ensure the session is clean before DDL (a failed query upstream, e.g.
+    # load_zone_map on a DB without public.zones, can leave the txn aborted).
+    try:
+        db.rollback()
+    except Exception:
+        pass
     db.execute(text("DROP TABLE IF EXISTS public.stage_elec_install_raw"))
     db.execute(text("""
         CREATE TABLE public.stage_elec_install_raw (
@@ -305,6 +342,7 @@ def import_electrical_installation_via_staging_copy(
             region                    text,
             district                  text,
             ward                      text,
+            zone_id                   text,
             email                     text,
             mobile_no                 text,
             plot_no                   text,
@@ -367,6 +405,8 @@ def import_electrical_installation_via_staging_copy(
             _map_location(row.get("region",   ""), region_map),
             _map_location(row.get("district", ""), district_map),
             _map_location(row.get("ward",     ""), ward_map),
+            # zone_id: resolved from region name via napa_regions→zones cache
+            zone_map_elec.get((_map_location(row.get("region", ""), region_map) or "").lower().strip()) or "",
             _c(row.get("email", "")),
             _n(row.get("mobile_no", "")),
             _c(row.get("plot_no", "")),
@@ -410,7 +450,7 @@ def import_electrical_installation_via_staging_copy(
                 userid, created_by, created_at_raw,
                 certificate_owner,
                 date_of_birth, nationality, gender, work_permit_no,
-                region, district, ward, email, mobile_no, plot_no, po_box,
+                region, district, ward, zone_id, email, mobile_no, plot_no, po_box,
                 identification, identification_name, passport, passport_name,
                 experience_type, facility_name, approved_class
             ) FROM STDIN WITH CSV NULL ''
@@ -493,6 +533,26 @@ def import_electrical_installation_via_staging_copy(
         ALTER TABLE IF EXISTS public.certificate_verifications
             ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
     """))
+    # Cast application_sector_details.latitude/longitude to numeric so the
+    # DB trigger trg_sync_approved_licenses (which copies them into
+    # approved_licenses.latitude/longitude numeric columns) doesn't fail.
+    for _col in ("latitude", "longitude"):
+        try:
+            db.execute(text(f"""
+                ALTER TABLE public.application_sector_details
+                    ALTER COLUMN {_col} TYPE numeric
+                    USING CASE
+                        WHEN NULLIF(TRIM({_col}), '') IS NULL THEN NULL
+                        ELSE TRIM({_col})::numeric
+                    END
+            """))
+            db.commit()
+        except Exception as _cast_err:
+            logger.debug("schema:guard: %s cast skipped (%s)", _col, _cast_err)
+            try:
+                db.rollback()
+            except Exception:
+                pass
     # Commit DDL immediately — ALTER TABLE must not share a transaction with DML
     db.commit()
     _progress("schema:guard:done")
@@ -700,33 +760,23 @@ def import_electrical_installation_via_staging_copy(
     _skipped_users = max(0, int(_total_elec_usernames) - int(_inserted_users))
     _progress(f"transform:users_from_userid: inserted={_inserted_users}, already_existed={_skipped_users}")
 
-    # Look up APPLICANT ROLE id — read from an existing user_roles row.
-    # Never scan public.roles: it is a FDW foreign table whose remote name
-    # differs (public.role), causing every query to fail.
-    _elec_role_id = None
+    # Resolve APPLICANT role_id dynamically — works on every environment.
+    _elec_role_id = load_applicant_role_id(db)
     _inserted_user_roles = 0
     _skipped_user_roles = 0
-    try:
-        _ur = db.execute(text("SELECT role_id FROM public.user_roles LIMIT 1")).fetchone()
-        if _ur:
-            _elec_role_id = str(_ur[0])
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
     if not _elec_role_id:
-        # public.roles FDW always fails (remote table is named public.role).
-        # Cannot safely scan roles — skip role assignment silently.
-        logger.info("APPLICANT ROLE id not found from user_roles; role assignment skipped (FDW limitation)")
+        logger.info("APPLICANT role not resolved; role assignment skipped for this run")
         _skipped_user_roles = int(_total_elec_usernames)
 
-    # Assign APPLICANT ROLE — remote user_roles FDW only exposes (user_id, role_id).
+    # Assign APPLICANT ROLE to every staged user that doesn't have it yet.
+    # FDW sends all locally-defined columns (user_id, role_id, deleted,
+    # created_at) to the remote — supply explicit values to avoid NOT-NULL
+    # violations on the remote.
     if _elec_role_id:
         try:
             _rr = db.execute(text("""
-                INSERT INTO public.user_roles (user_id, role_id)
-                SELECT u.id, :role_id
+                INSERT INTO public.user_roles (user_id, role_id, deleted, created_at)
+                SELECT u.id, :role_id, false, now()
                 FROM public.users u
                 WHERE EXISTS (
                     SELECT 1 FROM public.stage_elec_install_raw s
@@ -750,6 +800,38 @@ def import_electrical_installation_via_staging_copy(
             except Exception:
                 pass
     _progress("transform:users_from_userid:done")
+
+    # ── 7a. Load category map from DB (dynamic — insert if missing) ───────────
+    # Replaces the old hard-coded UUID CASE expression.
+    # Falls back gracefully: if the DB/FDW is unreachable for categories the
+    # temp table will be empty and the SQL ELSE branch returns NULL (same as before).
+    _progress("transform:category_map:load")
+    _cat_map: Dict[str, str] = {}
+    try:
+        _cat_map = load_elec_category_map(db)
+        push_category_map_temp_table(db, _cat_map)
+        db.flush()
+        _progress(
+            f"transform:category_map:loaded codes={list(_cat_map.keys())}"
+        )
+    except Exception as _cme:
+        logger.warning(
+            "transform:category_map: failed to load/push (%s) — "
+            "SQL will fall back to hard-coded CASE uuids",
+            _cme,
+        )
+        # Ensure the temp table exists but is empty so the SQL still runs cleanly.
+        try:
+            db.execute(text(f"""
+                DROP TABLE IF EXISTS {ELEC_CAT_MAP_TEMP};
+                CREATE TEMP TABLE {ELEC_CAT_MAP_TEMP} (
+                    code        text PRIMARY KEY,
+                    class_label text NOT NULL,
+                    category_id uuid NOT NULL
+                );
+            """))
+        except Exception:
+            pass
 
     # ── 7. Set-based SQL transform across all 8 tables ────────────────
     _progress("transform:sql:start")
@@ -790,6 +872,7 @@ def import_electrical_installation_via_staging_copy(
                 old_parent_application_id,
                 username, old_created_by,
                 status, is_from_lois,
+                zone_id,
                 created_at, updated_at
             )
             SELECT
@@ -802,30 +885,19 @@ def import_electrical_installation_via_staging_copy(
                      THEN trim(ea.completed_at)::date END,
                 'LICENSE_ELECTRICITY_INSTALLATION',  -- license_type: fixed per check constraint
                 'OPERATIONAL',                       -- category_license_type: fixed per check constraint
-                -- category_id: map licensecategoryclass (e.g. "CLASS A") → uuid from categories table.
-                -- Mapping derived from: SELECT id, code FROM public.categories WHERE deleted_at IS NULL
-                --   A  → 6dd52222-0eb2-471e-830d-1ee943177f93
-                --   B  → fb74cf81-0cf5-4a7d-98e5-5ac4d500a879
-                --   C  → feaed553-4247-4d99-9e80-cbc3665b690f
-                --   D  → 2c4d6a4d-b13e-4130-bc64-6e06143e53ba
-                --   W  → 15f47ccc-215f-4640-855d-25d522fb0b90
-                --   S1 → 0bf197a8-38a9-490e-9e63-239ddc5a5d5f
-                --   S2 → 21b7dcf1-cbbb-4cfb-9df2-18be275c2a00
-                --   S3 → 90aae050-6eef-452d-8bb6-fd0e08c567c9
-                CASE UPPER(REGEXP_REPLACE(TRIM(ea.licensecategoryclass), '\\s+', ' '))
-                    WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
-                    WHEN 'CLASS B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
-                    WHEN 'CLASS C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
-                    WHEN 'CLASS D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
-                    WHEN 'CLASS W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
-                    WHEN 'CLASS S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
-                    WHEN 'CLASS S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
-                    WHEN 'CLASS S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
-                    -- fallback: if already a raw UUID string, cast directly
-                    ELSE (CASE WHEN NULLIF(TRIM(ea.licensecategoryclass),'') ~ '^[0-9a-fA-F-]{36}$'
-                               THEN TRIM(ea.licensecategoryclass)::uuid
-                               ELSE NULL END)
-                END,
+                -- category_id: resolved dynamically from stage_elec_category_map temp table
+                -- (loaded from public.categories at import time; missing codes inserted on-demand).
+                -- The JOIN normalises both "CLASS A" and bare "A" formats.
+                -- Fallback ELSE: raw UUID string pass-through, then NULL.
+                COALESCE(
+                    cm_lc.category_id,
+                    -- OLD hard-coded fallback (kept for safety; active when temp table is empty):
+                    -- CASE UPPER(REGEXP_REPLACE(TRIM(ea.licensecategoryclass), '\\s+', ' '))
+                    --     WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid ...
+                    CASE WHEN NULLIF(TRIM(ea.licensecategoryclass),'') ~ '^[0-9a-fA-F-]{36}$'
+                         THEN TRIM(ea.licensecategoryclass)::uuid
+                         ELSE NULL END
+                ),
                 CASE WHEN NULLIF(trim(ea.effective_date),'') IS NOT NULL
                      THEN trim(ea.effective_date)::date END,
                 CASE WHEN NULLIF(trim(ea.expire_date),'') IS NOT NULL
@@ -835,6 +907,7 @@ def import_electrical_installation_via_staging_copy(
                 NULLIF(trim(ea.created_by), ''),
                 'APPROVED',
                 true,
+                NULLIF(trim(ea.zone_id), '')::uuid,
                 COALESCE(
                     CASE WHEN NULLIF(trim(ea.created_at_raw),'') IS NOT NULL
                          THEN trim(ea.created_at_raw)::timestamp END,
@@ -842,6 +915,10 @@ def import_electrical_installation_via_staging_copy(
                 ),
                 now()
             FROM deduped ea
+            -- Dynamic category map: JOIN normalises both "CLASS A" and bare "A".
+            LEFT JOIN stage_elec_category_map cm_lc
+                   ON cm_lc.code = UPPER(REGEXP_REPLACE(TRIM(ea.licensecategoryclass), '\\s+', ' '))
+                   OR cm_lc.class_label = UPPER(REGEXP_REPLACE(TRIM(ea.licensecategoryclass), '\\s+', ' '))
             ON CONFLICT (application_number) DO UPDATE SET
                 -- Only fill NULLs — never overwrite existing non-null values (COALESCE pattern).
                 application_type          = COALESCE(public.applications.application_type,          EXCLUDED.application_type),
@@ -853,6 +930,7 @@ def import_electrical_installation_via_staging_copy(
                 old_parent_application_id = COALESCE(public.applications.old_parent_application_id, EXCLUDED.old_parent_application_id),
                 username                  = COALESCE(public.applications.username,                  EXCLUDED.username),
                 old_created_by            = COALESCE(public.applications.old_created_by,            EXCLUDED.old_created_by),
+                zone_id                   = COALESCE(public.applications.zone_id,                   EXCLUDED.zone_id),
                 -- These two are always enforced for electrical installation imports.
                 status                    = 'APPROVED',
                 is_from_lois              = true,
@@ -868,34 +946,24 @@ def import_electrical_installation_via_staging_copy(
     # Ensure all matching rows (including pre-existing) have status=APPROVED and is_from_lois=true,
     # and back-fill category_id where it was previously NULL (e.g. rows inserted before the
     # licensecategoryclass mapping was added).
-    db.execute(text("""
+    # Uses the same stage_elec_category_map temp table loaded above.
+    db.execute(text(f"""
         UPDATE public.applications a
         SET    status       = 'APPROVED',
                is_from_lois = true,
                category_id  = COALESCE(
                    a.category_id,
-                   CASE UPPER(REGEXP_REPLACE(TRIM(s.licensecategoryclass), '\\s+', ' '))
-                       WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
-                       WHEN 'CLASS B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
-                       WHEN 'CLASS C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
-                       WHEN 'CLASS D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
-                       WHEN 'CLASS W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
-                       WHEN 'CLASS S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
-                       WHEN 'CLASS S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
-                       WHEN 'CLASS S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
-                       WHEN 'A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
-                       WHEN 'B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
-                       WHEN 'C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
-                       WHEN 'D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
-                       WHEN 'W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
-                       WHEN 'S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
-                       WHEN 'S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
-                       WHEN 'S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
-                       ELSE NULL
-                   END
+                   -- Dynamic lookup from temp table (code or class_label match):
+                   cm.category_id
+                   -- OLD hard-coded fallback (uncomment to revert):
+                   -- CASE UPPER(REGEXP_REPLACE(TRIM(s.licensecategoryclass), '\\s+', ' '))
+                   --     WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid ... ELSE NULL END
                ),
                updated_at   = now()
         FROM   public.stage_elec_install_raw s
+        LEFT JOIN {ELEC_CAT_MAP_TEMP} cm
+               ON cm.code        = UPPER(REGEXP_REPLACE(TRIM(s.licensecategoryclass), '\\s+', ' '))
+               OR cm.class_label = UPPER(REGEXP_REPLACE(TRIM(s.licensecategoryclass), '\\s+', ' '))
         WHERE  a.application_number = trim(s.application_number)
           AND  (
                a.status != 'APPROVED'
@@ -993,37 +1061,26 @@ def import_electrical_installation_via_staging_copy(
     _progress("transform:applications.certificate_id back-filled")
 
     # ── STEP B: application_electrical_installation ────────────────────
-    # approved_class_id is resolved via licence_categories.name lookup using
-    # the Excel column `approvedclass`.
-    r2 = db.execute(text("""
+    # approved_class_id is resolved via stage_elec_category_map temp table loaded above.
+    r2 = db.execute(text(f"""
         WITH eligible AS (
             SELECT DISTINCT ON (a.id)
                    s.*,
                    a.id AS resolved_app_id,
-                   -- approved_class_id: map approvedclass (e.g. "CLASS A") → uuid.
-                   -- DB categories table has code "A","B",... but Excel sends "CLASS A","CLASS B",...
-                   CASE UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
-                       WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
-                       WHEN 'CLASS B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
-                       WHEN 'CLASS C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
-                       WHEN 'CLASS D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
-                       WHEN 'CLASS W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
-                       WHEN 'CLASS S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
-                       WHEN 'CLASS S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
-                       WHEN 'CLASS S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
-                       -- fallback: bare code without "CLASS " prefix
-                       WHEN 'A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid
-                       WHEN 'B'  THEN 'fb74cf81-0cf5-4a7d-98e5-5ac4d500a879'::uuid
-                       WHEN 'C'  THEN 'feaed553-4247-4d99-9e80-cbc3665b690f'::uuid
-                       WHEN 'D'  THEN '2c4d6a4d-b13e-4130-bc64-6e06143e53ba'::uuid
-                       WHEN 'W'  THEN '15f47ccc-215f-4640-855d-25d522fb0b90'::uuid
-                       WHEN 'S1' THEN '0bf197a8-38a9-490e-9e63-239ddc5a5d5f'::uuid
-                       WHEN 'S2' THEN '21b7dcf1-cbbb-4cfb-9df2-18be275c2a00'::uuid
-                       WHEN 'S3' THEN '90aae050-6eef-452d-8bb6-fd0e08c567c9'::uuid
-                       ELSE NULL
-                   END AS resolved_approved_class_id
+                   -- approved_class_id: dynamic lookup from stage_elec_category_map
+                   -- (matches both "CLASS A" and bare "A" via class_label / code columns).
+                   -- OLD hard-coded fallback (uncomment to revert):
+                   -- CASE UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
+                   --     WHEN 'CLASS A'  THEN '6dd52222-...'::uuid ... ELSE NULL END
+                   COALESCE(
+                       cm_ac.category_id,
+                       NULL  -- stays NULL when code not in temp table (rare / unknown class)
+                   ) AS resolved_approved_class_id
             FROM public.stage_elec_install_raw s
             JOIN public.applications a ON a.application_number = trim(s.application_number)
+            LEFT JOIN {ELEC_CAT_MAP_TEMP} cm_ac
+                   ON cm_ac.code        = UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
+                   OR cm_ac.class_label = UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
             ORDER BY a.id, s.row_no
         ),
         ins AS (
@@ -1044,11 +1101,12 @@ def import_electrical_installation_via_staging_copy(
                 true, now(), now()
             FROM eligible e
             ON CONFLICT (id) DO UPDATE SET
-                applicant_name      = COALESCE(EXCLUDED.applicant_name, public.application_electrical_installation.applicant_name),
-                experience_type     = COALESCE(EXCLUDED.experience_type, public.application_electrical_installation.experience_type),
-                approved_class_id   = COALESCE(EXCLUDED.approved_class_id, public.application_electrical_installation.approved_class_id),
-                is_from_lois        = true,
-                updated_at          = now()
+                {_build_conflict_set(
+                    ['application_id', 'applicant_name', 'experience_type', 'approved_class_id'],
+                    'application_electrical_installation',
+                    skip=('id', 'created_at')
+                )},
+                is_from_lois = true
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -1058,7 +1116,11 @@ def import_electrical_installation_via_staging_copy(
     db.commit()
 
     # ── STEP C: contact_details ────────────────────────────────────────
-    r3 = db.execute(text("""
+    _cd_cols = [
+        'application_id', 'application_electrical_installation_id',
+        'region', 'district', 'ward', 'email', 'mobile_no', 'plot_no', 'po_box',
+    ]
+    r3 = db.execute(text(f"""
         WITH eligible AS (
             SELECT DISTINCT ON (aei.id)
                    s.*,
@@ -1100,14 +1162,7 @@ def import_electrical_installation_via_staging_copy(
                 now(), now()
             FROM eligible e
             ON CONFLICT (id) DO UPDATE SET
-                region     = COALESCE(EXCLUDED.region,    public.contact_details.region),
-                district   = COALESCE(EXCLUDED.district,  public.contact_details.district),
-                ward       = COALESCE(EXCLUDED.ward,      public.contact_details.ward),
-                email      = COALESCE(EXCLUDED.email,     public.contact_details.email),
-                mobile_no  = COALESCE(EXCLUDED.mobile_no, public.contact_details.mobile_no),
-                plot_no    = COALESCE(EXCLUDED.plot_no,   public.contact_details.plot_no),
-                po_box     = COALESCE(EXCLUDED.po_box,    public.contact_details.po_box),
-                updated_at = now()
+                {_build_conflict_set(_cd_cols, 'contact_details')}
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -1117,7 +1172,11 @@ def import_electrical_installation_via_staging_copy(
     db.commit()
 
     # ── STEP D: personal_details ───────────────────────────────────────
-    r4 = db.execute(text("""
+    _pd_cols = [
+        'application_id', 'application_electrical_installation_id',
+        'date_of_birth', 'nationality', 'gender', 'work_permit_no',
+    ]
+    r4 = db.execute(text(f"""
         WITH eligible AS (
             SELECT DISTINCT ON (aei.id)
                    s.*,
@@ -1162,11 +1221,7 @@ def import_electrical_installation_via_staging_copy(
                 now(), now()
             FROM eligible e
             ON CONFLICT (id) DO UPDATE SET
-                date_of_birth  = COALESCE(EXCLUDED.date_of_birth,  public.personal_details.date_of_birth),
-                nationality    = COALESCE(EXCLUDED.nationality,    public.personal_details.nationality),
-                gender         = COALESCE(EXCLUDED.gender,         public.personal_details.gender),
-                work_permit_no = COALESCE(EXCLUDED.work_permit_no, public.personal_details.work_permit_no),
-                updated_at     = now()
+                {_build_conflict_set(_pd_cols, 'personal_details')}
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -1176,7 +1231,11 @@ def import_electrical_installation_via_staging_copy(
     db.commit()
 
     # ── STEP E: attachments ────────────────────────────────────────────
-    r5 = db.execute(text("""
+    _att_cols = [
+        'application_id', 'application_electrical_installation_id',
+        'identification', 'identification_name', 'passport', 'passport_name',
+    ]
+    r5 = db.execute(text(f"""
         WITH eligible AS (
             SELECT DISTINCT ON (aei.id)
                    s.*,
@@ -1217,48 +1276,13 @@ def import_electrical_installation_via_staging_copy(
                 now(), now()
             FROM eligible e
             ON CONFLICT (id) DO UPDATE SET
-                identification      = COALESCE(EXCLUDED.identification,      public.attachments.identification),
-                identification_name = COALESCE(EXCLUDED.identification_name, public.attachments.identification_name),
-                passport            = COALESCE(EXCLUDED.passport,            public.attachments.passport),
-                passport_name       = COALESCE(EXCLUDED.passport_name,       public.attachments.passport_name),
-                updated_at          = now()
+                {_build_conflict_set(_att_cols, 'attachments')}
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
     """)).mappings().first() or {}
     ins_att = int(r5.get("cnt", 0) or 0)
     _progress(f"transform:attachments inserted={ins_att}")
-    db.commit()
-
-    # ── STEP E½: back-fill FK columns on application_electrical_installation ─
-    # Wire contact_details_id, personal_details_id, attachments_id now that
-    # all three child rows exist.
-    db.execute(text("""
-        UPDATE public.application_electrical_installation aei
-        SET
-            contact_details_id  = cd.id,
-            personal_details_id = pd.id,
-            attachments_id      = att.id,
-            updated_at          = now()
-        FROM public.application_electrical_installation aei2
-        JOIN public.applications a
-            ON a.id = aei2.application_id
-        JOIN public.stage_elec_install_raw s
-            ON trim(s.application_number) = trim(a.application_number)
-        LEFT JOIN public.contact_details cd
-            ON cd.application_electrical_installation_id = aei2.id
-        LEFT JOIN public.personal_details pd
-            ON pd.application_electrical_installation_id = aei2.id
-        LEFT JOIN public.attachments att
-            ON att.application_electrical_installation_id = aei2.id
-        WHERE aei.id = aei2.id
-          AND (
-              aei.contact_details_id  IS DISTINCT FROM cd.id  OR
-              aei.personal_details_id IS DISTINCT FROM pd.id  OR
-              aei.attachments_id      IS DISTINCT FROM att.id
-          );
-    """))
-    _progress("transform:application_electrical_installation FKs back-filled")
     db.commit()
 
     # ── STEP F: work_experience — SKIPPED on this import ──────────────
@@ -1275,7 +1299,11 @@ def import_electrical_installation_via_staging_copy(
     # is SELF_EMPLOYED. work_experience / voltage_level fields are not in this
     # file; use NULL / 'NONE' placeholders — they will be enriched by the
     # supervisors/work-experience upload later.
-    r6 = db.execute(text("""
+    _se_cols = [
+        'application_id', 'application_electrical_installation_id',
+        'from_date', 'to_date', 'project_performed', 'voltage_level', 'voltage',
+    ]
+    r6 = db.execute(text(f"""
         WITH eligible AS (
             SELECT DISTINCT ON (aei.id)
                 -- Use aei.id as the stable seed so supervisors upload can find
@@ -1318,11 +1346,7 @@ def import_electrical_installation_via_staging_copy(
                 now()
             FROM eligible e
             ON CONFLICT (id) DO UPDATE SET
-                application_electrical_installation_id = COALESCE(
-                    EXCLUDED.application_electrical_installation_id,
-                    public.self_employed.application_electrical_installation_id
-                ),
-                updated_at = now()
+                {_build_conflict_set(_se_cols, 'self_employed')}
             RETURNING 1
         )
         SELECT COUNT(*) AS cnt FROM ins;
@@ -1510,6 +1534,11 @@ def import_electrical_installation_via_staging_copy(
         ("public.contact_details",                    "application_id", None),
         ("public.personal_details",                   "application_id", None),
         ("public.attachments",                        "application_id", None),
+        ("public.work_experience",                    "application_id", None),
+        ("public.self_employed",                      "application_id", None),
+        ("public.supervisor_details",                 "application_id", None),
+        ("public.costumer_details",                   "application_id", None),
+        ("public.certificate_verifications",          "application_id", None),
     ]
     for _tbl, _fk, _self_join in _backfill_tables:
         try:

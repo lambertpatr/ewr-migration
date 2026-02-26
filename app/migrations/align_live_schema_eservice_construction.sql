@@ -84,17 +84,117 @@ ALTER TABLE IF EXISTS public.work_experience
 ALTER TABLE IF EXISTS public.self_employed
     ADD COLUMN IF NOT EXISTS voltage character varying(255);
 
--- Some environments don't have application_id on self_employed/custom_details.
--- The importer joins applications and stores it for easier reporting.
+-- ── Denormalize application_id on all child tables ───────────────────────
+-- Reduces multi-table joins: child tables can reach applications directly
+-- without going through application_sector_details first.
+-- Column is nullable so it can be back-filled after import.
 ALTER TABLE IF EXISTS public.self_employed
     ADD COLUMN IF NOT EXISTS application_id uuid;
 
 ALTER TABLE IF EXISTS public.self_employed
     ALTER COLUMN voltage_level SET DEFAULT 'NONE';
 
--- custom_details: keep application_id for easier reporting/queries (nullable)
 ALTER TABLE IF EXISTS public.custom_details
     ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.documents
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+-- FK back to application_sector_details (needed by backfill + transform)
+ALTER TABLE IF EXISTS public.documents
+    ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid;
+
+ALTER TABLE IF EXISTS public.documents
+    ADD COLUMN IF NOT EXISTS documents_order integer;
+
+ALTER TABLE IF EXISTS public.contact_persons
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+-- FK back to application_sector_details (contact_persons uses app_sector_detail_id)
+ALTER TABLE IF EXISTS public.contact_persons
+    ADD COLUMN IF NOT EXISTS app_sector_detail_id uuid;
+
+ALTER TABLE IF EXISTS public.fire
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.fire
+    ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid;
+
+ALTER TABLE IF EXISTS public.insurance_cover_details
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.insurance_cover_details
+    ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid;
+
+-- application_id columns: added in the managing_directors / shareholders sections below.
+
+ALTER TABLE IF EXISTS public.ardhi_information
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.ardhi_information
+    ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid;
+
+-- ── Electrical installation child tables: application_id + aei FK ─────────
+ALTER TABLE IF EXISTS public.application_electrical_installation
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.application_electrical_installation
+    ADD COLUMN IF NOT EXISTS is_from_lois boolean DEFAULT false;
+
+ALTER TABLE IF EXISTS public.personal_details
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.personal_details
+    ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
+
+ALTER TABLE IF EXISTS public.contact_details
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.contact_details
+    ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
+
+ALTER TABLE IF EXISTS public.attachments
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.attachments
+    ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
+
+ALTER TABLE IF EXISTS public.work_experience
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.work_experience
+    ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
+
+ALTER TABLE IF EXISTS public.self_employed
+    ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
+
+ALTER TABLE IF EXISTS public.supervisor_details
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.supervisor_details
+    ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
+
+ALTER TABLE IF EXISTS public.costumer_details
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.costumer_details
+    ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
+
+ALTER TABLE IF EXISTS public.certificate_verifications
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.certificate_verifications
+    ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
+
+-- certificates: columns required by the import pipeline
+ALTER TABLE IF EXISTS public.certificates
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.certificates
+    ADD COLUMN IF NOT EXISTS application_number text;
+
+ALTER TABLE IF EXISTS public.certificates
+    ADD COLUMN IF NOT EXISTS application_certificate_type text;
 
 -- Allow long custom details strings (some uploads exceed 255 chars)
 ALTER TABLE IF EXISTS public.custom_details
@@ -229,6 +329,18 @@ ALTER TABLE IF EXISTS public.managing_directors
 
 ALTER TABLE IF EXISTS public.managing_directors
     ADD COLUMN IF NOT EXISTS cpana_filename text;
+
+-- application_id is the canonical FK to applications (replaces application_number).
+-- Ensure the column exists and drop application_number if it was ever persisted.
+ALTER TABLE IF EXISTS public.managing_directors
+    ADD COLUMN IF NOT EXISTS application_id uuid;
+
+ALTER TABLE IF EXISTS public.managing_directors
+    DROP COLUMN IF EXISTS application_number;
+
+-- Shareholders: application_id is the canonical FK — no application_number column needed.
+ALTER TABLE IF EXISTS public.shareholders
+    ADD COLUMN IF NOT EXISTS application_id uuid;
 
 ---------------------------------------------------------------------
 -- 2) applications: ensure migration columns exist and defaults match

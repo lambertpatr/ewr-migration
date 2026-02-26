@@ -533,25 +533,25 @@ def import_shareholders_via_staging_copy(
                 a.id   AS application_id,
                 asd.id AS application_sector_detail_id,
                 -- objectid_raw is a plain integer (e.g. 121858); flag if non-numeric
-                (sn.objectid_raw IS NOT NULL AND sn.objectid_raw !~ '^[0-9]+(\.[0-9]+)?$') AS invalid_objectid
+                (sn.objectid_raw IS NOT NULL AND sn.objectid_raw !~ '^[0-9]+([.][0-9]+)?$') AS invalid_objectid
             FROM s_norm sn
             LEFT JOIN public.applications a
                 ON a.application_number IS NOT DISTINCT FROM sn.application_number
-            LEFT JOIN public.application_sector_details asd
-                ON asd.application_id = a.id
+            LEFT JOIN LATERAL (
+                SELECT id FROM public.application_sector_details
+                WHERE application_id = a.id
+                LIMIT 1
+            ) asd ON true
         ),
         eligible AS (
-            SELECT j.*
+            -- Deduplicate within the same upload on (application_number, shareholder_name)
+            -- so ON CONFLICT DO UPDATE never targets the same row twice.
+            SELECT DISTINCT ON (lower(trim(j.application_number)), lower(trim(j.shareholder_name)))
+                j.*
             FROM joined j
             WHERE j.application_id IS NOT NULL
-              AND j.application_sector_detail_id IS NOT NULL
               AND j.shareholder_name IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM public.shareholders x
-                  WHERE x.application_sector_detail_id = j.application_sector_detail_id
-                    AND x.shareholder_name IS NOT DISTINCT FROM j.shareholder_name
-              )
+            ORDER BY lower(trim(j.application_number)), lower(trim(j.shareholder_name)), j.id
         ),
         ins AS (
             INSERT INTO public.shareholders (
@@ -562,6 +562,8 @@ def import_shareholders_via_staging_copy(
                 deleted_by,
                 updated_at,
                 updated_by,
+                application_id,
+                application_sector_detail_id,
                 shareholder_name,
                 amount_of_shares,
                 country_of_residence,
@@ -569,7 +571,6 @@ def import_shareholders_via_staging_copy(
                 nationality,
                 individual_company,
                 passport_or_nationalid,
-                application_sector_detail_id,
                 file_name,
                 logic_doc_id,
                 amount_of_share_percent,
@@ -583,13 +584,17 @@ def import_shareholders_via_staging_copy(
                 street_address
             )
             SELECT
-                e.id,
+                -- Stable deterministic UUID keyed on application_number + shareholder_name
+                -- (application_sector_detail_id is unreliable across re-imports)
+                md5(e.application_number || '|' || lower(trim(e.shareholder_name)))::uuid AS id,
                 now() AS created_at,
                 NULL AS created_by,
                 NULL AS deleted_at,
                 NULL AS deleted_by,
                 now() AS updated_at,
                 NULL AS updated_by,
+                e.application_id,
+                e.application_sector_detail_id,
                 e.shareholder_name,
                 NULL AS amount_of_shares,
                 e.countryname AS country_of_residence,
@@ -597,68 +602,78 @@ def import_shareholders_via_staging_copy(
                 e.nationality_name AS nationality,
                 e.individual_company,
                 NULL AS passport_or_nationalid,
-                e.application_sector_detail_id,
                 NULLIF(trim(e.file_name), '') AS file_name,
                 -- objectid from Excel is a plain integer (e.g. 121858) → logic_doc_id
                 CASE
-                    WHEN e.objectid_raw ~ '^[0-9]+$'        THEN e.objectid_raw::bigint
-                    WHEN e.objectid_raw ~ '^[0-9]+\.[0-9]+$' THEN trunc(e.objectid_raw::numeric)::bigint
+                    WHEN e.objectid_raw ~ '^[0-9]+$'          THEN e.objectid_raw::bigint
+                    WHEN e.objectid_raw ~ '^[0-9]+[.][0-9]+$' THEN trunc(e.objectid_raw::numeric)::bigint
                     ELSE NULL
                 END AS logic_doc_id,
                 CASE
-                    WHEN e.amountofshare_raw ~ '^[0-9]+(\\.[0-9]+)?$' THEN e.amountofshare_raw::numeric
+                    WHEN e.amountofshare_raw ~ '^[0-9]+([.][0-9]+)?$' THEN e.amountofshare_raw::numeric
                     ELSE NULL
                 END AS amount_of_share_percent,
                 NULL::date AS birth_date,
                 NULL AS email,
                 CASE
                     WHEN e.shareholder_name IS NULL THEN NULL
-                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '\\s+'), 1) = 1 THEN split_part(trim(e.shareholder_name), ' ', 1)
-                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '\\s+'), 1) = 2 THEN split_part(trim(e.shareholder_name), ' ', 1)
+                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '[[:space:]]+'), 1) = 1 THEN split_part(trim(e.shareholder_name), ' ', 1)
+                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '[[:space:]]+'), 1) = 2 THEN split_part(trim(e.shareholder_name), ' ', 1)
                     ELSE split_part(trim(e.shareholder_name), ' ', 1)
                 END AS first_name,
                 NULL AS gender,
                 CASE
                     WHEN e.shareholder_name IS NULL THEN NULL
-                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '\\s+'), 1) = 1 THEN NULL
-                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '\\s+'), 1) = 2 THEN NULL
-                    ELSE regexp_replace(trim(e.shareholder_name), '^\\S+\\s+(.+)\\s+\\S+$', '\\1')
+                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '[[:space:]]+'), 1) = 1 THEN NULL
+                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '[[:space:]]+'), 1) = 2 THEN NULL
+                    ELSE regexp_replace(trim(e.shareholder_name), '^[^[:space:]]+[[:space:]]+(.+)[[:space:]]+[^[:space:]]+$', '\1')
                 END AS middle_name,
                 CASE
                     WHEN e.shareholder_name IS NULL THEN NULL
-                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '\\s+'), 1) = 1 THEN NULL
-                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '\\s+'), 1) = 2 THEN split_part(trim(e.shareholder_name), ' ', 2)
-                    ELSE regexp_replace(trim(e.shareholder_name), '^.*\\s+(\\S+)$', '\\1')
+                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '[[:space:]]+'), 1) = 1 THEN NULL
+                    WHEN array_length(regexp_split_to_array(trim(e.shareholder_name), '[[:space:]]+'), 1) = 2 THEN split_part(trim(e.shareholder_name), ' ', 2)
+                    ELSE regexp_replace(trim(e.shareholder_name), '^.*[[:space:]]+([^[:space:]]+)$', '\1')
                 END AS last_name,
                 NULL AS mobile_no,
                 e.street_address AS street_address
             FROM eligible e
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                updated_at                   = now(),
+                application_id               = COALESCE(EXCLUDED.application_id,               public.shareholders.application_id),
+                application_sector_detail_id = EXCLUDED.application_sector_detail_id,
+                shareholder_name             = EXCLUDED.shareholder_name,
+                amount_of_shares             = COALESCE(EXCLUDED.amount_of_shares,             public.shareholders.amount_of_shares),
+                country_of_residence         = COALESCE(EXCLUDED.country_of_residence,         public.shareholders.country_of_residence),
+                country_of_incorporation     = COALESCE(EXCLUDED.country_of_incorporation,     public.shareholders.country_of_incorporation),
+                nationality                  = COALESCE(EXCLUDED.nationality,                  public.shareholders.nationality),
+                individual_company           = COALESCE(EXCLUDED.individual_company,           public.shareholders.individual_company),
+                passport_or_nationalid       = COALESCE(EXCLUDED.passport_or_nationalid,       public.shareholders.passport_or_nationalid),
+                file_name                    = COALESCE(EXCLUDED.file_name,                    public.shareholders.file_name),
+                logic_doc_id                 = COALESCE(EXCLUDED.logic_doc_id,                 public.shareholders.logic_doc_id),
+                amount_of_share_percent      = COALESCE(EXCLUDED.amount_of_share_percent,      public.shareholders.amount_of_share_percent),
+                birth_date                   = COALESCE(EXCLUDED.birth_date,                   public.shareholders.birth_date),
+                email                        = COALESCE(EXCLUDED.email,                        public.shareholders.email),
+                first_name                   = COALESCE(EXCLUDED.first_name,                   public.shareholders.first_name),
+                gender                       = COALESCE(EXCLUDED.gender,                       public.shareholders.gender),
+                last_name                    = COALESCE(EXCLUDED.last_name,                    public.shareholders.last_name),
+                middle_name                  = COALESCE(EXCLUDED.middle_name,                  public.shareholders.middle_name),
+                mobile_no                    = COALESCE(EXCLUDED.mobile_no,                    public.shareholders.mobile_no),
+                street_address               = COALESCE(EXCLUDED.street_address,               public.shareholders.street_address)
             RETURNING 1
         ),
         stats AS (
             SELECT
-                (SELECT COUNT(*) FROM joined) AS processed_rows,
-                (SELECT COUNT(*) FROM ins) AS inserted_rows,
-                (SELECT COUNT(*) FROM joined WHERE application_id IS NULL OR application_sector_detail_id IS NULL) AS skipped_missing_application,
-                (SELECT COUNT(*) FROM joined WHERE application_id IS NOT NULL AND shareholder_name IS NULL) AS skipped_missing_shareholder_name,
-                (SELECT COUNT(*) FROM joined j
-                    WHERE j.application_id IS NOT NULL
-                      AND j.application_sector_detail_id IS NOT NULL
-                      AND j.shareholder_name IS NOT NULL
-                      AND EXISTS (
-                          SELECT 1
-                          FROM public.shareholders x
-                          WHERE x.application_sector_detail_id = j.application_sector_detail_id
-                            AND x.shareholder_name IS NOT DISTINCT FROM j.shareholder_name
-                      )
-                ) AS skipped_already_exists,
-                (SELECT COUNT(*) FROM joined WHERE invalid_objectid) AS invalid_objectid
+                (SELECT COUNT(*) FROM joined)                                                                          AS processed_rows,
+                (SELECT COUNT(*) FROM ins)                                                                             AS upserted_rows,
+                (SELECT COUNT(*) FROM joined WHERE application_id IS NULL)     AS skipped_missing_application,
+                (SELECT COUNT(*) FROM joined WHERE application_id IS NOT NULL AND shareholder_name IS NULL)            AS skipped_missing_shareholder_name,
+                0                                                                                                      AS skipped_already_exists,
+                (SELECT COUNT(*) FROM joined WHERE invalid_objectid)                                                   AS invalid_objectid
         )
         SELECT
             processed_rows,
-            inserted_rows,
-            (processed_rows - inserted_rows) AS skipped_total,
+            upserted_rows,
+            (processed_rows - upserted_rows) AS skipped_total,
             skipped_missing_application,
             skipped_missing_shareholder_name,
             skipped_already_exists,
@@ -674,7 +689,7 @@ def import_shareholders_via_staging_copy(
         row = (staged_total, 0, staged_total, 0, 0, 0, 0)
 
     processed_rows = int(row[0] or 0)
-    inserted_rows = int(row[1] or 0)
+    upserted_rows = int(row[1] or 0)
     skipped_total = int(row[2] or 0)
     skipped_missing_application = int(row[3] or 0)
     skipped_missing_shareholder_name = int(row[4] or 0)
@@ -683,15 +698,15 @@ def import_shareholders_via_staging_copy(
 
     _progress(
         "shareholders:transform:done "
-        f"processed={processed_rows} inserted={inserted_rows} skipped={skipped_total} "
-        f"missing_app={skipped_missing_application} missing_name={skipped_missing_shareholder_name} already_exists={skipped_already_exists}"
+        f"processed={processed_rows} upserted={upserted_rows} skipped={skipped_total} "
+        f"missing_app={skipped_missing_application} missing_name={skipped_missing_shareholder_name}"
     )
 
     result = {
         "total_rows_in_file": total_rows_in_file,
         "staged_total": staged_total,
         "processed_rows": processed_rows,
-        "inserted_rows": inserted_rows,
+        "upserted_rows": upserted_rows,
         "skipped_total": skipped_total,
         "skipped_breakdown": {
             "missing_application": skipped_missing_application,
@@ -700,13 +715,13 @@ def import_shareholders_via_staging_copy(
         },
         "diagnostics": {
             "invalid_objectid": invalid_objectid,
-            "note": "Rows are skipped when application_number doesn't match ca_applications, shareholder_name is blank, or (application_id + shareholder_order) already exists.",
+            "note": "Rows are upserted (inserted or updated) when application_number matches ca_applications and shareholder_name is present.",
         },
     }
 
-    # If nothing inserted, attach a small sample of rows for each skip reason
+    # If nothing upserted, attach a small sample of rows for each skip reason
     # so it's easy to see what's wrong without querying the DB manually.
-    if inserted_rows == 0 and staged_total > 0:
+    if upserted_rows == 0 and staged_total > 0:
         try:
             result["skip_samples"] = _fetch_skip_samples(db, limit=10)
         except Exception as e:

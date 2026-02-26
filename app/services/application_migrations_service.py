@@ -796,7 +796,7 @@ def import_applications_via_staging_copy(
     )
 
 
-def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, batch_size: int = 1000):
+def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, batch_size: int = 1000, sector_name: str = "PETROLEUM"):
     """Import application rows and their attachments into applications and
     documents using the provided SQLAlchemy Session-like `db`.
 
@@ -1747,7 +1747,7 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
         # Run before created_by backfill so that the created_by pass can use
         # the freshly populated application_id to resolve users on every table.
         try:
-            _abf = backfill_application_id_on_child_tables(db)
+            _abf = backfill_application_id_on_child_tables(db, sector_name=sector_name)
             logger.info("Auto backfill application_id: %s", _abf)
             result['backfill_application_id'] = _abf
         except Exception as _abfe:
@@ -1766,7 +1766,7 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
         return result
 
 
-def backfill_application_id_on_child_tables(db: Any) -> Dict[str, int]:
+def backfill_application_id_on_child_tables(db: Any, sector_name: str | None = None) -> Dict[str, int]:
     """Backfill application_id (and app_sector_detail_id where applicable) on
     ALL child tables that sit below applications in the hierarchy.
 
@@ -1786,14 +1786,19 @@ def backfill_application_id_on_child_tables(db: Any) -> Dict[str, int]:
 
     Tables covered
     ──────────────
-    Group A — petroleum / construction (via application_sector_details):
+    Group A — all sectors (via application_sector_details):
         documents, contact_persons, fire, insurance_cover_details,
         shareholders, managing_directors, ardhi_information
 
-    Group B — electrical installation (via application_electrical_installation):
+    Group B — electrical installation pipeline ONLY (via application_electrical_installation):
         application_electrical_installation, personal_details,
         contact_details, attachments, work_experience, self_employed,
         supervisor_details, costumer_details, certificate_verifications
+
+        ⚠ Group B is SKIPPED when sector_name is provided (i.e. called from
+          the applications-migration endpoint for any sector). Those uploads
+          only write to: applications → certificates → application_sector_details.
+          The electrical_installation pipeline is completely separate.
 
     All UPDATEs are idempotent (WHERE application_id IS NULL).
     Optional tables are silently skipped if they don't exist yet.
@@ -1993,19 +1998,34 @@ def backfill_application_id_on_child_tables(db: Any) -> Dict[str, int]:
     #   child.application_electrical_installation_id
     #     → application_electrical_installation.id
     #     → application_electrical_installation.application_id
+    #
+    # SKIPPED when sector_name is set — that means we were called from the
+    # applications-migration endpoint. Those uploads go to:
+    #   applications → certificates → application_sector_details → …
+    # The electrical_installation pipeline is completely separate and manages
+    # its own child tables. Never touch them here.
     # ══════════════════════════════════════════════════════════════════════
+    if sector_name:
+        logger.info(
+            "[backfill-app-id] Group B (electrical installation tables) skipped — "
+            "sector=%s uses applications→certificates→application_sector_details path",
+            sector_name,
+        )
+        logger.info("[backfill-app-id] results: %s", counts)
+        return counts
 
     # ── application_electrical_installation ─────────────────────────────
-    # AEI itself gets application_id via applications.application_number
-    # during import, but rows from older imports may have NULL.
+    # AEI itself gets application_id via its own import pipeline.
+    # Rows from older imports may have NULL — backfill via application_id
+    # already stored on AEI (no application_number column on this table).
     _run("""
         UPDATE public.application_electrical_installation aei
         SET    application_id = a.id
         FROM   public.applications a
-        WHERE  a.application_number = aei.application_number
+        WHERE  a.id = aei.application_id
           AND  aei.application_id IS NULL
           AND  a.id IS NOT NULL
-    """, "aei_via_app_number", table="application_electrical_installation")
+    """, "aei_via_app_id", table="application_electrical_installation")
 
     # ── personal_details ──────────────────────────────────────────────────
     _run("""

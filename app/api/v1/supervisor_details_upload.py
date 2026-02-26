@@ -60,65 +60,65 @@ def _run_job(job_id: str, df, source_file_name: str):
         db.close()
 
 
-@router.post("/upload-supervisor-details")
-def upload_supervisor_details(
-    file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None,
-    sync: bool = True,
-    background: bool = False,
-    include_rows: bool = False,
-    limit_rows: int = 50,
-):
-    """Upload supervisor details Excel/CSV.
-
-    Expected columns (case-insensitive, spaces tolerated):
-    - apprefno, sno, supervisorDetail, position, roleandresponsibility,
-      voltagelevel, workperformed, wfromdate, wtodate
-
-    Saves to:
-    - public.supervisor_details  (all rows matched to applications)
-    - public.self_employed       (only where aei.experience_type = 'SELF_EMPLOYED')
-
-    Staging table: public.stage_supervisor_details_raw
-    """
-    try:
-        df = read_users_file(file.filename, file.file)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {e}")
-
-    if sync and not background:
-        db = _get_new_session()
-        try:
-            result = import_supervisor_details_via_staging_copy(
-                db,
-                df,
-                source_file_name=file.filename,
-                include_rows=include_rows,
-                limit_rows=limit_rows,
-            )
-            db.commit()
-            return {"status": "SUCCESS", "result": result}
-        except Exception as e:
-            db.rollback()
-            raise HTTPException(status_code=500, detail=str(e))
-        finally:
-            db.close()
-
-    job_id = str(uuid_mod.uuid4())
-    _job_status[job_id] = {
-        "status": "QUEUED",
-        "queued_at": datetime.utcnow().isoformat(),
-        "source_file_name": file.filename,
-    }
-    background_tasks.add_task(_run_job, job_id, df, file.filename)
-    return JSONResponse(
-        status_code=202,
-        content={
-            "status": "ACCEPTED",
-            "job_id": job_id,
-            "message": "Import started in background. Check status at /api/v1/electrical-installations/supervisor-details-status/{job_id}",
-        },
-    )
+# @router.post("/upload-supervisor-details")
+# def upload_supervisor_details(
+#     file: UploadFile = File(...),
+#     background_tasks: BackgroundTasks = None,
+#     sync: bool = True,
+#     background: bool = False,
+#     include_rows: bool = False,
+#     limit_rows: int = 50,
+# ):
+#     """Upload supervisor details Excel/CSV.
+#
+#     Expected columns (case-insensitive, spaces tolerated):
+#     - apprefno, sno, supervisorDetail, position, roleandresponsibility,
+#       voltagelevel, workperformed, wfromdate, wtodate
+#
+#     Saves to:
+#     - public.supervisor_details  (all rows matched to applications)
+#     - public.self_employed       (only where aei.experience_type = 'SELF_EMPLOYED')
+#
+#     Staging table: public.stage_supervisor_details_raw
+#     """
+#     try:
+#         df = read_users_file(file.filename, file.file)
+#     except Exception as e:
+#         raise HTTPException(status_code=400, detail=f"Failed to read uploaded file: {e}")
+#
+#     if sync and not background:
+#         db = _get_new_session()
+#         try:
+#             result = import_supervisor_details_via_staging_copy(
+#                 db,
+#                 df,
+#                 source_file_name=file.filename,
+#                 include_rows=include_rows,
+#                 limit_rows=limit_rows,
+#             )
+#             db.commit()
+#             return {"status": "SUCCESS", "result": result}
+#         except Exception as e:
+#             db.rollback()
+#             raise HTTPException(status_code=500, detail=str(e))
+#         finally:
+#             db.close()
+#
+#     job_id = str(uuid_mod.uuid4())
+#     _job_status[job_id] = {
+#         "status": "QUEUED",
+#         "queued_at": datetime.utcnow().isoformat(),
+#         "source_file_name": file.filename,
+#     }
+#     background_tasks.add_task(_run_job, job_id, df, file.filename)
+#     return JSONResponse(
+#         status_code=202,
+#         content={
+#             "status": "ACCEPTED",
+#             "job_id": job_id,
+#             "message": "Import started in background. Check status at /api/v1/electrical-installations/supervisor-details-status/{job_id}",
+#         },
+#     )
 
 
 @router.get("/supervisor-details-status/{job_id}")

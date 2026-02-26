@@ -570,18 +570,48 @@ def import_electrical_supervisors_via_staging_copy(
                         e.app_id,
                         e.aei_id,
                         e.work_experience_id,
-                        NULLIF(trim(e.supervisor_detail), ''),
+                        -- Clean name: strip phone/email garbage embedded by LOIS.
+                        -- Pipe-separated: "NAYMAN CHAVALA | COUNTRY DIRECTOR | ..."
+                        -- Comma-separated: "CLAVERY MABELE,ELECTRICIAL,..."
+                        CASE
+                            WHEN NULLIF(trim(e.supervisor_detail), '') LIKE '%|%'
+                            THEN NULLIF(trim(SPLIT_PART(e.supervisor_detail, '|', 1)), '')
+                            WHEN NULLIF(trim(e.supervisor_detail), '') LIKE '%,%'
+                            THEN NULLIF(trim(SPLIT_PART(e.supervisor_detail, ',', 1)), '')
+                            ELSE NULLIF(trim(e.supervisor_detail), '')
+                        END,
                         NULLIF(trim(e.position), ''),
-                        NULL,
-                        NULL,
+                        -- Extract email from the raw name string at import time.
+                        NULLIF(trim(REGEXP_REPLACE(
+                            e.supervisor_detail,
+                            '^.*?([a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}).*$',
+                            '\1'
+                        )), e.supervisor_detail),
+                        -- Extract TZ mobile number (with or without spaces) at import time.
+                        -- REPLACE(..., ' ', '') collapses "+255 715 67 67 70" → "+255715676770"
+                        NULLIF(REPLACE(trim(REGEXP_REPLACE(
+                            e.supervisor_detail,
+                            '^.*?(\\+?255[\\s]?[0-9]([\\s]?[0-9]){8}|0[67][0-9]([\\s]?[0-9]){7}).*$',
+                            '\1'
+                        )), ' ', ''), REPLACE(e.supervisor_detail, ' ', '')),
                         now(),
                         now()
                     FROM eligible e
                     ON CONFLICT (id) DO UPDATE
                     SET
                         work_experience_id = COALESCE(EXCLUDED.work_experience_id, public.supervisor_details.work_experience_id),
-                        name              = COALESCE(EXCLUDED.name,              public.supervisor_details.name),
+                        -- Only update name if the stored one still looks like raw LOIS junk
+                        -- (contains a separator), otherwise preserve what's already clean.
+                        name              = CASE
+                                                WHEN public.supervisor_details.name LIKE '%|%'
+                                                  OR public.supervisor_details.name LIKE '%,%'
+                                                THEN EXCLUDED.name
+                                                ELSE COALESCE(public.supervisor_details.name, EXCLUDED.name)
+                                            END,
                         position          = COALESCE(EXCLUDED.position,          public.supervisor_details.position),
+                        -- Fill mobile_no / email only when currently blank
+                        mobile_no         = COALESCE(NULLIF(trim(public.supervisor_details.mobile_no), ''), EXCLUDED.mobile_no),
+                        email             = COALESCE(NULLIF(trim(public.supervisor_details.email),     ''), EXCLUDED.email),
                         updated_at        = now()
                     RETURNING 1
                 )

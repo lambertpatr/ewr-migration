@@ -263,11 +263,14 @@ def import_managing_directors_via_staging_copy(
         ALTER TABLE IF EXISTS public.managing_directors
             ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid;
         ALTER TABLE IF EXISTS public.managing_directors
+            ADD COLUMN IF NOT EXISTS application_id                uuid;
+        -- Drop application_number from child table; application_id is the canonical FK.
+        ALTER TABLE IF EXISTS public.managing_directors
+            DROP COLUMN IF EXISTS application_number;
+        ALTER TABLE IF EXISTS public.managing_directors
             ADD COLUMN IF NOT EXISTS email                         character varying(255);
         ALTER TABLE IF EXISTS public.managing_directors
             ADD COLUMN IF NOT EXISTS nationality                   character varying(255);
-        -- NOTE: We intentionally do NOT create/use application_id/contact_address/work_permit/cpana_filename
-        -- because your current public.managing_directors table doesn't have those columns.
 
         WITH s_norm AS (
             SELECT
@@ -309,30 +312,33 @@ def import_managing_directors_via_staging_copy(
         joined AS (
             SELECT
                 sn.*,
+                a.id   AS application_id,
                 asd.id AS application_sector_detail_id
             FROM s_norm sn
             LEFT JOIN public.applications a
                 ON a.application_number IS NOT DISTINCT FROM sn.application_number
-            LEFT JOIN public.application_sector_details asd
-                ON asd.application_id = a.id
+            LEFT JOIN LATERAL (
+                SELECT id FROM public.application_sector_details
+                WHERE application_id = a.id
+                LIMIT 1
+            ) asd ON true
         ),
         eligible AS (
-            SELECT j.*
+            -- Deduplicate within the same upload on (application_number, md_name)
+            -- so ON CONFLICT DO UPDATE never targets the same row twice.
+            SELECT DISTINCT ON (lower(trim(j.application_number)), lower(trim(j.md_name)))
+                j.*
             FROM joined j
-            WHERE j.application_sector_detail_id IS NOT NULL
+            WHERE j.application_id IS NOT NULL
               AND j.md_name IS NOT NULL
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM public.managing_directors x
-                  WHERE lower(trim(x.name)) = lower(trim(j.md_name))
-                    AND x.application_sector_detail_id = j.application_sector_detail_id
-              )
+            ORDER BY lower(trim(j.application_number)), lower(trim(j.md_name)), j.id
         ),
         ins AS (
             INSERT INTO public.managing_directors (
                 id,
                 created_at,
                 updated_at,
+                application_id,
                 application_sector_detail_id,
                 name,
                 first_name,
@@ -348,9 +354,12 @@ def import_managing_directors_via_staging_copy(
                 cpana_filename
             )
             SELECT
-                e.id,
+                -- Stable deterministic UUID keyed on application_number + name
+                -- (application_sector_detail_id is unreliable across re-imports)
+                md5(e.application_number || '|' || lower(trim(e.md_name)))::uuid AS id,
                 now()                          AS created_at,
                 now()                          AS updated_at,
+                e.application_id,
                 e.application_sector_detail_id,
                 e.md_name                      AS name,
                 split_part(trim(e.md_name), ' ', 1) AS first_name,
@@ -373,32 +382,39 @@ def import_managing_directors_via_staging_copy(
                 e.cpana_val                    AS cpana,
                 e.cpana_filename               AS cpana_filename
             FROM eligible e
-            ON CONFLICT (id) DO NOTHING
+            ON CONFLICT (id) DO UPDATE SET
+                updated_at                   = now(),
+                application_sector_detail_id = COALESCE(EXCLUDED.application_sector_detail_id, public.managing_directors.application_sector_detail_id),
+                application_id               = COALESCE(EXCLUDED.application_id,            public.managing_directors.application_id),
+                name                         = EXCLUDED.name,
+                first_name                   = EXCLUDED.first_name,
+                middle_name                  = COALESCE(EXCLUDED.middle_name,          public.managing_directors.middle_name),
+                last_name                    = COALESCE(EXCLUDED.last_name,            public.managing_directors.last_name),
+                email                        = COALESCE(EXCLUDED.email,               public.managing_directors.email),
+                mobile_no                    = COALESCE(EXCLUDED.mobile_no,           public.managing_directors.mobile_no),
+                country                      = COALESCE(EXCLUDED.country,             public.managing_directors.country),
+                nationality                  = COALESCE(EXCLUDED.nationality,         public.managing_directors.nationality),
+                work_permit                  = COALESCE(EXCLUDED.work_permit,         public.managing_directors.work_permit),
+                work_permit_filename         = COALESCE(EXCLUDED.work_permit_filename,public.managing_directors.work_permit_filename),
+                cpana                        = COALESCE(EXCLUDED.cpana,               public.managing_directors.cpana),
+                cpana_filename               = COALESCE(EXCLUDED.cpana_filename,      public.managing_directors.cpana_filename)
             RETURNING 1
         ),
         stats AS (
             SELECT
                 (SELECT COUNT(*) FROM joined)                                    AS processed_rows,
-                (SELECT COUNT(*) FROM ins)                                       AS inserted_rows,
-                (SELECT COUNT(*) FROM joined WHERE application_sector_detail_id IS NULL) AS skipped_missing_application,
+                (SELECT COUNT(*) FROM ins)                                       AS upserted_rows,
+                (SELECT COUNT(*) FROM joined WHERE application_id IS NULL)       AS skipped_missing_application,
                 (SELECT COUNT(*) FROM joined
-                    WHERE application_sector_detail_id IS NOT NULL AND md_name IS NULL) AS skipped_missing_name,
-                (SELECT COUNT(*) FROM joined j
-                    WHERE j.application_sector_detail_id IS NOT NULL
-                      AND j.md_name IS NOT NULL
-                      AND EXISTS (
-                          SELECT 1 FROM public.managing_directors x
-                          WHERE lower(trim(x.name)) = lower(trim(j.md_name))
-                            AND x.application_sector_detail_id = j.application_sector_detail_id
-                      )
-                )                                                                AS skipped_already_exists,
+                    WHERE application_id IS NOT NULL AND md_name IS NULL)        AS skipped_missing_name,
+                0                                                                AS skipped_already_exists,
                 (SELECT COUNT(*) FROM joined WHERE invalid_workpermit)           AS invalid_workpermit,
                 (SELECT COUNT(*) FROM joined WHERE invalid_cpana)                AS invalid_cpana
         )
         SELECT
             processed_rows,
-            inserted_rows,
-            (processed_rows - inserted_rows) AS skipped_total,
+            upserted_rows,
+            (processed_rows - upserted_rows) AS skipped_total,
             skipped_missing_application,
             skipped_missing_name,
             skipped_already_exists,

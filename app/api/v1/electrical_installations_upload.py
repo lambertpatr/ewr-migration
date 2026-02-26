@@ -7,6 +7,7 @@ from app.utils.file_reader import read_users_file
 from app.services.electrical_installation_import_service import (
     import_electrical_installations_via_staging_copy,
 )
+from app.utils.post_import_hooks import run_post_import_hooks
 
 router = APIRouter(
     prefix="/api/v1/electrical-installations",
@@ -44,6 +45,12 @@ def _run_job(job_id: str, df, source_file_name: str):
             limit_rows=50,
         )
         db.commit()
+
+        # ── Post-import hooks: align schema + backfill created_by ──────
+        _progress("Running post-import hooks (align schema + backfill) …")
+        hooks_result = run_post_import_hooks(db, progress_cb=_progress)
+        result["post_import_hooks"] = hooks_result
+
         _job_status[job_id] = {
             "status": "COMPLETED",
             "completed_at": datetime.utcnow().isoformat(),
@@ -133,6 +140,11 @@ def upload_electrical_installations(
                 limit_rows=limit_rows,
             )
             db.commit()
+
+            # ── Post-import hooks: align schema + backfill created_by ──────
+            hooks_result = run_post_import_hooks(db)
+            result["post_import_hooks"] = hooks_result
+
             return {"status": "SUCCESS", "result": result}
         except Exception as e:
             db.rollback()

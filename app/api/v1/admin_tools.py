@@ -309,14 +309,13 @@ def repair_and_backfill():
             logger.info("repair-missing-users: APPLICANT ROLE id not found from user_roles; role assignment skipped (FDW limitation)")
 
         # 5. Assign APPLICANT ROLE to every inserted user.
-        #    Remote user_roles FDW table only exposes (user_id, role_id).
         roles_assigned = []
         if _admin_role_id:
             for uname in inserted:
                 try:
                     db.execute(text("""
-                        INSERT INTO public.user_roles (user_id, role_id)
-                        SELECT u.id, :role_id
+                        INSERT INTO public.user_roles (user_id, role_id, deleted, created_at)
+                        SELECT u.id, :role_id, false, now()
                         FROM public.users u
                         WHERE lower(trim(u.username)) = :uname
                         AND NOT EXISTS (
@@ -366,7 +365,12 @@ def repair_and_backfill():
             except Exception:
                 pass
 
-        # 7. Full created_by backfill across all 17 tables
+        # 7. Backfill application_id on all child tables first
+        from app.services.application_migrations_service import backfill_application_id_on_child_tables
+        abf = backfill_application_id_on_child_tables(db)
+        logger.info("repair-and-backfill: backfill application_id result: %s", abf)
+
+        # 8. Full created_by backfill across all 17 tables
         bf = backfill_created_by_from_username(db)
         logger.info("repair-and-backfill: backfill result: %s", bf)
 
@@ -376,11 +380,12 @@ def repair_and_backfill():
             "roles_assigned": len(roles_assigned),
             "deduped_certificates": deduped_certs,
             "failed": failed,
+            "backfill_application_id": abf,
             "backfill": bf,
             "message": (
                 f"Inserted {len(inserted)} missing users, assigned {len(roles_assigned)} roles, "
                 f"removed {deduped_certs} duplicate certificate rows, "
-                f"backfilled created_by across 17 tables."
+                f"backfilled application_id + created_by across all child tables."
             )
         }
 
@@ -393,3 +398,206 @@ def repair_and_backfill():
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+
+@router.post('/backfill-application-id', tags=["99 - Backfill created_by"])
+def backfill_application_id():
+    """Propagate application_id to all child tables.
+
+    Fills application_id (and where relevant app_sector_detail_id) on:
+      documents, contact_persons, fire, insurance_cover_details,
+      shareholders, managing_directors, ardhi_information
+
+    Idempotent — only rows with application_id IS NULL are updated.
+    Run this once after migrating existing data, or whenever a new import
+    leaves child-table rows without an application_id.
+    """
+    from app.services.application_migrations_service import (
+        backfill_application_id_on_child_tables,
+        _ensure_child_table_columns,
+    )
+    db = _get_new_session()
+    try:
+        # Ensure columns exist first
+        _ensure_child_table_columns(db)
+        result = backfill_application_id_on_child_tables(db)
+        return {
+            "status": "ok",
+            "backfill_application_id": result,
+            "message": "application_id backfilled on all child tables.",
+        }
+    except Exception as e:
+        logger.exception("backfill-application-id: unexpected error: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+
+
+# ── Phone / email extraction regex (Postgres compatible) ──────────────────────
+# Covers TZ mobile numbers with or without spaces between digit groups:
+#   +255XXXXXXXXX           (international, no spaces)
+#   +255 XXX XX XX XX       (international, spaces in any grouping)
+#   +255 XXX XXX XXX        (international, 3-3-3 grouping)
+#   0[67]XXXXXXXX           (local 10-digit, no spaces)
+#   0[67]XX XXX XXXX        (local 10-digit, with spaces)
+# Pattern: after the prefix (+255 or 0[67]), match 9 digits that may have
+# single spaces interspersed, then assert the digit-count via the structure
+# [0-9][\s]? repeated 9 times — simplest form: [0-9]([\s]?[0-9]){8}
+_PHONE_RE  = r'(\+?255[\s]?[0-9]([\s]?[0-9]){8}|0[67][0-9]([\s]?[0-9]){7})'
+_EMAIL_RE  = r'([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})'
+
+
+@router.post('/clean-name-fields', tags=["01 - Schema Sync"])
+def clean_name_fields(dry_run: bool = True):
+    """Extract phone numbers and emails embedded in *name* columns.
+
+    **custom_details**
+    - `name` often contains the person's name followed by a mobile number, e.g.
+      ``CASTOR MAGARI 0782355391``.
+    - Extracts the phone into ``mobile_no`` (only when ``mobile_no`` is blank).
+
+    **supervisor_details**
+    - `name` often contains comma-separated junk, e.g.
+      ``CLAVERY MABELE,ELECTRICIAL,0754585433,claverymabele1978@gmail.com``.
+    - Extracts phone into ``mobile_no`` (only when blank).
+    - Extracts email into ``email``     (only when blank).
+    - Cleans ``name`` to the first comma-segment (the actual person name).
+
+    Set ``dry_run=false`` to apply changes.
+    """
+    db = _get_new_session()
+    try:
+        # ── preview counts before any change ──────────────────────────────
+        cd_affected = int(db.execute(text(f"""
+            SELECT COUNT(*) FROM public.custom_details
+            WHERE name ~ '{_PHONE_RE}'
+              AND NULLIF(TRIM(COALESCE(mobile_no, '')), '') IS NULL
+        """)).scalar() or 0)
+
+        sd_phone_affected = int(db.execute(text(f"""
+            SELECT COUNT(*) FROM public.supervisor_details
+            WHERE name ~ '{_PHONE_RE}'
+              AND NULLIF(TRIM(COALESCE(mobile_no, '')), '') IS NULL
+        """)).scalar() or 0)
+
+        sd_email_affected = int(db.execute(text(f"""
+            SELECT COUNT(*) FROM public.supervisor_details
+            WHERE name ~ '{_EMAIL_RE}'
+              AND NULLIF(TRIM(COALESCE(email, '')), '') IS NULL
+        """)).scalar() or 0)
+
+        sd_name_affected = int(db.execute(text("""
+            SELECT COUNT(*) FROM public.supervisor_details
+            WHERE name LIKE '%,%' OR name LIKE '%|%'
+        """)).scalar() or 0)
+
+        preview = {
+            "custom_details_phone_to_fill":     cd_affected,
+            "supervisor_details_phone_to_fill":  sd_phone_affected,
+            "supervisor_details_email_to_fill":  sd_email_affected,
+            "supervisor_details_name_to_clean":  sd_name_affected,
+        }
+
+        if dry_run:
+            return {"status": "DRY_RUN", "preview": preview}
+
+        # ── 1. custom_details: extract phone → mobile_no ───────────────────
+        # REGEXP_REPLACE with back-reference extracts the first capture group
+        # as a scalar — avoids the "set-returning not allowed in UPDATE" error
+        # that REGEXP_MATCHES causes.
+        r_cd = db.execute(text(f"""
+            UPDATE public.custom_details
+            SET
+                mobile_no  = COALESCE(
+                                 NULLIF(TRIM(mobile_no), ''),
+                                 -- strip spaces from extracted number (e.g. "+255 715 67 67 70" → "+255715676770")
+                                 NULLIF(REPLACE(TRIM(REGEXP_REPLACE(name,
+                                     '^.*?({_PHONE_RE[1:-1]}).*$', '\\1')), ' ', ''), REPLACE(name, ' ', ''))
+                             ),
+                updated_at = now()
+            WHERE name ~ '{_PHONE_RE}'
+              AND NULLIF(TRIM(COALESCE(mobile_no, '')), '') IS NULL
+        """))
+        cd_updated = r_cd.rowcount or 0
+        db.commit()
+        logger.info("clean-name-fields: custom_details updated=%d", cd_updated)
+
+        # ── 2a. supervisor_details: extract phone → mobile_no (only when blank) ─
+        r_sd_phone = db.execute(text(f"""
+            UPDATE public.supervisor_details
+            SET
+                mobile_no  = NULLIF(REPLACE(TRIM(REGEXP_REPLACE(name,
+                                 '^.*?({_PHONE_RE[1:-1]}).*$', '\\1')), ' ', ''),
+                             REPLACE(name, ' ', '')),
+                updated_at = now()
+            WHERE name ~ '{_PHONE_RE}'
+              AND NULLIF(TRIM(COALESCE(mobile_no, '')), '') IS NULL
+        """))
+        sd_phone_updated = r_sd_phone.rowcount or 0
+        db.commit()
+        logger.info("clean-name-fields: supervisor_details mobile_no filled=%d", sd_phone_updated)
+
+        # ── 2b. supervisor_details: extract email → email (only when blank) ───
+        r_sd_email = db.execute(text(f"""
+            UPDATE public.supervisor_details
+            SET
+                email      = NULLIF(TRIM(REGEXP_REPLACE(name,
+                                 '^.*?({_EMAIL_RE[1:-1]}).*$', '\\1')), name),
+                updated_at = now()
+            WHERE name ~ '{_EMAIL_RE}'
+              AND NULLIF(TRIM(COALESCE(email, '')), '') IS NULL
+        """))
+        sd_email_updated = r_sd_email.rowcount or 0
+        db.commit()
+        logger.info("clean-name-fields: supervisor_details email filled=%d", sd_email_updated)
+
+        # ── 2c. supervisor_details: clean name (always — strip junk separators) ─
+        r_sd_name = db.execute(text("""
+            UPDATE public.supervisor_details
+            SET
+                name       = CASE
+                                 WHEN name LIKE '%|%'
+                                 THEN TRIM(SPLIT_PART(name, '|', 1))
+                                 WHEN name LIKE '%,%'
+                                 THEN TRIM(SPLIT_PART(name, ',', 1))
+                                 ELSE TRIM(name)
+                             END,
+                updated_at = now()
+            WHERE name LIKE '%|%'
+               OR name LIKE '%,%'
+        """))
+        sd_name_updated = r_sd_name.rowcount or 0
+        db.commit()
+        logger.info("clean-name-fields: supervisor_details name cleaned=%d", sd_name_updated)
+
+        sd_updated = max(sd_phone_updated, sd_email_updated, sd_name_updated)
+
+        return {
+            "status": "APPLIED",
+            "preview": preview,
+            "custom_details_updated":              cd_updated,
+            "supervisor_details_phone_filled":     sd_phone_updated,
+            "supervisor_details_email_filled":     sd_email_updated,
+            "supervisor_details_name_cleaned":     sd_name_updated,
+            "message": (
+                f"custom_details: {cd_updated} rows had phone extracted into mobile_no. "
+                f"supervisor_details: {sd_phone_updated} mobile_no filled, "
+                f"{sd_email_updated} email filled, {sd_name_updated} names cleaned. "
+                f"(phone/email only filled where column was blank; name always cleaned of separators)."
+            ),
+        }
+
+    except Exception as e:
+        logger.exception("clean-name-fields: error: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+

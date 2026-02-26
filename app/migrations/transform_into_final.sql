@@ -164,6 +164,139 @@ END $$;
 -- - We only insert documents when file_name is present AND the legacy attachment id (logic_doc_id) is present.
 
 -------------------------------------------------------------------------------
+-- 0-pre-schema) Schema guard: ADD COLUMN IF NOT EXISTS for all child tables
+--
+-- This block runs before any DML so that the transform can run safely on
+-- partially-aligned DBs (e.g. a DB that was created before application_id was
+-- added to documents / contact_persons / fire / insurance_cover_details /
+-- shareholders / managing_directors / ardhi_information).
+-- All ADD COLUMNs are NO-OPs when the column already exists.
+-------------------------------------------------------------------------------
+DO $$
+BEGIN
+    -- documents
+    ALTER TABLE public.documents
+        ADD COLUMN IF NOT EXISTS application_id                 uuid,
+        ADD COLUMN IF NOT EXISTS application_sector_detail_id   uuid,
+        ADD COLUMN IF NOT EXISTS logic_doc_id                   bigint,
+        ADD COLUMN IF NOT EXISTS documents_order                integer;
+
+    -- contact_persons
+    ALTER TABLE public.contact_persons
+        ADD COLUMN IF NOT EXISTS application_id                 uuid,
+        ADD COLUMN IF NOT EXISTS app_sector_detail_id           uuid;
+
+    -- fire
+    ALTER TABLE public.fire
+        ADD COLUMN IF NOT EXISTS application_id                 uuid,
+        ADD COLUMN IF NOT EXISTS application_sector_detail_id   uuid;
+
+    -- insurance_cover_details
+    ALTER TABLE public.insurance_cover_details
+        ADD COLUMN IF NOT EXISTS application_id                 uuid,
+        ADD COLUMN IF NOT EXISTS application_sector_detail_id   uuid;
+
+    -- shareholders (best-effort — table may not exist yet)
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'shareholders') THEN
+        EXECUTE 'ALTER TABLE public.shareholders
+                 ADD COLUMN IF NOT EXISTS application_id               uuid,
+                 ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid';
+    END IF;
+
+    -- managing_directors (best-effort)
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'managing_directors') THEN
+        EXECUTE 'ALTER TABLE public.managing_directors
+                 ADD COLUMN IF NOT EXISTS application_id               uuid,
+                 ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid';
+    END IF;
+
+    -- ardhi_information (best-effort)
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'ardhi_information') THEN
+        EXECUTE 'ALTER TABLE public.ardhi_information
+                 ADD COLUMN IF NOT EXISTS application_id               uuid,
+                 ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid';
+    END IF;
+
+    -- ── Electrical installation child tables (best-effort) ──────────────
+
+    -- application_electrical_installation
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'application_electrical_installation') THEN
+        EXECUTE 'ALTER TABLE public.application_electrical_installation
+                 ADD COLUMN IF NOT EXISTS application_id uuid';
+    END IF;
+
+    -- personal_details
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'personal_details') THEN
+        EXECUTE 'ALTER TABLE public.personal_details
+                 ADD COLUMN IF NOT EXISTS application_id                        uuid,
+                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid';
+    END IF;
+
+    -- contact_details
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'contact_details') THEN
+        EXECUTE 'ALTER TABLE public.contact_details
+                 ADD COLUMN IF NOT EXISTS application_id                        uuid,
+                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid';
+    END IF;
+
+    -- attachments
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'attachments') THEN
+        EXECUTE 'ALTER TABLE public.attachments
+                 ADD COLUMN IF NOT EXISTS application_id                        uuid,
+                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid';
+    END IF;
+
+    -- work_experience
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'work_experience') THEN
+        EXECUTE 'ALTER TABLE public.work_experience
+                 ADD COLUMN IF NOT EXISTS application_id                        uuid,
+                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid';
+    END IF;
+
+    -- self_employed
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'self_employed') THEN
+        EXECUTE 'ALTER TABLE public.self_employed
+                 ADD COLUMN IF NOT EXISTS application_id                        uuid,
+                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid';
+    END IF;
+
+    -- supervisor_details
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'supervisor_details') THEN
+        EXECUTE 'ALTER TABLE public.supervisor_details
+                 ADD COLUMN IF NOT EXISTS application_id                        uuid,
+                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid';
+    END IF;
+
+    -- costumer_details
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'costumer_details') THEN
+        EXECUTE 'ALTER TABLE public.costumer_details
+                 ADD COLUMN IF NOT EXISTS application_id                        uuid,
+                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid';
+    END IF;
+
+    -- certificate_verifications
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'certificate_verifications') THEN
+        EXECUTE 'ALTER TABLE public.certificate_verifications
+                 ADD COLUMN IF NOT EXISTS application_id                        uuid,
+                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid';
+    END IF;
+
+    RAISE NOTICE '[staging-transform] schema guard: all child table columns ensured';
+END $$;
+
+-------------------------------------------------------------------------------
 -- 0) Pre-flight: Ensure mandatory categories exist
 --
 -- The transformation relies on joining categories by name.
@@ -316,170 +449,111 @@ END $$;
 
 -------------------------------------------------------------------------------
 -- 1) applications
+-- zone_id is resolved via napa_regions → zones when both tables exist.
+-- On dev DBs that lack these tables, zone_id is inserted as NULL (safe fallback).
 -------------------------------------------------------------------------------
 DO $$
 DECLARE
     v_apps_inserted bigint;
+    v_zone_expr     text;
+    v_sql           text;
 BEGIN
-    INSERT INTO public.applications (
-        id,
-        created_at,
-        created_by,
-        deleted_at,
-        deleted_by,
-        updated_at,
-        updated_by,
+    -- Determine zone_id expression based on whether lookup tables exist.
+    IF (SELECT COUNT(*) FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relname IN ('napa_regions', 'zones')) = 2
+    THEN
+        v_zone_expr :=
+            '(SELECT z.id FROM public.napa_regions nr'
+            ' JOIN public.zones z ON z.id = nr.zone_id'
+            ' WHERE lower(trim(nr.name)) = lower(trim(s.region))'
+            ' AND nr.zone_id IS NOT NULL LIMIT 1)';
+    ELSE
+        v_zone_expr := 'NULL::uuid';
+    END IF;
 
-        effective_date,
-        expire_date,
-        completed_at,
+    v_sql :=
+        'INSERT INTO public.applications ('
+        '    id, created_at, created_by, deleted_at, deleted_by, updated_at, updated_by,'
+        '    effective_date, expire_date, completed_at,'
+        '    application_number, application_type,'
+        '    approval_no, status, username, is_from_lois,'
+        '    approval_date, category_id, certificate_id, current_step_id,'
+        '    intimate_date, months_eligible, workflow_id, zone_id,'
+        '    responsible_role_names, licence_path, license_type, category_license_type,'
+        '    zone_name, payer_code, current_step_name, pending_actions,'
+        '    old_parent_application_id'
+        ') SELECT'
+        '    s.generated_id,'
+        '    now(),'
+        '    CASE WHEN NULLIF(trim(s.old_created_by), '''') ~* ''^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'''
+        '         THEN NULLIF(trim(s.old_created_by), '''')::uuid ELSE NULL END,'
+        '    NULL::timestamp, NULL::uuid, NULL::timestamp, NULL::uuid,'
+        '    CASE WHEN NULLIF(NULLIF(trim(s.effective_date),''''),''\N'') IS NOT NULL'
+        '         THEN NULLIF(NULLIF(trim(s.effective_date),''''),''\N'')::timestamp::date END,'
+        '    CASE WHEN NULLIF(NULLIF(trim(s.expire_date),''''),''\N'') IS NOT NULL'
+        '         THEN NULLIF(NULLIF(trim(s.expire_date),''''),''\N'')::timestamp::date END,'
+        '    CASE WHEN NULLIF(NULLIF(trim(s.completed_at),''''),''\N'') IS NOT NULL'
+        '         THEN NULLIF(NULLIF(trim(s.completed_at),''''),''\N'')::timestamp END,'
+        '    NULLIF(s.application_number, ''''),'
+        '    CASE UPPER(TRIM(s.application_type))'
+        '        WHEN ''EXTENSION''   THEN ''EXTEND'''
+        '        WHEN ''RENEWAL''     THEN ''RENEW'''
+        '        WHEN ''CHANGE_NAME'' THEN ''CHANGE_OF_NAME'''
+        '        WHEN ''CHANGES''     THEN ''CHANGE_OF_NAME'''
+        '        ELSE NULLIF(UPPER(TRIM(s.application_type)), '''')'
+        '    END,'
+        '    NULLIF(trim(s.approval_no), ''''),'
+        '    ''APPROVED'','
+        '    lower(NULLIF(trim(s.username), '''')),'
+        '    true,'
+        '    NULL::date, cat.id, NULL::uuid, NULL::uuid,'
+        '    NULL::date, NULL::integer, NULL::uuid,'
+        '    ' || v_zone_expr || ','
+        '    NULL::text, NULL::text,'
+        '    CASE'
+        '        WHEN TRIM(sec.name) = ''PETROLEUM'' AND cat.category_type = ''Construction'' THEN ''CONSTRUCTION_PETROLEUM'''
+        '        WHEN TRIM(sec.name) = ''PETROLEUM'' AND cat.category_type = ''License''      THEN ''LICENSE_PETROLEUM'''
+        '        WHEN TRIM(sec.name) = ''NATURAL_GAS'' AND cat.category_type = ''Construction'' THEN ''CONSTRUCTION_NATURAL_GAS'''
+        '        WHEN TRIM(sec.name) = ''NATURAL_GAS'' AND cat.category_type = ''License''    THEN ''LICENSE_NATURAL_GAS'''
+        '        WHEN TRIM(sec.name) = ''WATER_SUPPLY''                                       THEN ''LICENSE_WATER'''
+        '        WHEN TRIM(sec.name) = ''ELECTRICITY''                                        THEN ''LICENSE_ELECTRICITY_SUPPLY'''
+        '        ELSE NULL'
+        '    END,'
+        '    ''OPERATIONAL'','
+        '    NULL::text, NULL::text, NULL::text, NULL::text,'
+        '    NULLIF(trim(s.old_parent_application_id), '''')'
+        ' FROM ('
+        '    SELECT s.*, row_number() OVER ('
+        '        PARTITION BY COALESCE(NULLIF(s.application_number,''''), s.generated_id::text)'
+        '        ORDER BY s.source_row_no NULLS LAST, s.generated_id'
+        '    ) AS rn'
+        '    FROM public.stage_ca_applications_raw s'
+        ' ) s'
+        ' LEFT JOIN public.categories cat ON LOWER(TRIM(cat.name)) = LOWER(TRIM(s.license_type))'
+        ' LEFT JOIN public.sectors     sec ON sec.id = cat.sector_id'
+        ' WHERE s.rn = 1 AND NULLIF(trim(s.application_number), '''') IS NOT NULL'
+        ' ON CONFLICT (application_number) DO UPDATE SET'
+        '    effective_date   = COALESCE(EXCLUDED.effective_date,   public.applications.effective_date),'
+        '    expire_date      = COALESCE(EXCLUDED.expire_date,      public.applications.expire_date),'
+        '    completed_at     = COALESCE(EXCLUDED.completed_at,     public.applications.completed_at),'
+        '    approval_no      = COALESCE(EXCLUDED.approval_no,      public.applications.approval_no),'
+        '    application_type = COALESCE(EXCLUDED.application_type, public.applications.application_type),'
+        '    status           = COALESCE(EXCLUDED.status,           public.applications.status),'
+        '    username         = COALESCE(EXCLUDED.username,         public.applications.username),'
+        '    is_from_lois     = true,'
+        '    license_type     = COALESCE(EXCLUDED.license_type,     public.applications.license_type),'
+        '    category_id      = COALESCE(EXCLUDED.category_id,      public.applications.category_id),'
+        '    zone_id          = COALESCE(EXCLUDED.zone_id,          public.applications.zone_id),'
+        '    zone_name        = COALESCE(EXCLUDED.zone_name,        public.applications.zone_name),'
+        '    old_parent_application_id = COALESCE(EXCLUDED.old_parent_application_id, public.applications.old_parent_application_id),'
+        '    updated_at       = now()';
 
-        application_number,
-        application_type,
-
-        approval_no,
-        status,
-
-    username,
-
-    is_from_lois,
-
-        -- Other columns in applications table (set NULL for now unless you stage them)
-        approval_date,
-        category_id,
-        certificate_id,
-        current_step_id,
-        intimate_date,
-        months_eligible,
-        workflow_id,
-        zone_id,
-        responsible_role_names,
-        licence_path,
-        license_type,
-        category_license_type,
-        zone_name,
-        payer_code,
-        current_step_name,
-        pending_actions,
-        old_parent_application_id
-    )
-    SELECT
-        s.generated_id AS id,
-        now() AS created_at,
-        CASE
-            WHEN NULLIF(trim(s.old_created_by), '') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-                THEN NULLIF(trim(s.old_created_by), '')::uuid
-            ELSE NULL
-        END AS created_by,
-        NULL::timestamp AS deleted_at,
-        NULL::uuid AS deleted_by,
-        NULL::timestamp AS updated_at,
-        NULL::uuid AS updated_by,
-
-    CASE WHEN NULLIF(NULLIF(trim(s.effective_date), ''), '\N') IS NOT NULL
-         THEN NULLIF(NULLIF(trim(s.effective_date), ''), '\N')::timestamp::date
-         ELSE NULL END AS effective_date,
-    CASE WHEN NULLIF(NULLIF(trim(s.expire_date), ''), '\N') IS NOT NULL
-         THEN NULLIF(NULLIF(trim(s.expire_date), ''), '\N')::timestamp::date
-         ELSE NULL END AS expire_date,
-    CASE WHEN NULLIF(NULLIF(trim(s.completed_at), ''), '\N') IS NOT NULL
-         THEN NULLIF(NULLIF(trim(s.completed_at), ''), '\N')::timestamp
-         ELSE NULL END AS completed_at,
-
-        NULLIF(s.application_number, '') AS application_number,
-        NULLIF(upper(s.application_type), '') AS application_type,
-
-        NULLIF(trim(s.approval_no), '') AS approval_no,
-    'APPROVED'::text AS status,
-
-    lower(NULLIF(trim(s.username), '')) AS username,
-
-    true AS is_from_lois,
-
-        NULL::date AS approval_date,
-        cat.id AS category_id,
-        NULL::uuid AS certificate_id,
-        NULL::uuid AS current_step_id,
-        NULL::date AS intimate_date,
-        NULL::integer AS months_eligible,
-        NULL::uuid AS workflow_id,
-        NULL::uuid AS zone_id,
-        NULL::text AS responsible_role_names,
-        NULL::text AS licence_path,
-        -- Derive license_type from the sector the category belongs to + the category_type.
-        -- sectors.name in DB: 'PETROLEUM', 'NATURAL_GAS', 'ELECTRICITY', 'WATER_SUPPLY'
-        -- categories.category_type in DB: 'Construction' or 'License'
-        -- The categories JOIN below resolves the raw Excel category name -> category row,
-        -- then the sectors JOIN follows sector_id -> sector name, giving us both inputs.
-        CASE
-            -- ── PETROLEUM ────────────────────────────────────────────────────
-            WHEN TRIM(sec.name) = 'PETROLEUM' AND cat.category_type = 'Construction'
-                THEN 'CONSTRUCTION_PETROLEUM'
-            WHEN TRIM(sec.name) = 'PETROLEUM' AND cat.category_type = 'License'
-                THEN 'LICENSE_PETROLEUM'
-            -- ── NATURAL GAS ──────────────────────────────────────────────────
-            WHEN TRIM(sec.name) = 'NATURAL_GAS' AND cat.category_type = 'Construction'
-                THEN 'CONSTRUCTION_NATURAL_GAS'
-            WHEN TRIM(sec.name) = 'NATURAL_GAS' AND cat.category_type = 'License'
-                THEN 'LICENSE_NATURAL_GAS'
-            -- ── WATER SUPPLY ─────────────────────────────────────────────────
-            WHEN TRIM(sec.name) = 'WATER_SUPPLY'
-                THEN 'LICENSE_WATER'
-            -- ── ELECTRICITY ──────────────────────────────────────────────────
-            -- Electricity sector only has License categories (LICENSE_ELECTRICITY_SUPPLY).
-            -- LICENSE_ELECTRICITY_INSTALLATION is handled exclusively by its own
-            -- dedicated service (electrical_installation_import_service.py) and is
-            -- never derived here.
-            WHEN TRIM(sec.name) = 'ELECTRICITY'
-                THEN 'LICENSE_ELECTRICITY_SUPPLY'
-            -- ── fallback ─────────────────────────────────────────────────────
-            ELSE NULL
-        END AS license_type,
-        'OPERATIONAL'::text AS category_license_type,
-        NULL::text AS zone_name,
-        NULL::text AS payer_code,
-        NULL::text AS current_step_name,
-        NULL::text AS pending_actions,
-        -- parent application reference from LOIS (stored as raw text, not a FK)
-        NULLIF(trim(s.old_parent_application_id), '') AS old_parent_application_id
-    FROM (
-        -- Dedupe inside this load by application_number first.
-        -- This is REQUIRED when using ON CONFLICT(application_number) DO UPDATE;
-        -- same application_number in the staging table must only produce one row.
-        SELECT s.*,
-               row_number() OVER (
-                   PARTITION BY COALESCE(
-                       NULLIF(s.application_number, ''),
-                       s.generated_id::text
-                   )
-                   ORDER BY s.source_row_no NULLS LAST, s.generated_id
-               ) AS rn
-        FROM public.stage_ca_applications_raw s
-    ) s
-    LEFT JOIN public.categories cat ON LOWER(TRIM(cat.name)) = LOWER(TRIM(s.license_type))
-    LEFT JOIN public.sectors     sec ON sec.id = cat.sector_id
-    WHERE s.rn = 1
-      AND NULLIF(trim(s.application_number), '') IS NOT NULL
-        ON CONFLICT (application_number) DO UPDATE
-        SET
-            effective_date   = COALESCE(EXCLUDED.effective_date,   public.applications.effective_date),
-            expire_date      = COALESCE(EXCLUDED.expire_date,      public.applications.expire_date),
-            completed_at     = COALESCE(EXCLUDED.completed_at,     public.applications.completed_at),
-            approval_no      = COALESCE(EXCLUDED.approval_no,      public.applications.approval_no),
-            application_type = COALESCE(EXCLUDED.application_type, public.applications.application_type),
-            status           = COALESCE(EXCLUDED.status,           public.applications.status),
-            username         = COALESCE(EXCLUDED.username,         public.applications.username),
-            is_from_lois     = true,
-            license_type     = COALESCE(EXCLUDED.license_type,     public.applications.license_type),
-            category_id      = COALESCE(EXCLUDED.category_id,      public.applications.category_id),
-            zone_id          = COALESCE(EXCLUDED.zone_id,          public.applications.zone_id),
-            zone_name        = COALESCE(EXCLUDED.zone_name,        public.applications.zone_name),
-            old_parent_application_id = COALESCE(EXCLUDED.old_parent_application_id, public.applications.old_parent_application_id),
-            updated_at       = now();
-
+    EXECUTE v_sql;
     GET DIAGNOSTICS v_apps_inserted = ROW_COUNT;
     RAISE NOTICE '[staging-transform] inserted apps=%', v_apps_inserted;
 END $$;
+
 
 
 -------------------------------------------------------------------------------
@@ -533,7 +607,16 @@ BEGIN
         a.application_number,
         a.approval_no,
         -- application_certificate_type from staged application_type (NEW/RENEW/UPGRADE etc.)
-        COALESCE(NULLIF(UPPER(TRIM(s.application_type)), ''), 'NEW') AS application_certificate_type,
+        COALESCE(
+            CASE UPPER(TRIM(s.application_type))
+                WHEN 'EXTENSION'   THEN 'EXTEND'
+                WHEN 'RENEWAL'     THEN 'RENEW'
+                WHEN 'CHANGE_NAME' THEN 'CHANGE_OF_NAME'
+                WHEN 'CHANGES'     THEN 'CHANGE_OF_NAME'
+                ELSE NULLIF(UPPER(TRIM(s.application_type)), '')
+            END,
+            'NEW'
+        ) AS application_certificate_type,
         a.effective_date,
         a.expire_date,
         a.intimate_date,
@@ -706,6 +789,7 @@ BEGIN
         deleted_by,
         updated_at,
         updated_by,
+        application_id,
         application_sector_detail_id,
         document_url,
         file_name,
@@ -720,6 +804,7 @@ BEGIN
         NULL::uuid AS deleted_by,
         now() AS updated_at,
         NULL::uuid AS updated_by,
+        asd.application_id,
         asd.id AS application_sector_detail_id,
         NULL::text AS document_url,
         NULLIF(trim(d.file_name), '') AS file_name,
@@ -730,7 +815,9 @@ BEGIN
         ON asd.id = d.application_generated_id
     WHERE NULLIF(trim(d.file_name), '') IS NOT NULL
       AND d.logic_doc_id IS NOT NULL
-    ON CONFLICT (id) DO NOTHING;
+    ON CONFLICT (id) DO UPDATE SET
+        application_id = COALESCE(EXCLUDED.application_id, public.documents.application_id),
+        updated_at = now();
 
     GET DIAGNOSTICS v_docs_inserted = ROW_COUNT;
     RAISE NOTICE '[staging-transform] inserted documents=%', v_docs_inserted;
@@ -752,6 +839,7 @@ BEGIN
         deleted_by,
         updated_at,
         updated_by,
+        application_id,
         app_sector_detail_id,
         contact_name,
         email,
@@ -766,6 +854,7 @@ BEGIN
         NULL::uuid AS deleted_by,
         now() AS updated_at,
         NULL::uuid AS updated_by,
+        asd.application_id,
         asd.id AS app_sector_detail_id,
         NULLIF(trim(c.contact_name), '') AS contact_name,
         NULLIF(trim(c.email), '') AS email,
@@ -811,6 +900,7 @@ BEGIN
         id,
         created_at,
         updated_at,
+        application_id,
         application_sector_detail_id,
         fire_certificate_control_number,
         premise_name,
@@ -826,6 +916,7 @@ BEGIN
         gen_random_uuid() AS id,
         now() AS created_at,
         now() AS updated_at,
+        asd.application_id,
         asd.id AS application_sector_detail_id,
         NULLIF(trim(s.fire_certificate_control_number), '') AS fire_certificate_control_number,
         NULLIF(trim(s.fire_premise_name), '') AS premise_name,
@@ -873,6 +964,7 @@ BEGIN
         id,
         created_at,
         updated_at,
+        application_id,
         application_sector_detail_id,
         cover_note_number,
         cover_note_ref_no,
@@ -888,6 +980,7 @@ BEGIN
         gen_random_uuid() AS id,
         now() AS created_at,
         now() AS updated_at,
+        asd.application_id,
         asd.id AS application_sector_detail_id,
         NULLIF(trim(s.cover_note_number), '') AS cover_note_number,
         NULLIF(trim(s.cover_note_ref_no), '') AS cover_note_ref_no,
@@ -920,4 +1013,246 @@ BEGIN
 
     GET DIAGNOSTICS v_ins_inserted = ROW_COUNT;
     RAISE NOTICE '[staging-transform] inserted insurance_cover_details=%', v_ins_inserted;
+END $$;
+
+
+-------------------------------------------------------------------------------
+-- 7) Backfill application_id on ALL child tables via application_sector_details
+--
+-- For any existing rows where application_id IS NULL but
+-- application_sector_detail_id is set, resolve through asd.application_id.
+-- This covers both newly imported and pre-existing historical rows.
+-- Idempotent: only updates where application_id IS NULL.
+-------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_docs_bf      bigint := 0;
+    v_contacts_bf  bigint := 0;
+    v_fire_bf      bigint := 0;
+    v_insurance_bf bigint := 0;
+    v_shareholders_bf  bigint := 0;
+    v_directors_bf     bigint := 0;
+    v_ardhi_bf         bigint := 0;
+BEGIN
+    -- documents
+    UPDATE public.documents d
+    SET    application_id = asd.application_id
+    FROM   public.application_sector_details asd
+    WHERE  d.application_sector_detail_id = asd.id
+      AND  d.application_id IS NULL
+      AND  asd.application_id IS NOT NULL;
+    GET DIAGNOSTICS v_docs_bf = ROW_COUNT;
+
+    -- contact_persons (uses app_sector_detail_id)
+    UPDATE public.contact_persons cp
+    SET    application_id = asd.application_id
+    FROM   public.application_sector_details asd
+    WHERE  cp.app_sector_detail_id = asd.id
+      AND  cp.application_id IS NULL
+      AND  asd.application_id IS NOT NULL;
+    GET DIAGNOSTICS v_contacts_bf = ROW_COUNT;
+
+    -- fire
+    UPDATE public.fire f
+    SET    application_id = asd.application_id
+    FROM   public.application_sector_details asd
+    WHERE  f.application_sector_detail_id = asd.id
+      AND  f.application_id IS NULL
+      AND  asd.application_id IS NOT NULL;
+    GET DIAGNOSTICS v_fire_bf = ROW_COUNT;
+
+    -- insurance_cover_details
+    UPDATE public.insurance_cover_details icd
+    SET    application_id = asd.application_id
+    FROM   public.application_sector_details asd
+    WHERE  icd.application_sector_detail_id = asd.id
+      AND  icd.application_id IS NULL
+      AND  asd.application_id IS NOT NULL;
+    GET DIAGNOSTICS v_insurance_bf = ROW_COUNT;
+
+    -- shareholders (skip if table doesn't exist yet)
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'shareholders') THEN
+        UPDATE public.shareholders s
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  s.application_sector_detail_id = asd.id
+          AND  s.application_id IS NULL
+          AND  asd.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_shareholders_bf = ROW_COUNT;
+    END IF;
+
+    -- managing_directors (skip if table doesn't exist yet)
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'managing_directors') THEN
+        UPDATE public.managing_directors md
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  md.application_sector_detail_id = asd.id
+          AND  md.application_id IS NULL
+          AND  asd.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_directors_bf = ROW_COUNT;
+    END IF;
+
+    -- ardhi_information (skip if table doesn't exist yet)
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'ardhi_information') THEN
+        UPDATE public.ardhi_information ai
+        SET    application_id = asd.application_id
+        FROM   public.application_sector_details asd
+        WHERE  ai.application_sector_detail_id = asd.id
+          AND  ai.application_id IS NULL
+          AND  asd.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_ardhi_bf = ROW_COUNT;
+    END IF;
+
+    RAISE NOTICE '[staging-transform] backfill application_id: documents=%, contact_persons=%, fire=%, insurance=%, shareholders=%, managing_directors=%, ardhi=%',
+        v_docs_bf, v_contacts_bf, v_fire_bf, v_insurance_bf, v_shareholders_bf, v_directors_bf, v_ardhi_bf;
+END $$;
+
+-------------------------------------------------------------------------------
+-- 7b) Backfill application_id on electrical installation child tables
+--     via application_electrical_installation → application_id
+--
+-- SKIPPED when this transform is invoked from the applications-migration
+-- endpoint (PETROLEUM, NATURAL_GAS, ELECTRICITY, WATER_SUPPLY).
+-- For those sectors the data path is:
+--   applications → certificates → application_sector_details → (fire / insurance / documents …)
+-- The electrical installation pipeline (electrical_installations_upload) is
+-- completely separate and sets application_id itself — do NOT touch those
+-- tables here to avoid cross-contamination and the "column does not exist" error.
+-------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_sector        text := current_setting('migration.sector_name', true);
+    v_aei_bf        bigint := 0;
+    v_pd_bf         bigint := 0;
+    v_cd_bf         bigint := 0;
+    v_att_bf        bigint := 0;
+    v_we_bf         bigint := 0;
+    v_se_bf         bigint := 0;
+    v_sd_bf         bigint := 0;
+    v_cud_bf        bigint := 0;
+    v_cv_bf         bigint := 0;
+BEGIN
+    -- Skip entirely when called from the applications-migration upload.
+    -- All four sector uploads (PETROLEUM, NATURAL_GAS, ELECTRICITY, WATER_SUPPLY)
+    -- set migration.sector_name; if the variable is set, this is NOT the
+    -- electrical-installations pipeline, so leave those tables alone.
+    IF v_sector IS NOT NULL AND v_sector != '' THEN
+        RAISE NOTICE '[staging-transform] block 7b skipped — sector=% uses applications→certificates path, not electrical_installation',
+            v_sector;
+        RETURN;
+    END IF;
+
+    -- application_electrical_installation: fill via applications.application_number
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'application_electrical_installation') THEN
+        UPDATE public.application_electrical_installation aei
+        SET    application_id = a.id
+        FROM   public.applications a
+        WHERE  a.application_number = aei.application_number
+          AND  aei.application_id IS NULL
+          AND  a.id IS NOT NULL;
+        GET DIAGNOSTICS v_aei_bf = ROW_COUNT;
+    END IF;
+
+    -- personal_details
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'personal_details') THEN
+        UPDATE public.personal_details pd
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  pd.application_electrical_installation_id = aei.id
+          AND  pd.application_id IS NULL
+          AND  aei.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_pd_bf = ROW_COUNT;
+    END IF;
+
+    -- contact_details
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'contact_details') THEN
+        UPDATE public.contact_details cd
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  cd.application_electrical_installation_id = aei.id
+          AND  cd.application_id IS NULL
+          AND  aei.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_cd_bf = ROW_COUNT;
+    END IF;
+
+    -- attachments
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'attachments') THEN
+        UPDATE public.attachments att
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  att.application_electrical_installation_id = aei.id
+          AND  att.application_id IS NULL
+          AND  aei.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_att_bf = ROW_COUNT;
+    END IF;
+
+    -- work_experience
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'work_experience') THEN
+        UPDATE public.work_experience we
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  we.application_electrical_installation_id = aei.id
+          AND  we.application_id IS NULL
+          AND  aei.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_we_bf = ROW_COUNT;
+    END IF;
+
+    -- self_employed
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'self_employed') THEN
+        UPDATE public.self_employed se
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  se.application_electrical_installation_id = aei.id
+          AND  se.application_id IS NULL
+          AND  aei.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_se_bf = ROW_COUNT;
+    END IF;
+
+    -- supervisor_details
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'supervisor_details') THEN
+        UPDATE public.supervisor_details sd
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  sd.application_electrical_installation_id = aei.id
+          AND  sd.application_id IS NULL
+          AND  aei.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_sd_bf = ROW_COUNT;
+    END IF;
+
+    -- costumer_details
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'costumer_details') THEN
+        UPDATE public.costumer_details cud
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  cud.application_electrical_installation_id = aei.id
+          AND  cud.application_id IS NULL
+          AND  aei.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_cud_bf = ROW_COUNT;
+    END IF;
+
+    -- certificate_verifications
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'certificate_verifications') THEN
+        UPDATE public.certificate_verifications cv
+        SET    application_id = aei.application_id
+        FROM   public.application_electrical_installation aei
+        WHERE  cv.application_electrical_installation_id = aei.id
+          AND  cv.application_id IS NULL
+          AND  aei.application_id IS NOT NULL;
+        GET DIAGNOSTICS v_cv_bf = ROW_COUNT;
+    END IF;
+
+    RAISE NOTICE '[staging-transform] backfill application_id (elec): aei=%, personal_details=%, contact_details=%, attachments=%, work_experience=%, self_employed=%, supervisor_details=%, costumer_details=%, certificate_verifications=%',
+        v_aei_bf, v_pd_bf, v_cd_bf, v_att_bf, v_we_bf, v_se_bf, v_sd_bf, v_cud_bf, v_cv_bf;
 END $$;
