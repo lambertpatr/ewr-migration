@@ -426,7 +426,13 @@ def import_license_categories_and_fees_via_staging_copy(
                         ELSE NULL
                     END AS thereof_price,
 
-                    NULLIF(btrim(s.capacity_unit), '') AS capacity_unit,
+                    -- capacity_unit: only store values allowed by the DB check constraint.
+                    -- Anything else (NULL, '', 'NONE', unknown) → NULL.
+                    CASE
+                        WHEN upper(btrim(COALESCE(s.capacity_unit, ''))) IN ('MW', 'KV')
+                            THEN upper(btrim(s.capacity_unit))
+                        ELSE NULL
+                    END AS capacity_unit,
 
                     -- voltage_level: accept valid values from Excel; default to 'HV' for ELECTRICITY.
                     CASE
