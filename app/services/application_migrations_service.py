@@ -329,6 +329,7 @@ def _build_default_mappings():
       approval_no                 -> approval_no
       effective_date              -> effective_date    (ISO date)
       expire_date                 -> expire_date       (ISO date)
+      approval_date               -> completed_at      (alias for completed_at)
       completed_at                -> completed_at
       license_type                -> license_type
       license_category_id         -> license_category_raw (staging)
@@ -412,6 +413,7 @@ def _build_default_mappings():
         'end_date':                        'expire_date',
         'enddate':                         'expire_date',
         'completed_at':                    'completed_at',
+        'approval_date':                   'completed_at',
         'license_type':                    'license_type',
         'license_category_id':             'license_category_id',
         'application_legal_status_id':     'application_legal_status_id',
@@ -628,6 +630,7 @@ def _build_stage_mappings():
         'end_date':                        'expire_date',
         'enddate':                         'expire_date',
         'completed_at':                    'completed_at',
+        'approval_date':                   'completed_at',
         'license_type':                    'license_type',
         'license_category_id':             'license_category_raw',        # raw text -> resolved in transform
         'application_legal_status_id':     'application_legal_status_raw', # raw text -> resolved in transform
@@ -677,6 +680,7 @@ def _ensure_child_table_columns(db: Any) -> None:
         ("applications",
          """ALTER TABLE public.applications
                 ADD COLUMN IF NOT EXISTS completed_at          timestamp         NULL,
+                ADD COLUMN IF NOT EXISTS approval_date         timestamp         NULL,
                 ADD COLUMN IF NOT EXISTS old_parent_application_id text          NULL,
                 ADD COLUMN IF NOT EXISTS is_from_lois          boolean           NOT NULL DEFAULT false,
                 ADD COLUMN IF NOT EXISTS certificate_id        uuid              NULL"""),
@@ -1101,7 +1105,7 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                                             mapping_stats['license_category_unmapped_samples'].add(sval)
                         
                         # Fix Excel serial dates for date columns
-                        if app_col in ('effective_date', 'expire_date', 'completed_at') and val not in (None, ''):
+                        if app_col in ('effective_date', 'expire_date', 'completed_at', 'approval_date') and val not in (None, ''):
                             val = _convert_excel_date(val)
 
                         app_row[app_col] = val

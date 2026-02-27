@@ -1522,47 +1522,7 @@ def import_electrical_installation_via_staging_copy(
 
     _progress("done")
 
-    # ── Auto backfill created_by from username ─────────────────────────
-    # Now that users exist and applications are inserted, fill created_by
-    # on all child tables using username → users.id matching.
-    _progress("backfill:created_by:start")
-    _backfill_counts: dict = {}
-    _backfill_tables = [
-        ("public.applications",                       "application_id", "id"),
-        ("public.certificates",                       "application_id", None),
-        ("public.application_electrical_installation","application_id", None),
-        ("public.contact_details",                    "application_id", None),
-        ("public.personal_details",                   "application_id", None),
-        ("public.attachments",                        "application_id", None),
-        ("public.work_experience",                    "application_id", None),
-        ("public.self_employed",                      "application_id", None),
-        ("public.supervisor_details",                 "application_id", None),
-        ("public.costumer_details",                   "application_id", None),
-        ("public.certificate_verifications",          "application_id", None),
-    ]
-    for _tbl, _fk, _self_join in _backfill_tables:
-        try:
-            _r = db.execute(text(f"""
-                UPDATE {_tbl} t
-                SET created_by = u.id, updated_at = now()
-                FROM public.applications a
-                JOIN public.users u
-                  ON lower(trim(u.username)) = lower(trim(a.username))
-                WHERE {"t.id = a.id" if _self_join else f"t.{_fk} = a.id"}
-                  AND a.username IS NOT NULL
-                  AND trim(a.username) <> ''
-                  AND t.created_by IS NULL
-            """))
-            _backfill_counts[_tbl] = _r.rowcount or 0
-        except Exception as _be:
-            logger.warning("backfill created_by skipped for %s: %s", _tbl, _be)
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            _backfill_counts[_tbl] = -1
-    db.commit()
-    _progress("backfill:created_by:done")
+    # ...existing code...
 
     return {
         "total_rows_in_file": total_rows,

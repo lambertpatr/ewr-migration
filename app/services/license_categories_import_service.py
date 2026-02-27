@@ -429,8 +429,8 @@ def import_license_categories_and_fees_via_staging_copy(
                     -- capacity_unit: only store values allowed by the DB check constraint.
                     -- Anything else (NULL, '', 'NONE', unknown) → NULL.
                     CASE
-                        WHEN upper(btrim(COALESCE(s.capacity_unit, ''))) IN ('MW', 'KV')
-                            THEN upper(btrim(s.capacity_unit))
+                        WHEN upper(btrim(COALESCE(s.capacity_unit, ''))) = 'MW' THEN 'MW'
+                        WHEN upper(btrim(COALESCE(s.capacity_unit, ''))) = 'KV' THEN 'kV'
                         ELSE NULL
                     END AS capacity_unit,
 

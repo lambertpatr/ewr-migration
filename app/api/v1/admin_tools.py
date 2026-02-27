@@ -601,3 +601,93 @@ def clean_name_fields(dry_run: bool = True):
     finally:
         db.close()
 
+
+@router.post("/fix-certificates", tags=["01 - Schema Sync"])
+def fix_certificates():
+    """Post-upload certificate maintenance. Run this after all application uploads are done.
+
+    Performs three operations in sequence:
+
+    1️⃣  **intimate_date backfill** — For all applications whose category has
+        ``category_type = 'License'`` and whose ``intimate_date`` is currently
+        NULL, set ``intimate_date = expire_date - 6 months``.
+
+    2️⃣  **De-duplicate certificates** — Where the same ``approval_no`` appears
+        more than once in the ``certificates`` table, delete all but the one
+        with the most recent ``expire_date`` (ties broken by ``created_at DESC``).
+
+    3️⃣  **Backfill applications.certificate_id** — Update every application row
+        so its ``certificate_id`` points to the surviving certificate whose
+        ``approval_no`` matches the application's own ``approval_no``.
+        This gives every historical application record a reference to the
+        current certificate.
+    """
+    db = _get_new_session()
+    try:
+        # ── 1️⃣ Backfill intimate_date ────────────────────────────────────────
+        r1 = db.execute(text("""
+            UPDATE public.applications a
+            SET intimate_date = a.expire_date - INTERVAL '6 months',
+                updated_at    = now()
+            FROM public.categories c
+            WHERE a.category_id = c.id
+              AND c.category_type = 'License'
+              AND a.intimate_date IS NULL
+              AND a.expire_date IS NOT NULL
+        """))
+        intimate_date_updated = r1.rowcount or 0
+        db.commit()
+        logger.info("fix-certificates: intimate_date backfilled: %d rows", intimate_date_updated)
+
+        # ── 2️⃣ Delete duplicate certificates (keep latest per approval_no) ───
+        r2 = db.execute(text("""
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY approval_no
+                           ORDER BY expire_date DESC NULLS LAST,
+                                    created_at    DESC NULLS LAST
+                       ) AS rn
+                FROM public.certificates
+                WHERE approval_no IS NOT NULL
+                  AND TRIM(approval_no) <> ''
+            )
+            DELETE FROM public.certificates
+            WHERE id IN (
+                SELECT id FROM ranked WHERE rn > 1
+            )
+        """))
+        certificates_deleted = r2.rowcount or 0
+        db.commit()
+        logger.info("fix-certificates: duplicate certificates deleted: %d rows", certificates_deleted)
+
+        # ── 3️⃣ Backfill applications.certificate_id ─────────────────────────
+        r3 = db.execute(text("""
+            UPDATE public.applications a
+            SET certificate_id = c.id,
+                updated_at     = now()
+            FROM public.certificates c
+            WHERE TRIM(a.approval_no) = TRIM(c.approval_no)
+              AND a.approval_no IS NOT NULL
+              AND TRIM(a.approval_no) <> ''
+        """))
+        certificate_id_updated = r3.rowcount or 0
+        db.commit()
+        logger.info("fix-certificates: applications.certificate_id backfilled: %d rows", certificate_id_updated)
+
+        return {
+            "status": "OK",
+            "intimate_date_backfilled": intimate_date_updated,
+            "duplicate_certificates_deleted": certificates_deleted,
+            "applications_certificate_id_updated": certificate_id_updated,
+        }
+
+    except Exception as e:
+        logger.exception("fix-certificates: error: %s", e)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
