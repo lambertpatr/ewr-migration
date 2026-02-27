@@ -530,10 +530,8 @@ def _build_default_mappings():
         'pwllabel8', 'pwllabel9', 'avccotcc', 'prodoc', 'commreport', 'ppapotapsapea',
         'losflg', 'losfmrfe',
         # --- added 2026-02-27: explicit filename cols from user list ---
-        'coifilename', 'bno', 'brelacfilename', 'lssdfilename',
-        'vatno', 'vatcfilename', 'memofilename', 'capexpfilename',
-        'piwbayacei', 'loancap', 'scc', 'lftbbsfilename',
-        'bteleno', 'conpername', 'bposition', 'bpobox', 'bname',
+        'coifilename', 'brelacfilename', 'lssdfilename',
+        'vatcfilename', 'memofilename', 'capexpfilename', 'lftbbsfilename',
         'commission', 'commissionfilename', 'commissioningreportfilename',
         'edadoffilename', 'comoufilename', 'permitsfilename', 'polurfilename',
         'eiasraabtnemfilename', 'oshacerfilename', 'lcpfilename',
@@ -541,10 +539,9 @@ def _build_default_mappings():
         'gsasfilename', 'gsafilename', 'daabdisoaanpofsfilename',
         'sitemapsfilename', 'businessplanfilename', 'cngplanfilename',
         'decommissionfilename', 'dateofissfilename', 'cngsysplanfilename',
-        'cmobile_no', 'title', 'contact_name',
         'nemcfilename', 'healthothersfilename', 'registeredengineerfilename',
         'assessmentcertificatefilename', 'ownerfilename',
-        'intendedfacility', 'companyfilename', 'cvattachfilename',
+        'companyfilename', 'cvattachfilename',
     ]
 
     for name in extra_names:
