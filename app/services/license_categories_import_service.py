@@ -183,34 +183,24 @@ def import_license_categories_and_fees_via_staging_copy(
             """
         )
     )
-    db.commit()
-
-    # uq_categories_name_lower — case-insensitive unique index on active rows.
-    # Using lower(name) means 'generation' and 'Generation' are treated as the
-    # same category, preventing duplicates from case differences between imports.
-    #
-    # First: soft-delete any duplicate lower(name) rows keeping the oldest one,
-    # so the index creation doesn't fail on pre-existing case variants.
+    # fees_category_id: points a category that has no fees to the sibling row
+    # (same lower(name), different casing) that does have fees.  This lets the
+    # UI/API redirect users away from the "empty" duplicate without deleting it.
     try:
-        db.execute(
-            text(
-                """
-                UPDATE public.categories c
-                SET deleted_at = now()
-                WHERE c.deleted_at IS NULL
-                  AND c.id NOT IN (
-                      SELECT DISTINCT ON (lower(btrim(name))) id
-                      FROM public.categories
-                      WHERE deleted_at IS NULL
-                      ORDER BY lower(btrim(name)), created_at ASC, id
-                  );
-                """
-            )
-        )
+        db.execute(text(
+            "ALTER TABLE public.categories ADD COLUMN IF NOT EXISTS fees_category_id uuid NULL"
+        ))
         db.commit()
     except Exception:
         db.rollback()
-        _progress("Warning: could not deduplicate case-variant category names — continuing")
+
+    # uq_categories_name_lower — case-insensitive unique index on active rows.
+    # NOTE: We intentionally do NOT soft-delete case-variant duplicates here.
+    # Legacy DBs may have both 'generation' and 'Generation' as separate live rows.
+    # We keep both alive; the one without fees will get fees_category_id pointing
+    # to the sibling that has fees (see post-fee step below).
+    # The index creation is best-effort — it will fail if duplicates exist and
+    # that is acceptable: the mapping table handles dedup via lower(name) JOIN.
 
     try:
         db.execute(
@@ -368,16 +358,20 @@ def import_license_categories_and_fees_via_staging_copy(
         )
     ).scalar() or 0
 
-    # Build a temp mapping table so we can return per-name category_id and use it in fees insert.
+    # Build a temp mapping table: key_name → ALL category_ids that share the same
+    # case-insensitive name.  If both 'generation' and 'Generation' exist as separate
+    # rows in public.categories (legacy duplicates), fees will be inserted for BOTH.
+    # Primary key is (key_name, category_id) — intentionally one-to-many.
     # NOTE: TEMP tables cannot be created inside the public schema.
     db.execute(
         text(
             """
             DROP TABLE IF EXISTS stage_license_category_ids;
             CREATE TEMP TABLE stage_license_category_ids (
-                key_name text PRIMARY KEY,
-                category_id uuid
-            ) ON COMMIT DROP;
+                key_name    text NOT NULL,
+                category_id uuid NOT NULL,
+                PRIMARY KEY (key_name, category_id)
+            );
             """
         )
     )
@@ -386,15 +380,23 @@ def import_license_categories_and_fees_via_staging_copy(
     # the staging row contains explicit non-null values (backward-compatible:
     # sectors whose Excel files don't have the new columns keep their existing
     # DB values untouched).
+    #
+    # Case-insensitive dedup strategy:
+    #  1. DISTINCT ON (lower(btrim(...))) collapses duplicates within the same upload.
+    #  2. ON CONFLICT (lower(btrim(name))) WHERE deleted_at IS NULL → UPDATE the existing
+    #     row when a name collides (case-insensitive). No WHERE NOT EXISTS guard here —
+    #     that would prevent the conflict from firing and stop the mapping table from
+    #     seeing ALL pre-existing case variants (e.g. both 'generation' and 'Generation').
+    #
+    # After this INSERT/UPDATE the mapping table is populated with ALL category_id rows
+    # that share the same lower(name), so fees are written for every case-variant.
     cat_insert = db.execute(
         text(
             f"""
             WITH enriched AS (
                 -- One representative row per category name (first staging row).
-                -- key_name uses lower() for dedup; display_name uses btrim() preserving
-                -- original casing from Excel. Uniqueness in the DB is enforced via
-                -- lower(name) functional index (uq_categories_name_lower) so that
-                -- 'generation' and 'Generation' are treated as the same category.
+                -- key_name is always lowercase for comparison; display_name preserves
+                -- the original Excel casing (e.g. 'Generation') for storage.
                 SELECT DISTINCT ON (lower(btrim(s.categoryorclass)))
                     lower(btrim(s.categoryorclass))                        AS key_name,
                     btrim(s.categoryorclass)                               AS display_name,
@@ -518,32 +520,22 @@ def import_license_categories_and_fees_via_staging_copy(
     inserted_categories = sum(1 for r in rows if r[0] is True)
     updated_categories  = sum(1 for r in rows if r[0] is False)
 
-    # Populate mapping table for all names in stage (existing + newly inserted)
+    # Populate mapping table for all names in stage → ALL matching category_id variants.
+    # e.g. if both 'generation' and 'Generation' exist in public.categories, both rows
+    # are inserted here so fees are written for every case-variant of the same name.
     db.execute(
         text(
             f"""
-            INSERT INTO stage_license_category_ids(key_name, category_id)
-            SELECT key_name, category_id
-            FROM (
-                SELECT
-                    lower(btrim(s.categoryorclass)) AS key_name,
-                    lc.id AS category_id,
-                    row_number() OVER (
-                        PARTITION BY lower(btrim(s.categoryorclass))
-                        ORDER BY
-                            -- Prefer matching sector row when duplicates exist across sectors
-                            CASE WHEN lc.sector_id = :sector_id THEN 0 ELSE 1 END,
-                            lc.created_at ASC,
-                            lc.id
-                    ) AS rn
-                FROM {stage} s
-                JOIN public.categories lc
-                  ON lower(btrim(lc.name)) = lower(btrim(s.categoryorclass))
-                 AND lc.deleted_at IS NULL
-                WHERE s.categoryorclass IS NOT NULL AND btrim(s.categoryorclass) <> ''
-            ) x
-            WHERE x.rn = 1
-            ON CONFLICT (key_name) DO UPDATE SET category_id = EXCLUDED.category_id;
+            INSERT INTO stage_license_category_ids (key_name, category_id)
+            SELECT DISTINCT
+                lower(btrim(s.categoryorclass)) AS key_name,
+                lc.id                           AS category_id
+            FROM {stage} s
+            JOIN public.categories lc
+              ON lower(btrim(lc.name)) = lower(btrim(s.categoryorclass))
+             AND lc.deleted_at IS NULL
+            WHERE s.categoryorclass IS NOT NULL AND btrim(s.categoryorclass) <> ''
+            ON CONFLICT (key_name, category_id) DO NOTHING;
             """
         ),
         {"sector_id": sector_id},
@@ -561,55 +553,23 @@ def import_license_categories_and_fees_via_staging_copy(
             WITH typed AS (
                 SELECT
                     ids.category_id,
-                    -- license_type / category_license_type derivation (backward-compatible):
-                    --   ELECTRICITY, PETROLEUM  → from licencetype column (e.g. Provisional/Operational, Construction Approval)
-                    --   NATURAL_GAS, WATER_SUPPLY → forced OPERATIONAL (no licencetype column in those files)
-                    NULLIF(
-                        btrim(
-                            regexp_replace(
-                                regexp_replace(
-                                    upper(
-                                        CASE
-                                            WHEN :db_sector_name IN ('ELECTRICITY', 'PETROLEUM')
-                                                THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
-                                            ELSE 'OPERATIONAL'
-                                        END
-                                    ),
-                                    '[^A-Z0-9]+',
-                                    '_',
-                                    'g'
-                                ),
-                                '^_+|_+$',
-                                '',
-                                'g'
-                            ),
-                            '_'
-                        ),
-                        ''
-                    ) AS license_type,
-                    NULLIF(
-                        btrim(
-                            regexp_replace(
-                                regexp_replace(
-                                    upper(
-                                        CASE
-                                            WHEN :db_sector_name IN ('ELECTRICITY', 'PETROLEUM')
-                                                THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
-                                            ELSE 'OPERATIONAL'
-                                        END
-                                    ),
-                                    '[^A-Z0-9]+',
-                                    '_',
-                                    'g'
-                                ),
-                                '^_+|_+$',
-                                '',
-                                'g'
-                            ),
-                            '_'
-                        ),
-                        ''
-                    ) AS category_license_type,
+                    -- license_type / category_license_type:
+                    --   ELECTRICITY only → PROVISIONAL when licencetype contains 'PROVISIONAL', else OPERATIONAL.
+                    --   ALL other sectors (PETROLEUM, NATURAL_GAS, WATER_SUPPLY, etc.) → always OPERATIONAL.
+                    --   The raw Excel values like 'Petroleum', 'Construction Approval', etc. are NOT valid
+                    --   DB enum values and must never be stored in these columns.
+                    CASE
+                        WHEN :db_sector_name = 'ELECTRICITY'
+                             AND upper(btrim(COALESCE(s.licencetype, ''))) LIKE '%PROVISIONAL%'
+                        THEN 'PROVISIONAL'
+                        ELSE 'OPERATIONAL'
+                    END AS license_type,
+                    CASE
+                        WHEN :db_sector_name = 'ELECTRICITY'
+                             AND upper(btrim(COALESCE(s.licencetype, ''))) LIKE '%PROVISIONAL%'
+                        THEN 'PROVISIONAL'
+                        ELSE 'OPERATIONAL'
+                    END AS category_license_type,
                     NULLIF(btrim(s.nocustomerf), '') AS no_customer_from,
                     NULLIF(btrim(s.nocustomerto), '') AS no_customer_to,
                     -- application_type: ALL sectors use applicationtype column from Excel.
@@ -625,11 +585,14 @@ def import_license_categories_and_fees_via_staging_copy(
                         ELSE
                             CASE WHEN btrim(s.acapacityfrom) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityfrom))::numeric ELSE 1 END
                     END AS capacity_from,
+                    -- capacity_to is varchar(255) in DB: store raw value as text.
+                    -- For NATURAL_GAS/WATER_SUPPLY: NULL when blank.
+                    -- For ELECTRICITY/PETROLEUM: keep the raw string (could be 'Above', a number, etc.).
                     CASE
                         WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
-                            CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE NULL END
+                            NULLIF(btrim(s.acapacityto), '')
                         ELSE
-                            CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE 10 END
+                            COALESCE(NULLIF(btrim(s.acapacityto), ''), '10')
                     END AS capacity_to,
                     CASE WHEN btrim(s.appfee) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.appfee))::numeric ELSE 240000 END AS application_fee,
                     CASE WHEN btrim(s.licencefee) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.licencefee))::numeric ELSE 120500000 END AS license_fee,
@@ -652,8 +615,8 @@ def import_license_categories_and_fees_via_staging_copy(
                     lower(btrim(COALESCE(license_type, ''))),
                     COALESCE(no_customer_from, ''),
                     COALESCE(no_customer_to, ''),
-                    COALESCE(capacity_from, -1),
-                    COALESCE(capacity_to, -1),
+                    COALESCE(capacity_from, -1::numeric),
+                    COALESCE(capacity_to::text, ''),
                     lower(btrim(COALESCE(application_prefix, ''))),
                     lower(btrim(COALESCE(license_prefix, ''))),
                     COALESCE(months_eligible, 0)
@@ -665,8 +628,8 @@ def import_license_categories_and_fees_via_staging_copy(
                     lower(btrim(COALESCE(license_type, ''))),
                     COALESCE(no_customer_from, ''),
                     COALESCE(no_customer_to, ''),
-                    COALESCE(capacity_from, -1),
-                    COALESCE(capacity_to, -1),
+                    COALESCE(capacity_from, -1::numeric),
+                    COALESCE(capacity_to::text, ''),
                     lower(btrim(COALESCE(application_prefix, ''))),
                     lower(btrim(COALESCE(license_prefix, ''))),
                     COALESCE(months_eligible, 0)
@@ -693,8 +656,8 @@ def import_license_categories_and_fees_via_staging_copy(
             WHERE f.category_id = d.category_id
               AND lower(btrim(f.application_type)) = lower(btrim(d.application_type))
               AND lower(btrim(COALESCE(f.license_type, ''))) = lower(btrim(COALESCE(d.license_type, '')))
-              AND COALESCE(f.capacity_from, -1) = COALESCE(d.capacity_from, -1)
-              AND COALESCE(f.capacity_to, -1) = COALESCE(d.capacity_to, -1)
+              AND COALESCE(f.capacity_from, -1::numeric) = COALESCE(d.capacity_from, -1::numeric)
+              AND COALESCE(f.capacity_to, '') = COALESCE(d.capacity_to::text, '')
               AND COALESCE(f.no_customer_from, '') = COALESCE(d.no_customer_from, '')
               AND COALESCE(f.no_customer_to, '') = COALESCE(d.no_customer_to, '')
               AND lower(btrim(COALESCE(f.application_prefix, ''))) = lower(btrim(COALESCE(d.application_prefix, '')))
@@ -714,42 +677,20 @@ def import_license_categories_and_fees_via_staging_copy(
                 SELECT
                     ids.category_id,
                     -- license_type / category_license_type (same rules as UPDATE above):
-                    --   ELECTRICITY, PETROLEUM → from licencetype col
-                    --   NATURAL_GAS, WATER_SUPPLY → forced OPERATIONAL
-                    NULLIF(
-                        btrim(
-                            regexp_replace(
-                                regexp_replace(
-                                    upper(
-                                        CASE
-                                            WHEN :db_sector_name IN ('ELECTRICITY', 'PETROLEUM')
-                                                THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
-                                            ELSE 'OPERATIONAL'
-                                        END
-                                    ),
-                                    '[^A-Z0-9]+', '_', 'g'
-                                ),
-                                '^_+|_+$', '', 'g'
-                            ), '_'
-                        ), ''
-                    ) AS license_type,
-                    NULLIF(
-                        btrim(
-                            regexp_replace(
-                                regexp_replace(
-                                    upper(
-                                        CASE
-                                            WHEN :db_sector_name IN ('ELECTRICITY', 'PETROLEUM')
-                                                THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
-                                            ELSE 'OPERATIONAL'
-                                        END
-                                    ),
-                                    '[^A-Z0-9]+', '_', 'g'
-                                ),
-                                '^_+|_+$', '', 'g'
-                            ), '_'
-                        ), ''
-                    ) AS category_license_type,
+                    --   ELECTRICITY only → PROVISIONAL or OPERATIONAL from licencetype col.
+                    --   ALL other sectors → always OPERATIONAL.
+                    CASE
+                        WHEN :db_sector_name = 'ELECTRICITY'
+                             AND upper(btrim(COALESCE(s.licencetype, ''))) LIKE '%PROVISIONAL%'
+                        THEN 'PROVISIONAL'
+                        ELSE 'OPERATIONAL'
+                    END AS license_type,
+                    CASE
+                        WHEN :db_sector_name = 'ELECTRICITY'
+                             AND upper(btrim(COALESCE(s.licencetype, ''))) LIKE '%PROVISIONAL%'
+                        THEN 'PROVISIONAL'
+                        ELSE 'OPERATIONAL'
+                    END AS category_license_type,
                     NULLIF(btrim(s.nocustomerf), '') AS no_customer_from,
                     NULLIF(btrim(s.nocustomerto), '') AS no_customer_to,
                     -- application_type: ALL sectors use applicationtype column from Excel.
@@ -760,11 +701,14 @@ def import_license_categories_and_fees_via_staging_copy(
                         ELSE
                             CASE WHEN btrim(s.acapacityfrom) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityfrom))::numeric ELSE 1 END
                     END AS capacity_from,
+                    -- capacity_to is varchar(255) in DB: store raw value as text.
+                    -- For NATURAL_GAS/WATER_SUPPLY: NULL when blank.
+                    -- For ELECTRICITY/PETROLEUM: keep the raw string (could be 'Above', a number, etc.).
                     CASE
                         WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
-                            CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE NULL END
+                            NULLIF(btrim(s.acapacityto), '')
                         ELSE
-                            CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE 10 END
+                            COALESCE(NULLIF(btrim(s.acapacityto), ''), '10')
                     END AS capacity_to,
                     CASE WHEN btrim(s.appfee) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.appfee))::numeric ELSE 240000 END AS application_fee,
                     CASE WHEN btrim(s.licencefee) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.licencefee))::numeric ELSE 120500000 END AS license_fee,
@@ -783,8 +727,8 @@ def import_license_categories_and_fees_via_staging_copy(
                     lower(btrim(COALESCE(license_type, ''))),
                     COALESCE(no_customer_from, ''),
                     COALESCE(no_customer_to, ''),
-                    COALESCE(capacity_from, -1),
-                    COALESCE(capacity_to, -1),
+                    COALESCE(capacity_from, -1::numeric),
+                    COALESCE(capacity_to::text, ''),
                     lower(btrim(COALESCE(application_prefix, ''))),
                     lower(btrim(COALESCE(license_prefix, ''))),
                     COALESCE(months_eligible, 0)
@@ -796,8 +740,8 @@ def import_license_categories_and_fees_via_staging_copy(
                     lower(btrim(COALESCE(license_type, ''))),
                     COALESCE(no_customer_from, ''),
                     COALESCE(no_customer_to, ''),
-                    COALESCE(capacity_from, -1),
-                    COALESCE(capacity_to, -1),
+                    COALESCE(capacity_from, -1::numeric),
+                    COALESCE(capacity_to::text, ''),
                     lower(btrim(COALESCE(application_prefix, ''))),
                     lower(btrim(COALESCE(license_prefix, ''))),
                     COALESCE(months_eligible, 0)
@@ -850,8 +794,8 @@ def import_license_categories_and_fees_via_staging_copy(
                 WHERE f.category_id = d.category_id
                   AND lower(btrim(f.application_type)) = lower(btrim(d.application_type))
                   AND lower(btrim(COALESCE(f.license_type, ''))) = lower(btrim(COALESCE(d.license_type, '')))
-                  AND COALESCE(f.capacity_from, -1) = COALESCE(d.capacity_from, -1)
-                  AND COALESCE(f.capacity_to, -1) = COALESCE(d.capacity_to, -1)
+                  AND COALESCE(f.capacity_from, -1::numeric) = COALESCE(d.capacity_from, -1::numeric)
+                  AND COALESCE(f.capacity_to, '') = COALESCE(d.capacity_to::text, '')
                   AND COALESCE(f.no_customer_from, '') = COALESCE(d.no_customer_from, '')
                   AND COALESCE(f.no_customer_to, '') = COALESCE(d.no_customer_to, '')
                   AND lower(btrim(COALESCE(f.application_prefix, ''))) = lower(btrim(COALESCE(d.application_prefix, '')))
@@ -870,25 +814,63 @@ def import_license_categories_and_fees_via_staging_copy(
     ).scalar() or 0
     inserted_fees = int(after_fee_count) - int(before_fee_count)
 
+    # ── Post-fee: link no-fees category variants to their sibling with fees ──
+    # For every pair of categories that share the same lower(name) (e.g. 'generation'
+    # and 'Generation'), find which one HAS fees and set fees_category_id on the one
+    # that has NO fees so the UI can redirect users to the correct category.
+    # Safe to re-run: only updates rows where fees_category_id is currently NULL
+    # AND no fees exist for that category_id.
+    _progress("Linking no-fees category variants to their fees siblings …")
+    try:
+        db.execute(text(f"""
+            UPDATE public.categories c_empty
+            SET    fees_category_id = c_has_fees.id,
+                   updated_at       = now()
+            FROM   public.categories c_has_fees
+            WHERE  lower(btrim(c_has_fees.name)) = lower(btrim(c_empty.name))
+              AND  c_has_fees.id <> c_empty.id
+              AND  c_empty.deleted_at  IS NULL
+              AND  c_has_fees.deleted_at IS NULL
+              -- c_empty has NO fees
+              AND  NOT EXISTS (
+                       SELECT 1 FROM public.application_category_fees f
+                       WHERE  f.category_id = c_empty.id
+                         AND  f.deleted_at IS NULL
+                   )
+              -- c_has_fees HAS fees
+              AND  EXISTS (
+                       SELECT 1 FROM public.application_category_fees f
+                       WHERE  f.category_id = c_has_fees.id
+                         AND  f.deleted_at IS NULL
+                   )
+              -- only update when not already set (idempotent)
+              AND  c_empty.fees_category_id IS NULL;
+        """))
+        db.commit()
+        _progress("fees_category_id back-fill done")
+    except Exception as _fce:
+        _progress(f"fees_category_id back-fill skipped: {_fce}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
     processed = int(len(df))
 
-    # figures for skipped are computed approximately via counts
+    # figures for skipped are computed approximately via counts.
+    # Count distinct key_names from stage that already had at least one matching
+    # category row in the DB (regardless of casing or sector).
     skipped_categories_existing = db.execute(
         text(
             f"""
-            SELECT COUNT(*)
-            FROM (
-                SELECT DISTINCT lower(btrim(categoryorclass)) AS key_name
-                FROM {stage}
-                WHERE categoryorclass IS NOT NULL AND btrim(categoryorclass) <> ''
-            ) x
+            SELECT COUNT(DISTINCT lower(btrim(s.categoryorclass)))
+            FROM {stage} s
             JOIN public.categories lc
-              ON lc.sector_id = :sector_id
-             AND lower(btrim(lc.name)) = x.key_name
-             AND lc.deleted_at IS NULL;
+              ON lower(btrim(lc.name)) = lower(btrim(s.categoryorclass))
+             AND lc.deleted_at IS NULL
+            WHERE s.categoryorclass IS NOT NULL AND btrim(s.categoryorclass) <> '';
             """
         ),
-        {"sector_id": sector_id},
     ).scalar() or 0
 
     # This includes newly inserted too; so compute existing-only
@@ -901,29 +883,14 @@ def import_license_categories_and_fees_via_staging_copy(
             WITH typed AS (
                 SELECT
                     ids.category_id,
-                    NULLIF(
-                        btrim(
-                            regexp_replace(
-                                regexp_replace(
-                                    upper(
-                                        CASE
-                                            WHEN :db_sector_name IN ('ELECTRICITY', 'PETROLEUM')
-                                                THEN COALESCE(NULLIF(btrim(s.licencetype), ''), '')
-                                            ELSE 'OPERATIONAL'
-                                        END
-                                    ),
-                                    '[^A-Z0-9]+',
-                                    '_',
-                                    'g'
-                                ),
-                                '^_+|_+$',
-                                '',
-                                'g'
-                            ),
-                            '_'
-                        ),
-                        ''
-                    ) AS license_type,
+                    -- license_type: ELECTRICITY only → PROVISIONAL or OPERATIONAL.
+                    -- ALL other sectors → always OPERATIONAL.
+                    CASE
+                        WHEN :db_sector_name = 'ELECTRICITY'
+                             AND upper(btrim(COALESCE(s.licencetype, ''))) LIKE '%PROVISIONAL%'
+                        THEN 'PROVISIONAL'
+                        ELSE 'OPERATIONAL'
+                    END AS license_type,
                     NULLIF(btrim(s.nocustomerf), '') AS no_customer_from,
                     NULLIF(btrim(s.nocustomerto), '') AS no_customer_to,
                     upper(COALESCE(NULLIF(btrim(s.applicationtype), ''), 'NEW')) AS application_type,
@@ -933,11 +900,14 @@ def import_license_categories_and_fees_via_staging_copy(
                         ELSE
                             CASE WHEN btrim(s.acapacityfrom) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityfrom))::numeric ELSE 1 END
                     END AS capacity_from,
+                    -- capacity_to is varchar(255) in DB: store raw value as text.
+                    -- For NATURAL_GAS/WATER_SUPPLY: NULL when blank.
+                    -- For ELECTRICITY/PETROLEUM: keep the raw string (could be 'Above', a number, etc.).
                     CASE
                         WHEN :db_sector_name IN ('NATURAL_GAS', 'WATER_SUPPLY') THEN
-                            CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE NULL END
+                            NULLIF(btrim(s.acapacityto), '')
                         ELSE
-                            CASE WHEN btrim(s.acapacityto) ~ '^-?\\d+(\\.\\d+)?$' THEN (btrim(s.acapacityto))::numeric ELSE 10 END
+                            COALESCE(NULLIF(btrim(s.acapacityto), ''), '10')
                     END AS capacity_to,
                     COALESCE(NULLIF(btrim(s.prefix), ''), 'AECBL') AS application_prefix,
                     COALESCE(NULLIF(btrim(s.licenseprefix), ''), 'ECBL') AS license_prefix,
@@ -954,8 +924,8 @@ def import_license_categories_and_fees_via_staging_copy(
                     lower(btrim(COALESCE(license_type, ''))),
                     COALESCE(no_customer_from, ''),
                     COALESCE(no_customer_to, ''),
-                    COALESCE(capacity_from, -1),
-                    COALESCE(capacity_to, -1),
+                    COALESCE(capacity_from, -1::numeric),
+                    COALESCE(capacity_to::text, ''),
                     lower(btrim(COALESCE(application_prefix, ''))),
                     lower(btrim(COALESCE(license_prefix, ''))),
                     COALESCE(months_eligible, 0)
@@ -983,4 +953,5 @@ def import_license_categories_and_fees_via_staging_copy(
         "skipped_fees_existing_estimate": int(skipped_fees_existing),
         "fee_count_before": int(before_fee_count),
         "fee_count_after": int(after_fee_count),
+        "fees_category_id_linked": "see categories.fees_category_id for no-fees variants",
     }
