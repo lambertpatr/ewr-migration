@@ -647,4 +647,177 @@ ALTER TABLE IF EXISTS public.applications
 COMMENT ON COLUMN public.applications.completed_at
     IS 'Completion / approval timestamp migrated from the LOIS Excel export (completed_at column).';
 
+---------------------------------------------------------------------
+-- Water Supply (and other sector) imports: application columns
+--
+-- created_by (uuid) — resolved from users.id via userid/username column.
+-- Mirrors the electrical-installation importer approach.
+---------------------------------------------------------------------
+
+ALTER TABLE IF EXISTS public.applications
+    ADD COLUMN IF NOT EXISTS created_by uuid NULL;
+
+---------------------------------------------------------------------
+-- Water Supply imports: application_sector_details extra columns
+--
+-- vrn              — VAT Registration Number from vrnno Excel column
+-- gn_gazette_on    — Government Gazette date from gngzon Excel column
+-- government_notice_no — Notice number from govtnoteno Excel column
+---------------------------------------------------------------------
+
+ALTER TABLE IF EXISTS public.application_sector_details
+    ADD COLUMN IF NOT EXISTS vrn                  text NULL;
+
+ALTER TABLE IF EXISTS public.application_sector_details
+    ADD COLUMN IF NOT EXISTS gn_gazette_on         text NULL;
+
+ALTER TABLE IF EXISTS public.application_sector_details
+    ADD COLUMN IF NOT EXISTS government_notice_no  text NULL;
+
+---------------------------------------------------------------------
+-- Water Supply imports: financial_information extra columns
+--
+-- application_id              — direct FK to applications (no join via asd)
+-- fs                          — financial statement reference
+-- amount                      — declared investment/capital amount
+-- currency                    — currency of amount (e.g. TZS, USD)
+---------------------------------------------------------------------
+
+ALTER TABLE IF EXISTS public.financial_information
+    ADD COLUMN IF NOT EXISTS application_id uuid NULL;
+
+ALTER TABLE IF EXISTS public.financial_information
+    ADD COLUMN IF NOT EXISTS fs text NULL;
+
+ALTER TABLE IF EXISTS public.financial_information
+    ADD COLUMN IF NOT EXISTS amount text NULL;
+
+ALTER TABLE IF EXISTS public.financial_information
+    ADD COLUMN IF NOT EXISTS currency text NULL;
+
+---------------------------------------------------------------------
+-- Water Supply imports: drop blocking one-to-one UNIQUE and FK
+-- constraints on financial_information.
+--
+-- These Hibernate-generated constraints enforce a 1:1 relationship
+-- between financial_information and bank/referee/funding rows, which
+-- prevents multiple applications from sharing the same records and
+-- blocks idempotent re-imports.  They are replaced by the looser
+-- ON CONFLICT (id) DO UPDATE pattern used by the migration pipeline.
+--
+-- Constraint names are hard-coded Hibernate hashes — drop each with
+-- IF NOT EXISTS so the script is safe to re-run.
+---------------------------------------------------------------------
+
+DO $$
+DECLARE
+    _cname text;
+    _constraints text[] := ARRAY[
+        -- UNIQUE constraints
+        'uk3330k9q1sw66jlduqpsrhj0p',   -- UNIQUE bank_details_tz_id
+        'uk3bdd17w6dmarkybpxwdqyig3e',   -- UNIQUE bank_details_outside_tz_id
+        'ukel2wimvd2s27v1yv6piue4gdt',   -- UNIQUE referee_id
+        'ukfa6pmxx6fmxjml7o4tnpiqnk4',   -- UNIQUE sources_of_funding_id
+        'ukh0i89cf4bjf1w09xb5phl8shm',   -- UNIQUE applicant_proposed_investment_id
+        'uksj2p6a47sf5y8u6uyui21sk8v',   -- UNIQUE audited_financial_statements_id
+        -- FK constraints
+        'fk1fyiwcuau1xor0biuf5hiy8cf',   -- FK bank_details_tz_id → bank_details_tanzania
+        'fk4hpnlnjnfofc7khnkxp0emfqn',   -- FK referee_id → referees
+        'fk5uk0tmchnlb1ystu0jpqq42sl',   -- FK application_sector_detail_id → application_sector_details
+        'fk66wid3r5eqs7mukb826wj7f3s',   -- FK audited_financial_statements_id
+        'fkbp7gwdkep3f5gkn44t1ms7p30',   -- FK sources_of_funding_id
+        'fkjmhltcnyhhewyo6hmn8q6hbno',   -- FK bank_details_outside_tz_id → bank_details_outside_tanzania
+        'fksmkj5b9iapr68uiw8wrcj5s2m'    -- FK applicant_proposed_investment_id
+    ];
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_class WHERE oid = 'public.financial_information'::regclass) THEN
+        FOREACH _cname IN ARRAY _constraints
+        LOOP
+            IF EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'public.financial_information'::regclass
+                  AND conname  = _cname
+            ) THEN
+                EXECUTE format(
+                    'ALTER TABLE public.financial_information DROP CONSTRAINT %I',
+                    _cname
+                );
+                RAISE NOTICE 'Dropped financial_information constraint: %', _cname;
+            END IF;
+        END LOOP;
+    END IF;
+END $$;
+
+-- applicant_proposed_investment: migration link columns + FKs
+ALTER TABLE IF EXISTS public.applicant_proposed_investment
+    ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid NULL;
+ALTER TABLE IF EXISTS public.applicant_proposed_investment
+    ADD COLUMN IF NOT EXISTS application_id               uuid NULL;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.applicant_proposed_investment'::regclass AND conname='fk_api_application_id') THEN
+        ALTER TABLE public.applicant_proposed_investment DROP CONSTRAINT fk_api_application_id;
+    END IF;
+    ALTER TABLE public.applicant_proposed_investment ADD CONSTRAINT fk_api_application_id FOREIGN KEY (application_id) REFERENCES public.applications (id) ON DELETE CASCADE;
+END $$;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.applicant_proposed_investment'::regclass AND conname='fk_api_asd_id') THEN
+        ALTER TABLE public.applicant_proposed_investment DROP CONSTRAINT fk_api_asd_id;
+    END IF;
+    ALTER TABLE public.applicant_proposed_investment ADD CONSTRAINT fk_api_asd_id FOREIGN KEY (application_sector_detail_id) REFERENCES public.application_sector_details (id) ON DELETE CASCADE;
+END $$;
+
+-- project_description: migration link columns + FKs
+ALTER TABLE IF EXISTS public.project_description
+    ADD COLUMN IF NOT EXISTS application_id               uuid NULL;
+ALTER TABLE IF EXISTS public.project_description
+    ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid NULL;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.project_description'::regclass AND conname='fk_pd_application_id') THEN
+        ALTER TABLE public.project_description DROP CONSTRAINT fk_pd_application_id;
+    END IF;
+    ALTER TABLE public.project_description ADD CONSTRAINT fk_pd_application_id FOREIGN KEY (application_id) REFERENCES public.applications (id) ON DELETE CASCADE;
+END $$;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.project_description'::regclass AND conname='fk_pd_asd_id') THEN
+        ALTER TABLE public.project_description DROP CONSTRAINT fk_pd_asd_id;
+    END IF;
+    ALTER TABLE public.project_description ADD CONSTRAINT fk_pd_asd_id FOREIGN KEY (application_sector_detail_id) REFERENCES public.application_sector_details (id) ON DELETE CASCADE;
+END $$;
+
+-- referees: migration link columns + FKs
+ALTER TABLE IF EXISTS public.referees
+    ADD COLUMN IF NOT EXISTS application_id               uuid NULL;
+ALTER TABLE IF EXISTS public.referees
+    ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid NULL;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.referees'::regclass AND conname='fk_ref_application_id') THEN
+        ALTER TABLE public.referees DROP CONSTRAINT fk_ref_application_id;
+    END IF;
+    ALTER TABLE public.referees ADD CONSTRAINT fk_ref_application_id FOREIGN KEY (application_id) REFERENCES public.applications (id) ON DELETE CASCADE;
+END $$;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.referees'::regclass AND conname='fk_ref_asd_id') THEN
+        ALTER TABLE public.referees DROP CONSTRAINT fk_ref_asd_id;
+    END IF;
+    ALTER TABLE public.referees ADD CONSTRAINT fk_ref_asd_id FOREIGN KEY (application_sector_detail_id) REFERENCES public.application_sector_details (id) ON DELETE CASCADE;
+END $$;
+
+-- bank_details_tanzania: migration link columns + FKs
+ALTER TABLE IF EXISTS public.bank_details_tanzania
+    ADD COLUMN IF NOT EXISTS application_id               uuid NULL;
+ALTER TABLE IF EXISTS public.bank_details_tanzania
+    ADD COLUMN IF NOT EXISTS application_sector_detail_id uuid NULL;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.bank_details_tanzania'::regclass AND conname='fk_bdt_application_id') THEN
+        ALTER TABLE public.bank_details_tanzania DROP CONSTRAINT fk_bdt_application_id;
+    END IF;
+    ALTER TABLE public.bank_details_tanzania ADD CONSTRAINT fk_bdt_application_id FOREIGN KEY (application_id) REFERENCES public.applications (id) ON DELETE CASCADE;
+END $$;
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='public.bank_details_tanzania'::regclass AND conname='fk_bdt_asd_id') THEN
+        ALTER TABLE public.bank_details_tanzania DROP CONSTRAINT fk_bdt_asd_id;
+    END IF;
+    ALTER TABLE public.bank_details_tanzania ADD CONSTRAINT fk_bdt_asd_id FOREIGN KEY (application_sector_detail_id) REFERENCES public.application_sector_details (id) ON DELETE CASCADE;
+END $$;
+
 COMMIT;
