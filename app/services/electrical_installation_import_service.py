@@ -35,6 +35,7 @@ from app.utils.lookup_cache import (
     load_elec_category_map,
     push_category_map_temp_table,
     load_applicant_role_id,
+    load_default_role_id,
     ELEC_CAT_MAP_TEMP,
     load_zone_map,
 )
@@ -760,15 +761,15 @@ def import_electrical_installation_via_staging_copy(
     _skipped_users = max(0, int(_total_elec_usernames) - int(_inserted_users))
     _progress(f"transform:users_from_userid: inserted={_inserted_users}, already_existed={_skipped_users}")
 
-    # Resolve APPLICANT role_id dynamically — works on every environment.
-    _elec_role_id = load_applicant_role_id(db)
+    # Resolve DEFAULT role_id — assigned to all migrated users.
+    _elec_role_id = load_default_role_id(db)
     _inserted_user_roles = 0
     _skipped_user_roles = 0
     if not _elec_role_id:
-        logger.info("APPLICANT role not resolved; role assignment skipped for this run")
+        logger.info("DEFAULT role not resolved; role assignment skipped for this run")
         _skipped_user_roles = int(_total_elec_usernames)
 
-    # Assign APPLICANT ROLE to every staged user that doesn't have it yet.
+    # Assign DEFAULT role to every staged user that doesn't have it yet.
     # FDW sends all locally-defined columns (user_id, role_id, deleted,
     # created_at) to the remote — supply explicit values to avoid NOT-NULL
     # violations on the remote.
@@ -1008,6 +1009,7 @@ def import_electrical_installation_via_staging_copy(
                 effective_date,
                 expire_date,
                 application_certificate_type,
+                owner_id,
                 created_at, updated_at
             )
             SELECT
@@ -1026,8 +1028,12 @@ def import_electrical_installation_via_staging_copy(
                 CASE WHEN NULLIF(trim(e.expire_date),'') IS NOT NULL
                      THEN trim(e.expire_date)::date END,
                 COALESCE(NULLIF(trim(e.application_type), ''), 'NEW'),
+                -- owner_id: the user who created the application (created_by = users.id)
+                a_owner.id,
                 now(), now()
             FROM eligible e
+            LEFT JOIN public.applications a_src ON a_src.id = e.resolved_app_id
+            LEFT JOIN public.users a_owner ON a_owner.id = a_src.created_by
             ON CONFLICT (application_number) DO UPDATE
             SET
                 approval_no               = COALESCE(EXCLUDED.approval_no,               public.certificates.approval_no),
@@ -1039,6 +1045,8 @@ def import_electrical_installation_via_staging_copy(
                 expire_date               = COALESCE(EXCLUDED.expire_date,               public.certificates.expire_date),
                 certificate_owner         = COALESCE(EXCLUDED.certificate_owner,         public.certificates.certificate_owner),
                 application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
+                -- Always fill owner_id when we now have a value and the stored one is still NULL
+                owner_id                  = COALESCE(public.certificates.owner_id, EXCLUDED.owner_id),
                 updated_at                = now()
             RETURNING id
         )

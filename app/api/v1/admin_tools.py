@@ -1842,3 +1842,214 @@ def transfer_ownership_restore(
     finally:
         db.close()
 
+
+# ── SQL: fix-region-zones ─────────────────────────────────────────────────────
+
+_SQL_FIX_REGION_UUID = """
+UPDATE public.contact_details cd
+SET region = nr.name
+FROM public.napa_regions nr
+WHERE cd.region::uuid = nr.id
+  AND cd.region ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+"""
+
+_SQL_FIX_ZONE_FROM_SECTOR = """
+UPDATE public.applications a
+SET
+    zone_id   = z.id,
+    zone_name = z.name
+FROM
+    public.application_sector_details asd,
+    public.napa_regions nr,
+    public.zones z
+WHERE
+    a.id = asd.application_id
+    AND asd.region = nr.name
+    AND nr.zone_id = z.id
+    AND asd.region IS NOT NULL
+"""
+
+_SQL_FIX_ZONE_FROM_ELECTRICAL = """
+UPDATE public.applications a
+SET
+    zone_id   = z.id,
+    zone_name = z.name
+FROM
+    public.application_electrical_installation aei,
+    public.contact_details cd,
+    public.napa_regions nr,
+    public.zones z
+WHERE
+    a.id = aei.application_id
+    AND cd.application_electrical_installation_id = aei.id
+    AND cd.region = nr.name
+    AND nr.zone_id = z.id
+"""
+
+_SQL_PREVIEW_REGION_UUID = """
+SELECT COUNT(*) AS contact_details_to_fix
+FROM public.contact_details cd
+WHERE cd.region ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  AND EXISTS (
+      SELECT 1 FROM public.napa_regions nr
+      WHERE cd.region::uuid = nr.id
+  )
+"""
+
+_SQL_PREVIEW_ZONE_FROM_SECTOR = """
+SELECT COUNT(*) AS applications_to_fix_via_sector
+FROM public.applications a
+JOIN public.application_sector_details asd ON a.id = asd.application_id
+JOIN public.napa_regions nr ON asd.region = nr.name
+JOIN public.zones z ON nr.zone_id = z.id
+WHERE asd.region IS NOT NULL
+  AND (a.zone_id IS DISTINCT FROM z.id OR a.zone_name IS DISTINCT FROM z.name)
+"""
+
+_SQL_PREVIEW_ZONE_FROM_ELECTRICAL = """
+SELECT COUNT(*) AS applications_to_fix_via_electrical
+FROM public.applications a
+JOIN public.application_electrical_installation aei ON a.id = aei.application_id
+JOIN public.contact_details cd ON cd.application_electrical_installation_id = aei.id
+JOIN public.napa_regions nr ON cd.region = nr.name
+JOIN public.zones z ON nr.zone_id = z.id
+WHERE a.zone_id IS DISTINCT FROM z.id
+   OR a.zone_name IS DISTINCT FROM z.name
+"""
+
+
+@router.post('/fix-region-zones', tags=["06 - Data Fixes"])
+def fix_region_zones(dry_run: bool = True):
+    """Fix UUID region values in contact_details and backfill zone_id/zone_name in applications.
+
+    Runs three updates in order:
+
+    1. **contact_details** — replaces UUID strings in `region` with proper region names
+       from `napa_regions`.
+    2. **applications (sector path)** — sets `zone_id`/`zone_name` via
+       `application_sector_details → napa_regions → zones`.
+    3. **applications (electrical path)** — sets `zone_id`/`zone_name` via
+       `application_electrical_installation → contact_details → napa_regions → zones`.
+
+    - `dry_run=true`  → returns row counts of what *would* be updated (no changes)
+    - `dry_run=false` → executes all three updates and returns affected row counts
+    """
+    db = _get_new_session()
+    try:
+        if dry_run:
+            region_uuid_count = db.execute(text(_SQL_PREVIEW_REGION_UUID)).scalar() or 0
+            zone_sector_count = db.execute(text(_SQL_PREVIEW_ZONE_FROM_SECTOR)).scalar() or 0
+            zone_elec_count   = db.execute(text(_SQL_PREVIEW_ZONE_FROM_ELECTRICAL)).scalar() or 0
+            return {
+                "status": "DRY_RUN",
+                "would_update": {
+                    "contact_details_uuid_regions":            region_uuid_count,
+                    "applications_zone_via_sector_details":    zone_sector_count,
+                    "applications_zone_via_electrical":        zone_elec_count,
+                },
+            }
+
+        # ── Step 1: fix UUID region values in contact_details ────────────────
+        r1 = db.execute(text(_SQL_FIX_REGION_UUID))
+        db.commit()
+
+        # ── Step 2: backfill zone from application_sector_details ────────────
+        r2 = db.execute(text(_SQL_FIX_ZONE_FROM_SECTOR))
+        db.commit()
+
+        # ── Step 3: backfill zone from electrical installation contact ───────
+        r3 = db.execute(text(_SQL_FIX_ZONE_FROM_ELECTRICAL))
+        db.commit()
+
+        rows = {
+            "contact_details_uuid_regions_fixed":       r1.rowcount,
+            "applications_zone_via_sector_details":     r2.rowcount,
+            "applications_zone_via_electrical":         r3.rowcount,
+        }
+
+        logger.info("fix-region-zones: %s", rows)
+
+        return {
+            "status": "OK",
+            "rows_updated": rows,
+            "total": sum(rows.values()),
+        }
+
+    except Exception as exc:
+        db.rollback()
+        logger.exception("fix-region-zones failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        db.close()
+
+
+# ── SQL: fix-owner-id ─────────────────────────────────────────────────────────
+
+_SQL_PREVIEW_OWNER_ID = """
+SELECT COUNT(*) AS certificates_missing_owner_id
+FROM public.certificates cert
+JOIN public.applications a ON a.id = cert.application_id
+JOIN public.users u ON u.id = a.created_by
+WHERE cert.owner_id IS NULL
+  AND a.created_by IS NOT NULL
+"""
+
+_SQL_FIX_OWNER_ID = """
+UPDATE public.certificates cert
+SET
+    owner_id   = a.created_by,
+    updated_at = now()
+FROM public.applications a
+JOIN public.users u ON u.id = a.created_by
+WHERE cert.application_id = a.id
+  AND cert.owner_id IS NULL
+  AND a.created_by IS NOT NULL
+"""
+
+
+@router.post('/fix-owner-id', tags=["06 - Data Fixes"])
+def fix_owner_id(dry_run: bool = True):
+    """Backfill `certificates.owner_id` from `applications.created_by`.
+
+    For every certificate whose `owner_id` is NULL, looks up the linked
+    application's `created_by` (which is `users.id`) and sets `owner_id`
+    to that value.  Only updates rows where a valid user actually exists.
+
+    - `dry_run=true`  → returns the count of certificates that would be updated
+    - `dry_run=false` → applies the update and returns affected row count
+    """
+    db = _get_new_session()
+    try:
+        missing = int(db.execute(text(_SQL_PREVIEW_OWNER_ID)).scalar() or 0)
+
+        if dry_run:
+            return {
+                "status": "DRY_RUN",
+                "certificates_missing_owner_id": missing,
+                "message": (
+                    f"{missing} certificate(s) have owner_id=NULL and a resolvable "
+                    f"created_by on their application. Re-run with dry_run=false to fix."
+                ),
+            }
+
+        r = db.execute(text(_SQL_FIX_OWNER_ID))
+        updated = r.rowcount or 0
+        db.commit()
+
+        logger.info("fix-owner-id: updated %d certificate rows", updated)
+
+        return {
+            "status": "OK",
+            "certificates_updated": updated,
+            "message": (
+                f"owner_id backfilled on {updated} certificate row(s) "
+                f"using applications.created_by."
+            ),
+        }
+
+    except Exception as exc:
+        db.rollback()
+        logger.exception("fix-owner-id failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        db.close()
