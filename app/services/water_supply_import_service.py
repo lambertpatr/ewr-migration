@@ -71,7 +71,7 @@ from decimal import Decimal, InvalidOperation
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.utils.lookup_cache import load_applicant_role_id
+from app.utils.lookup_cache import load_applicant_role_id, load_default_role_id
 from app.services.application_migrations_service import (
     region_map_csv,
     district_map_csv,
@@ -889,12 +889,12 @@ def import_water_supply_via_staging(
     db.commit()
     _progress(f"users: inserted={inserted_users}, already_existed={skipped_users}")
 
-    # Assign APPLICANT ROLE to every staged user that doesn't have it yet.
-    _water_role_id = load_applicant_role_id(db)
+    # Assign DEFAULT role to every staged user that doesn't have it yet.
+    _water_role_id = load_default_role_id(db)
     inserted_user_roles = 0
     skipped_user_roles = 0
     if not _water_role_id:
-        logger.info("[water-supply] APPLICANT role not resolved; role assignment skipped")
+        logger.info("[water-supply] DEFAULT role not resolved; role assignment skipped")
         skipped_user_roles = int(total_usernames)
     else:
         try:

@@ -15,6 +15,7 @@ from app.utils.lookup_cache import (
     load_legal_status_map,
     load_category_map,
     load_applicant_role_id,
+    load_default_role_id,
     load_zone_map,
 )
 
@@ -1219,14 +1220,14 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                         except Exception:
                             pass
 
-                # Resolve APPLICANT role_id dynamically — works on every environment.
-                _applicant_role_id = load_applicant_role_id(db)
+                # Resolve DEFAULT role_id — assigned to all migrated users.
+                _applicant_role_id = load_default_role_id(db)
 
                 if not _applicant_role_id:
-                    logger.info("APPLICANT role not resolved; role assignment skipped for this batch")
+                    logger.info("DEFAULT role not resolved; role assignment skipped for this batch")
                     skipped_user_roles += len(batch_usernames)
 
-                # Assign APPLICANT ROLE to each user.
+                # Assign DEFAULT role to each user.
                 if _applicant_role_id:
                     for _uname in batch_usernames:
                         try:

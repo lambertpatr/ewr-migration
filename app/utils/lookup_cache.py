@@ -773,6 +773,85 @@ def load_applicant_role_id(db: Any) -> Optional[str]:
     return None
 
 
+def load_default_role_id(db: Any) -> Optional[str]:
+    """Return the UUID of the role named 'DEFAULT', or None.
+
+    Strategy
+    --------
+    1. Probe ``public.roles`` then ``public.role`` (FDW alias) for a row
+       whose ``name`` matches 'default' (case-insensitive).
+    2. If not found, insert a new 'DEFAULT' role and return its UUID.
+    3. If all attempts fail, return ``None`` — callers skip role assignment
+       gracefully.
+
+    This is the role assigned to every migrated user on import.  Using 'DEFAULT'
+    instead of 'APPLICANT' gives a clean neutral baseline that can be upgraded
+    to a sector-specific role later through the application UI.
+    """
+    from sqlalchemy import text
+
+    # ── 1. Probe roles tables directly ────────────────────────────────────────
+    for table in _ROLE_TABLE_CANDIDATES:
+        try:
+            row = db.execute(
+                text(f"""
+                    SELECT id::text
+                    FROM   {table}
+                    WHERE  lower(trim(name)) = 'default'
+                      AND  (deleted_at IS NULL OR deleted_at > now())
+                    LIMIT  1
+                """)
+            ).fetchone()
+            if row and row[0]:
+                logger.debug("load_default_role_id: found in %s → %s", table, row[0])
+                return str(row[0])
+        except Exception as exc:
+            logger.debug("load_default_role_id: probe of %s failed (%s)", table, exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    # ── 2. Insert DEFAULT role into the first writable roles table ────────────
+    new_id = str(_uuid_mod.uuid4())
+    for table in _ROLE_TABLE_CANDIDATES:
+        try:
+            db.execute(
+                text(f"""
+                    INSERT INTO {table} (id, name, created_at, updated_at)
+                    VALUES (:id, 'DEFAULT', now(), now())
+                    ON CONFLICT DO NOTHING
+                """),
+                {"id": new_id},
+            )
+            db.flush()
+            row = db.execute(
+                text(f"""
+                    SELECT id::text FROM {table}
+                    WHERE  lower(trim(name)) = 'default'
+                    LIMIT  1
+                """)
+            ).fetchone()
+            if row and row[0]:
+                logger.info(
+                    "load_default_role_id: inserted DEFAULT role in %s → %s",
+                    table, row[0],
+                )
+                return str(row[0])
+        except Exception as exc:
+            logger.debug("load_default_role_id: insert into %s failed (%s)", table, exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+    logger.warning(
+        "load_default_role_id: DEFAULT role not found and could not be inserted "
+        "— role assignment will be skipped for this import run"
+    )
+    return None
+
+
 # ── Zone map cache ────────────────────────────────────────────────────────────
 # Keyed by lower(region_name) → zone_id (uuid str).
 # Loaded once per DB connection session; safe across multiple imports because
