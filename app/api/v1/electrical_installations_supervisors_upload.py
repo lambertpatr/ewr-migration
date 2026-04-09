@@ -63,7 +63,7 @@ def _run_job(job_id: str, df, source_file_name: str):
         db.close()
 
 
-@router.post("/upload-supervisors-work-experience")
+@router.post("/upload-employed-experience")
 def upload_supervisors_work_experience(
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None,
@@ -114,18 +114,18 @@ def upload_supervisors_work_experience(
         content={
             "status": "ACCEPTED",
             "job_id": job_id,
-            "message": "Import started in background. Check status at /api/v1/electrical-installations/supervisors-status/{job_id}",
+            "message": "Import started in background. Check status at /api/v1/electrical-installations/employed-experience-status/{job_id}",
         },
     )
 
 
-@router.get("/supervisors-status/{job_id}")
+@router.get("/employed-experience-status/{job_id}")
 def get_supervisors_job_status(job_id: str):
     if job_id not in _job_status:
         raise HTTPException(status_code=404, detail="Job not found")
     return _job_status[job_id]
 
 
-@router.get("/supervisors-jobs")
+@router.get("/employed-experience-jobs")
 def list_supervisors_jobs():
     return _job_status

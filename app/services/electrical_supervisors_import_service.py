@@ -11,8 +11,6 @@ Target tables
 -------------
 - public.supervisor_details
 - public.work_experience
-- public.self_employed (only when aei.experience_type = 'SELF_EMPLOYED')
-- public.costumer_details (not populated by this file; kept for future)
 
 Notes
 -----
@@ -237,38 +235,9 @@ def import_electrical_supervisors_via_staging_copy(
     db.commit()
     _progress(f"staging:done rows={staged}")
 
-    # Schema guard: columns we rely on
+    # Schema guard: add columns we rely on if they don't exist yet
     _progress("schema:guard")
-    # Ensure gen_random_uuid() exists in the DB
     db.execute(text("CREATE EXTENSION IF NOT EXISTS pgcrypto"))
-
-    # Drop FK constraints on work_experience.supervisor_details_id (if any)
-    # because live data can contain supervisor_details rows not present yet or
-    # we may intentionally insert without enforcing the relationship.
-    db.execute(
-        text(
-            """
-            DO $$
-            DECLARE
-                r record;
-            BEGIN
-                FOR r IN (
-                    SELECT conname
-                    FROM pg_constraint c
-                    JOIN pg_class t ON t.oid = c.conrelid
-                    JOIN pg_namespace n ON n.oid = t.relnamespace
-                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
-                    WHERE c.contype = 'f'
-                      AND n.nspname = 'public'
-                      AND t.relname = 'work_experience'
-                      AND a.attname = 'supervisor_details_id'
-                ) LOOP
-                    EXECUTE format('ALTER TABLE public.work_experience DROP CONSTRAINT IF EXISTS %I', r.conname);
-                END LOOP;
-            END $$;
-            """
-        )
-    )
     db.execute(
         text(
             """
@@ -278,8 +247,6 @@ def import_electrical_supervisors_via_staging_copy(
                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid,
                 ADD COLUMN IF NOT EXISTS voltage character varying(255);
 
-            -- Widen text-ish columns to avoid truncation during migration.
-            -- (Keeping original field names; only changing type.)
             ALTER TABLE IF EXISTS public.work_experience
                 ALTER COLUMN work_description TYPE text,
                 ALTER COLUMN name_of_employer TYPE text,
@@ -293,83 +260,6 @@ def import_electrical_supervisors_via_staging_copy(
                 ADD COLUMN IF NOT EXISTS application_id uuid,
                 ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid,
                 ADD COLUMN IF NOT EXISTS work_experience_id uuid;
-
-            -- ── self_employed ────────────────────────────────────────────────
-            ALTER TABLE IF EXISTS public.self_employed
-                ADD COLUMN IF NOT EXISTS application_id uuid,
-                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid,
-                ADD COLUMN IF NOT EXISTS voltage character varying(255);
-
-            ALTER TABLE IF EXISTS public.self_employed
-                ALTER COLUMN project_performed TYPE text,
-                ALTER COLUMN voltage TYPE text,
-                ALTER COLUMN voltage_level TYPE text;
-
-            -- ── costumer_details ─────────────────────────────────────────────
-            ALTER TABLE IF EXISTS public.costumer_details
-                ADD COLUMN IF NOT EXISTS application_id uuid,
-                ADD COLUMN IF NOT EXISTS application_electrical_installation_id uuid;
-            """
-        )
-    )
-    db.commit()
-
-    # Add FK: supervisor_details.application_electrical_installation_id
-    #         -> application_electrical_installation(id)
-    # Use named constraints and (re)create them to enforce ON DELETE CASCADE.
-    db.execute(
-        text(
-            """
-            DO $$
-            BEGIN
-                -- supervisor_details FK (force ON DELETE CASCADE)
-                IF EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'fk_sd_aei_id'
-                      AND conrelid = 'public.supervisor_details'::regclass
-                ) THEN
-                    ALTER TABLE public.supervisor_details
-                        DROP CONSTRAINT fk_sd_aei_id;
-                END IF;
-                ALTER TABLE public.supervisor_details
-                    ADD CONSTRAINT fk_sd_aei_id
-                    FOREIGN KEY (application_electrical_installation_id)
-                    REFERENCES public.application_electrical_installation (id)
-                    ON DELETE CASCADE
-                    DEFERRABLE INITIALLY DEFERRED;
-
-                -- work_experience FK (force ON DELETE CASCADE)
-                IF EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'fk_we_aei_id'
-                      AND conrelid = 'public.work_experience'::regclass
-                ) THEN
-                    ALTER TABLE public.work_experience
-                        DROP CONSTRAINT fk_we_aei_id;
-                END IF;
-                ALTER TABLE public.work_experience
-                    ADD CONSTRAINT fk_we_aei_id
-                    FOREIGN KEY (application_electrical_installation_id)
-                    REFERENCES public.application_electrical_installation (id)
-                    ON DELETE CASCADE
-                    DEFERRABLE INITIALLY DEFERRED;
-
-                -- self_employed FK (force ON DELETE CASCADE)
-                IF EXISTS (
-                    SELECT 1 FROM pg_constraint
-                    WHERE conname = 'fk_se_aei_id'
-                      AND conrelid = 'public.self_employed'::regclass
-                ) THEN
-                    ALTER TABLE public.self_employed
-                        DROP CONSTRAINT fk_se_aei_id;
-                END IF;
-                ALTER TABLE public.self_employed
-                    ADD CONSTRAINT fk_se_aei_id
-                    FOREIGN KEY (application_electrical_installation_id)
-                    REFERENCES public.application_electrical_installation (id)
-                    ON DELETE CASCADE
-                    DEFERRABLE INITIALLY DEFERRED;
-            END $$;
             """
         )
     )
@@ -630,77 +520,6 @@ def import_electrical_supervisors_via_staging_copy(
     db.commit()
     _progress(f"transform:supervisor_details inserted={ins_sd}")
 
-    # STEP 3: self_employed
-    # Simple rule: for every application in the staged file whose
-    # application_electrical_installation.experience_type = 'SELF_EMPLOYED',
-    # insert ONE self_employed row (one per application, not per staged row).
-    # Uses md5(aei.id || '|se')::uuid so the id is stable across re-uploads
-    # and matches the row seeded by the main installation importer.
-    _progress("transform:self_employed")
-    try:
-        r3 = (
-            db.execute(
-                text(
-                    """
-                WITH self_emp_apps AS (
-                    -- One distinct AEI per application that is SELF_EMPLOYED
-                    -- and appears in the staged supervisors file
-                    SELECT DISTINCT
-                        a.id                             AS app_id,
-                        aei.id                           AS aei_id,
-                        md5(aei.id::text || '|se')::uuid AS se_id
-                    FROM public.stage_elec_supervisors_raw s
-                    JOIN public.applications a
-                        ON a.application_number = trim(s.app_number)
-                    JOIN public.application_electrical_installation aei
-                        ON aei.application_id = a.id
-                    WHERE UPPER(TRIM(aei.experience_type)) = 'SELF_EMPLOYED'
-                      AND NULLIF(trim(s.app_number), '') IS NOT NULL
-                ),
-                ins AS (
-                    INSERT INTO public.self_employed (
-                        id,
-                        application_id,
-                        application_electrical_installation_id,
-                        voltage_level,
-                        created_at,
-                        updated_at
-                    )
-                    SELECT
-                        t.se_id,
-                        t.app_id,
-                        t.aei_id,
-                        'NONE',
-                        now(),
-                        now()
-                    FROM self_emp_apps t
-                    ON CONFLICT (id) DO UPDATE
-                    SET
-                        application_electrical_installation_id = COALESCE(
-                            EXCLUDED.application_electrical_installation_id,
-                            public.self_employed.application_electrical_installation_id
-                        ),
-                        updated_at = now()
-                    RETURNING 1
-                )
-                SELECT COUNT(*) AS cnt FROM ins;
-                    """
-                )
-            )
-            .mappings()
-            .first()
-            or {}
-        )
-    except Exception:
-        logger.exception("[electrical_supervisors_import] transform:self_employed failed")
-        raise
-    ins_se = int(r3.get("cnt", 0) or 0)
-    db.commit()
-    _progress(f"transform:self_employed inserted={ins_se}")
-
-    # costumer_details cannot be populated from this file (no customer name/mobile columns)
-    ins_cd = 0
-
     # Optional row previews are not necessary for these endpoints; keep response small
     include_rows = bool(include_rows)
     try:
@@ -716,15 +535,5 @@ def import_electrical_supervisors_via_staging_copy(
         "inserted": {
             "supervisor_details": {"count": ins_sd, "rows": []},
             "work_experience": {"count": ins_we, "rows": []},
-            "self_employed": {
-                "count": ins_se,
-                "rows": [],
-                "note": "enriches self_employed rows (seeded by main install import) with work details where supervisor file has matching SELF_EMPLOYED rows",
-            },
-            "costumer_details": {
-                "count": ins_cd,
-                "rows": [],
-                "note": "not populated by this file; requires customer name/mobile columns",
-            },
         },
     }
