@@ -658,13 +658,17 @@ def import_water_supply_via_staging(
     # first — so re-runs are safe and no error is raised if it already exists.
     _fk_guards: list[tuple[str, str, str, str, str]] = [
         # (table, constraint_name, fk_col, ref_table, ref_col)
-        ("applicant_proposed_investment", "fk_api_application_id",  "application_id",             "applications",              "id"),
+        ("applicant_proposed_investment", "fk_api_application_id",  "application_id",              "applications",              "id"),
         ("applicant_proposed_investment", "fk_api_asd_id",          "application_sector_detail_id","application_sector_details","id"),
-        ("project_description",           "fk_pd_application_id",   "application_id",             "applications",              "id"),
-        ("project_description",           "fk_pd_asd_id",           "application_sector_detail_id","application_sector_details","id"),
-        ("referees",                      "fk_ref_application_id",  "application_id",             "applications",              "id"),
+        ("project_description",           "fk_pd_application_id",   "application_id",              "applications",              "id"),
+        # NOTE: fk_pd_asd_id intentionally skipped —
+        # project_description.application_sector_detail_id already has
+        # the system-generated FK fk3gq9vloe8sd42cassh4whgf57 pointing to
+        # application_sector_details(id). Adding a second named FK on the
+        # same column causes a constraint conflict on re-runs.
+        ("referees",                      "fk_ref_application_id",  "application_id",              "applications",              "id"),
         ("referees",                      "fk_ref_asd_id",          "application_sector_detail_id","application_sector_details","id"),
-        ("bank_details_tanzania",         "fk_bdt_application_id",  "application_id",             "applications",              "id"),
+        ("bank_details_tanzania",         "fk_bdt_application_id",  "application_id",              "applications",              "id"),
         ("bank_details_tanzania",         "fk_bdt_asd_id",          "application_sector_detail_id","application_sector_details","id"),
     ]
 

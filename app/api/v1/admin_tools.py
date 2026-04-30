@@ -2053,3 +2053,102 @@ def fix_owner_id(dry_run: bool = True):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         db.close()
+
+
+# ── SQL: backfill location fields on applications from application_sector_details ──
+
+_SQL_PREVIEW_BACKFILL_LOCATION = """
+SELECT
+    COUNT(*) FILTER (WHERE a.region   IS NULL AND asd.region   IS NOT NULL) AS region_to_fill,
+    COUNT(*) FILTER (WHERE a.district IS NULL AND asd.district IS NOT NULL) AS district_to_fill,
+    COUNT(*) FILTER (WHERE a.street   IS NULL AND asd.street   IS NOT NULL) AS street_to_fill,
+    COUNT(*) FILTER (WHERE a.ward     IS NULL AND asd.ward     IS NOT NULL) AS ward_to_fill,
+    COUNT(*) FILTER (
+        WHERE (a.region   IS NULL AND asd.region   IS NOT NULL)
+           OR (a.district IS NULL AND asd.district IS NOT NULL)
+           OR (a.street   IS NULL AND asd.street   IS NOT NULL)
+           OR (a.ward     IS NULL AND asd.ward     IS NOT NULL)
+    ) AS total_applications_affected
+FROM public.applications a
+JOIN public.application_sector_details asd ON asd.application_id = a.id
+"""
+
+_SQL_FIX_BACKFILL_LOCATION = """
+UPDATE public.applications a
+SET
+    region   = COALESCE(a.region,   asd.region),
+    district = COALESCE(a.district, asd.district),
+    street   = COALESCE(a.street,   asd.street),
+    ward     = COALESCE(a.ward,     asd.ward),
+    updated_at = now()
+FROM public.application_sector_details asd
+WHERE asd.application_id = a.id
+  AND (
+      (a.region   IS NULL AND asd.region   IS NOT NULL) OR
+      (a.district IS NULL AND asd.district IS NOT NULL) OR
+      (a.street   IS NULL AND asd.street   IS NOT NULL) OR
+      (a.ward     IS NULL AND asd.ward     IS NOT NULL)
+  )
+"""
+
+
+@router.post("/backfill-location", tags=["01 - Schema Sync"])
+def backfill_location_fields(dry_run: bool = True):
+    """Backfill region, district, street, ward on applications where NULL.
+
+    Copies the value from `application_sector_details` into `applications`
+    **only when the applications column is NULL** and the matching
+    `application_sector_details` row has a non-NULL value.
+
+    - **dry_run=true**  → preview how many rows would be updated per column (no changes)
+    - **dry_run=false** → runs the UPDATE and returns affected row count
+    """
+    db = _get_new_session()
+    try:
+        # Always show preview first
+        preview = db.execute(text(_SQL_PREVIEW_BACKFILL_LOCATION)).mappings().one()
+        preview_dict = {
+            "region_to_fill":                int(preview["region_to_fill"]   or 0),
+            "district_to_fill":              int(preview["district_to_fill"] or 0),
+            "street_to_fill":                int(preview["street_to_fill"]   or 0),
+            "ward_to_fill":                  int(preview["ward_to_fill"]     or 0),
+            "total_applications_affected":   int(preview["total_applications_affected"] or 0),
+        }
+
+        if dry_run:
+            return {
+                "status": "DRY_RUN",
+                "message": "Run with dry_run=false to apply these changes.",
+                **preview_dict,
+            }
+
+        if preview_dict["total_applications_affected"] == 0:
+            return {
+                "status": "OK",
+                "applications_updated": 0,
+                "message": "Nothing to update — all location fields are already populated.",
+                **preview_dict,
+            }
+
+        r = db.execute(text(_SQL_FIX_BACKFILL_LOCATION))
+        updated = r.rowcount or 0
+        db.commit()
+
+        logger.info("backfill-location: updated %d application rows", updated)
+
+        return {
+            "status": "OK",
+            "applications_updated": updated,
+            "message": (
+                f"Backfilled location fields on {updated} application(s) "
+                f"from application_sector_details."
+            ),
+            **preview_dict,
+        }
+
+    except Exception as exc:
+        db.rollback()
+        logger.exception("backfill-location failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        db.close()
