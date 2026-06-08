@@ -14,6 +14,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File
 
 from app.utils.file_reader import read_users_file
 from app.services.water_supply_import_service import import_water_supply_via_staging
+from app.utils.post_import_hooks import run_post_import_hooks
 
 router = APIRouter(prefix="/api/v1/water-supply", tags=["07 - Water Supply Migration"])
 
@@ -22,8 +23,7 @@ _job_status: dict = {}
 
 def _get_new_session():
     from app.core import database as db_module
-    db_module._init_engine()
-    return db_module._SessionLocal()
+    return db_module.new_session()
 
 
 # ── Background job runner ─────────────────────────────────────────────────────
@@ -43,6 +43,8 @@ def _run_job(job_id: str, df, source_file_name: str):
 
         result = import_water_supply_via_staging(db, df, progress_cb=_cb)
         db.commit()
+        hooks_result = run_post_import_hooks(db, progress_cb=_cb)
+        result["post_import_hooks"] = hooks_result
         _job_status[job_id] = {
             "status": "COMPLETED",
             "message": "Water Supply import finished successfully.",
@@ -101,6 +103,8 @@ def upload_water_supply(
     try:
         result = import_water_supply_via_staging(db, df)
         db.commit()
+        hooks_result = run_post_import_hooks(db)
+        result["post_import_hooks"] = hooks_result
         return {
             "status": "COMPLETED",
             "message": "Water Supply import finished successfully.",

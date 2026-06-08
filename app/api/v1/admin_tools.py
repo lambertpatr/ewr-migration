@@ -111,8 +111,7 @@ _EMAIL_RE = r'([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})'
 
 def _get_new_session():
     from app.core import database as db_module
-    db_module._init_engine()
-    return db_module._SessionLocal()
+    return db_module.new_session()
 
 
 @router.post('/sync-schemas', tags=["01 - Schema Sync"])

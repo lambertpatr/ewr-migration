@@ -144,6 +144,56 @@ def run_backfill_application_id(db: Any, *, progress_cb: Optional[Callable[[str]
         return {"skipped": str(exc)}
 
 
+def run_backfill_category_type(db: Any, *, progress_cb: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """Backfill ``applications.category_type`` from the ``categories`` table.
+
+    Joins ``applications.category_id`` → ``categories.id`` to copy
+    ``categories.category_type``.  Falls back to ``'License'`` when the join
+    finds no match or the stored value is NULL / blank.  Idempotent and
+    non-fatal.
+    """
+    def _progress(msg: str):
+        logger.info("[post-import:backfill-category-type] %s", msg)
+        if callable(progress_cb):
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+
+    _progress("backfilling applications.category_type from categories …")
+    try:
+        result = db.execute(text("""
+            WITH resolved AS (
+                SELECT
+                    a.id,
+                    COALESCE(
+                        NULLIF(TRIM(c.category_type), ''),
+                        'License'
+                    ) AS resolved_type
+                FROM applications a
+                LEFT JOIN categories c ON c.id = a.category_id
+                WHERE
+                    COALESCE(NULLIF(TRIM(a.category_type), ''), '') IS DISTINCT FROM
+                    COALESCE(NULLIF(TRIM(c.category_type), ''), 'License')
+            )
+            UPDATE applications a
+            SET    category_type = r.resolved_type
+            FROM   resolved r
+            WHERE  a.id = r.id
+        """))
+        db.commit()
+        updated = result.rowcount
+        _progress(f"category_type backfill done: {updated} rows updated")
+        return {"updated": updated}
+    except Exception as exc:
+        logger.warning("[post-import:backfill-category-type] failed (non-fatal): %s", exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"skipped": str(exc)}
+
+
 def run_post_import_hooks(
     db: Any,
     *,
@@ -154,6 +204,7 @@ def run_post_import_hooks(
     1. ``align_live_schema`` — ensures columns / constraints exist
     2. ``backfill_application_id`` — fills ``application_id`` on child tables
     3. ``backfill_created_by`` — fills ``created_by`` from ``username``
+    4. ``backfill_category_type`` — fills ``category_type`` from ``categories``
 
     Returns a dict with the result of each hook.
     """
@@ -162,5 +213,6 @@ def run_post_import_hooks(
     results["align_live_schema"] = run_align_live_schema(db, progress_cb=progress_cb)
     results["backfill_application_id"] = run_backfill_application_id(db, progress_cb=progress_cb)
     results["backfill_created_by"] = run_backfill_created_by(db, progress_cb=progress_cb)
+    results["backfill_category_type"] = run_backfill_category_type(db, progress_cb=progress_cb)
 
     return results

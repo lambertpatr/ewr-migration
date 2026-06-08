@@ -15,10 +15,8 @@ _job_status: dict = {}
 
 
 def _get_new_session():
-    """Get a new DB session, initializing the engine if needed."""
     from app.core import database as db_module
-    db_module._init_engine()
-    return db_module._SessionLocal()
+    return db_module.new_session()
 
 
 def _run_shareholders_job(job_id: str, df):

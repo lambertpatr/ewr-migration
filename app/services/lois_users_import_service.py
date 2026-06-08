@@ -1,5 +1,5 @@
 # app/services/lois_users_import_service.py
-from typing import Any
+from typing import Any, Optional
 import contextlib
 import uuid
 
@@ -32,7 +32,7 @@ def upper_value(v):
 class LoisUsersImportService:
 
     @staticmethod
-    def import_users(db: Any, df, *, progress_cb=None, job_id: str | None = None, skip_existing: bool = False):
+    def import_users(db: Any, df, *, progress_cb=None, job_id: Optional[str] = None, skip_existing: bool = False):
         # import sqlalchemy symbols lazily so importing this module doesn't
         # fail in environments where SQLAlchemy isn't installed. A clear
         # ImportError will be raised when this function is executed if the

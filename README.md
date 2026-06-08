@@ -5,6 +5,31 @@
 
 ---
 
+## 🚀 Server Deployment
+
+To deploy this API to server 10.1.8.144:
+
+```bash
+# 1. Verify server is ready
+./verify-server.sh
+
+# 2. Deploy automatically
+./deploy.sh
+```
+
+**Quick Start:** See [QUICK_DEPLOY.md](QUICK_DEPLOY.md) for step-by-step instructions.
+
+**Full Documentation:** See [DEPLOY_TO_SERVER.md](DEPLOY_TO_SERVER.md) for detailed deployment guide.
+
+**Server Details:**
+- Server: 10.1.8.144
+- User: ewura-admin (password: secure@123)
+- Deploy Path: /var/lib/pgsql/scripts/ewura-migration
+- Owner: postgres:postgres
+- API URL: http://10.1.8.144:8000/docs
+
+---
+
 ## Prerequisites
 
 Before touching any endpoint:

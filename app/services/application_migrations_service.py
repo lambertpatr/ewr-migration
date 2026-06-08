@@ -1,4 +1,4 @@
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 import uuid
 import re
 import os
@@ -1784,7 +1784,7 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
         return result
 
 
-def backfill_application_id_on_child_tables(db: Any, sector_name: str | None = None) -> Dict[str, int]:
+def backfill_application_id_on_child_tables(db: Any, sector_name: Optional[str] = None) -> Dict[str, int]:
     """Backfill application_id (and app_sector_detail_id where applicable) on
     ALL child tables that sit below applications in the hierarchy.
 
@@ -1839,7 +1839,7 @@ def backfill_application_id_on_child_tables(db: Any, sector_name: str | None = N
                 pass
             return False
 
-    def _run(sql: str, key: str, *, table: str | None = None) -> None:
+    def _run(sql: str, key: str, *, table: Optional[str] = None) -> None:
         # Skip silently if the target table does not exist
         if table and not _table_exists(table):
             counts[key] = 0
@@ -2205,7 +2205,7 @@ def backfill_created_by_from_username(db: Any) -> Dict[str, int]:
                 pass
             return False
 
-    def _run(sql: str, key: str, *, table: str | None = None) -> None:
+    def _run(sql: str, key: str, *, table: Optional[str] = None) -> None:
         if table and not _cb_table_exists(table):
             counts[key] = 0
             return
