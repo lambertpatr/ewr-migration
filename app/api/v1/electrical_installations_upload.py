@@ -127,6 +127,16 @@ def upload_electrical_installations(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"failed to read uploaded file: {e}")
 
+    # Filter: only process rows where approval_no is present
+    if "approval_no" in df.columns:
+        before = len(df)
+        df = df[df["approval_no"].notna() & (df["approval_no"].astype(str).str.strip() != "")]
+        skipped = before - len(df)
+        if skipped:
+            logger.info("Skipped %d rows with null/empty approval_no (kept %d)", skipped, len(df))
+    if df.empty:
+        raise HTTPException(status_code=400, detail="No rows with a valid approval_no found in the uploaded file.")
+
     if sync and not background:
         # Synchronous path — wait for completion
         db = _get_new_session()

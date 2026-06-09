@@ -8,6 +8,7 @@ Upload the Water Supply Excel/CSV and import into:
   - documents                   (one row per attachment pair)
 """
 
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File
@@ -17,6 +18,8 @@ from app.services.water_supply_import_service import import_water_supply_via_sta
 from app.utils.post_import_hooks import run_post_import_hooks
 
 router = APIRouter(prefix="/api/v1/water-supply", tags=["07 - Water Supply Migration"])
+
+logger = logging.getLogger(__name__)
 
 _job_status: dict = {}
 
@@ -92,6 +95,16 @@ def upload_water_supply(
         df = read_users_file(file.filename, file.file)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
+
+    # Filter: only process rows where approval_no is present
+    if "approval_no" in df.columns:
+        before = len(df)
+        df = df[df["approval_no"].notna() & (df["approval_no"].astype(str).str.strip() != "")]
+        skipped = before - len(df)
+        if skipped:
+            logger.info("Skipped %d rows with null/empty approval_no (kept %d)", skipped, len(df))
+    if df.empty:
+        raise HTTPException(status_code=400, detail="No rows with a valid approval_no found in the uploaded file.")
 
     if background:
         job_id = f"water-supply-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
