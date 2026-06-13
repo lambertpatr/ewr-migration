@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, Query, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 import logging
@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from enum import Enum
 
-from app.core.database import get_db
+from app.core.database import _db_env_var
 from app.utils.file_reader import read_users_file
 from app.services.application_migrations_service import (
     import_applications_from_df,
@@ -65,6 +65,11 @@ class SectorName(str, Enum):
     ELECTRICITY = "ELECTRICITY"
     WATER_SUPPLY = "WATER_SUPPLY"
 
+class DBEnv(str, Enum):
+    dev     = "dev"
+    staging = "staging"
+    prod    = "prod"
+
 # Simple in-memory job status tracker
 _job_status: dict = {}
 
@@ -74,7 +79,7 @@ def _get_new_session():
     return db_module.new_session()
 
 
-def _run_import_job(job_id: str, df, sector_name: str = "PETROLEUM"):
+def _run_import_job(job_id: str, df, sector_name: str = "PETROLEUM", db_env: str = "dev"):
     """Background task that runs the import and updates job status."""
     global _job_status
 
@@ -88,8 +93,13 @@ def _run_import_job(job_id: str, df, sector_name: str = "PETROLEUM"):
     root_logger.addHandler(_job_handler)
     # ──────────────────────────────────────────────────────────────────────────
 
+    # Re-apply the request-time DB environment inside the background thread.
+    # BackgroundTasks do NOT inherit ContextVar values from the request context,
+    # so without this the ContextVar falls back to its default ("dev").
+    _db_env_var.set(db_env)
+
     _job_status[job_id] = {"status": "RUNNING", "started_at": datetime.utcnow().isoformat(), "progress": "Starting..."}
-    logger.info("[Job %s] Starting import of %d rows (sector=%s)", job_id, len(df), sector_name)
+    logger.info("[Job %s] Starting import of %d rows (sector=%s, db_env=%s)", job_id, len(df), sector_name, db_env)
 
     try:
         db = _get_new_session()
@@ -163,9 +173,10 @@ def _run_import_job(job_id: str, df, sector_name: str = "PETROLEUM"):
 @router.post('/upload')
 def upload_application_migrations(
     sector_name: SectorName = Form(SectorName.PETROLEUM),
+    db_env: DBEnv = Form(DBEnv.dev, description="Target database environment (dev / staging / prod)"),
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None,
-    sync: bool = False
+    sync: bool = Form(False),
 ):
     """
     Upload and import applications from Excel/CSV.
@@ -176,9 +187,12 @@ def upload_application_migrations(
     - Use GET /status/{job_id} to check progress.
     - Set sync=true to wait for the import to complete (may timeout for large files).
     """
-    logger.info("Received upload request: %s (sector=%s) (sync=%s)", file.filename, sector_name, sync)
-    
-    # Use the enum value (string) for downstream logic
+    logger.info(
+        "Received upload request: %s (sector=%s) (sync=%s) (db_env=%s)",
+        file.filename, sector_name, sync, db_env.value,
+    )
+    # Set the ContextVar immediately from the explicit query param — no header magic needed.
+    _db_env_var.set(db_env.value)
     sector_str = sector_name.value
 
     try:
@@ -188,13 +202,19 @@ def upload_application_migrations(
         logger.exception("Failed to read uploaded file")
         raise HTTPException(status_code=400, detail=f"failed to read uploaded file: {e}")
 
-    # Filter: only process rows where approval_no is present
+    # Filter: only process rows where approval_no is a valid licence number
+    # (must be non-null, non-blank, and contain at least one '-' or '/' — bare numbers like 33 are rejected)
     if "approval_no" in df.columns:
         before = len(df)
-        df = df[df["approval_no"].notna() & (df["approval_no"].astype(str).str.strip() != "")]
+        mask = (
+            df["approval_no"].notna()
+            & (df["approval_no"].astype(str).str.strip() != "")
+            & (df["approval_no"].astype(str).str.contains(r'[-/]', regex=True))
+        )
+        df = df[mask]
         skipped = before - len(df)
         if skipped:
-            logger.info("Skipped %d rows with null/empty approval_no (kept %d)", skipped, len(df))
+            logger.info("Skipped %d rows with invalid/missing approval_no (kept %d)", skipped, len(df))
     if df.empty:
         raise HTTPException(status_code=400, detail="No rows with a valid approval_no found in the uploaded file.")
 
@@ -218,11 +238,12 @@ def upload_application_migrations(
         finally:
             db.close()
     else:
-        # Async mode: run in background and return job_id immediately
+        # Async mode: run in background and return job_id immediately.
+        # Pass db_env explicitly — BackgroundTasks run outside the request ContextVar scope.
         job_id = str(uuid_mod.uuid4())
         _job_status[job_id] = {"status": "QUEUED", "queued_at": datetime.utcnow().isoformat()}
-        background_tasks.add_task(_run_import_job, job_id, df, sector_str)
-        logger.info("Queued background import job: %s", job_id)
+        background_tasks.add_task(_run_import_job, job_id, df, sector_str, db_env.value)
+        logger.info("Queued background import job: %s (db_env=%s)", job_id, db_env.value)
         return JSONResponse(
             status_code=202,
             content={

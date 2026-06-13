@@ -1,8 +1,7 @@
 # app/main.py
-from fastapi import Depends, FastAPI, Header
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Literal
-from app.core.database import _db_env_var
+from app.core.database import _db_env_var, DBEnv
 from app.api.v1.lois_users_upload import router as lois_users_router
 from app.api.v1.application_migrations_upload import router as app_migrations_router
 from app.api.v1.shareholders_upload import router as shareholders_router
@@ -23,19 +22,8 @@ from app.api.v1.water_supply_upload import router as water_supply_router
 import app.api.v1.categories_upload as categories_upload
 
 
-def _set_db_env(
-    x_db_env: Literal["dev", "staging", "prod"] = Header(
-        default="dev",
-        description="Target database environment.",
-    )
-):
-    """Global dependency: sets the per-request DB environment from X-DB-Env header."""
-    _db_env_var.set(x_db_env.strip().lower())
-
-
 app = FastAPI(
     title="EWURA LOIS Migration API",
-    dependencies=[Depends(_set_db_env)],
 )
 
 # Add permissive CORS so Swagger UI Try-it works from the browser

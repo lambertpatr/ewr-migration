@@ -999,10 +999,12 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                         # Capture userid/username values (for users table creation)
                         if app_col == 'username' and val not in (None, ''):
                             try:
-                                s_un = str(val).strip().lower()
-                                if s_un and s_un not in ('nan', 'nat', 'none', 'null'):
-                                    batch_usernames.add(s_un)
-                                    val = s_un  # also store lowercased in app_row
+                                s_un = str(val).strip()
+                                if s_un and s_un.lower() not in ('nan', 'nat', 'none', 'null'):
+                                    # Keep the original casing for the applications table.
+                                    # Use lowercase only for the users dedup lookup set.
+                                    batch_usernames.add(s_un.lower())
+                                    val = s_un  # save as-is from Excel
                             except Exception:
                                 pass
                         # If region column contains an id, map it to the name.

@@ -1,8 +1,9 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 import uuid as uuid_mod
 from datetime import datetime
 
+from app.core.database import _db_env_var, DBEnv
 from app.utils.file_reader import read_users_file
 from app.services.electrical_certificate_verifications_import_service import (
     import_electrical_certificate_verifications_via_staging_copy,
@@ -23,7 +24,8 @@ def _get_new_session():
     return db_module.new_session()
 
 
-def _run_job(job_id: str, df, source_file_name: str):
+def _run_job(job_id: str, df, source_file_name: str, db_env: str = "dev"):
+    _db_env_var.set(db_env)
     _job_status[job_id] = {
         "status": "RUNNING",
         "started_at": datetime.utcnow().isoformat(),
@@ -69,6 +71,7 @@ def upload_certificate_verifications(
     background: bool = False,
     include_rows: bool = False,
     limit_rows: int = 50,
+    db_env: DBEnv = Form(DBEnv.dev, description="Target database environment (dev / staging / prod)"),
 ):
     """Upload certificate verifications Excel.
 
@@ -86,6 +89,8 @@ def upload_certificate_verifications(
         df = read_users_file(file.filename, file.file)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"failed to read uploaded file: {e}")
+
+    _db_env_var.set(db_env.value)
 
     if sync and not background:
         db = _get_new_session()
@@ -111,7 +116,8 @@ def upload_certificate_verifications(
         "queued_at": datetime.utcnow().isoformat(),
         "source_file_name": file.filename,
     }
-    background_tasks.add_task(_run_job, job_id, df, file.filename)
+    current_db_env = db_env.value
+    background_tasks.add_task(_run_job, job_id, df, file.filename, current_db_env)
     return JSONResponse(
         status_code=202,
         content={

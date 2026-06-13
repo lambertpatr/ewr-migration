@@ -1,8 +1,9 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 import uuid as uuid_mod
 from datetime import datetime
 
+from app.core.database import _db_env_var, DBEnv
 from app.utils.file_reader import read_users_file
 from app.services.electrical_installation_import_service import (
     import_electrical_installations_via_staging_copy,
@@ -22,7 +23,10 @@ def _get_new_session():
     return db_module.new_session()
 
 
-def _run_job(job_id: str, df, source_file_name: str):
+def _run_job(job_id: str, df, source_file_name: str, db_env: str = "dev"):
+    # Re-apply the request-time DB environment — BackgroundTasks do NOT
+    # inherit ContextVar values from the request context.
+    _db_env_var.set(db_env)
     _job_status[job_id] = {
         "status": "RUNNING",
         "started_at": datetime.utcnow().isoformat(),
@@ -74,6 +78,7 @@ def upload_electrical_installations(
     background: bool = False,
     include_rows: bool = False,
     limit_rows: int = 50,
+    db_env: DBEnv = Form(DBEnv.dev, description="Target database environment (dev / staging / prod)"),
 ):
     """Upload Excel/CSV containing electrical installation records and import into
     `application_electrical_installation`.
@@ -127,13 +132,22 @@ def upload_electrical_installations(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"failed to read uploaded file: {e}")
 
-    # Filter: only process rows where approval_no is present
+    # Set ContextVar from explicit query param
+    _db_env_var.set(db_env.value)
+
+    # Filter: only process rows where approval_no is a valid licence number
+    # (must be non-null, non-blank, and contain at least one '-' or '/' — bare numbers like 33 are rejected)
     if "approval_no" in df.columns:
         before = len(df)
-        df = df[df["approval_no"].notna() & (df["approval_no"].astype(str).str.strip() != "")]
+        mask = (
+            df["approval_no"].notna()
+            & (df["approval_no"].astype(str).str.strip() != "")
+            & (df["approval_no"].astype(str).str.contains(r'[-/]', regex=True))
+        )
+        df = df[mask]
         skipped = before - len(df)
         if skipped:
-            logger.info("Skipped %d rows with null/empty approval_no (kept %d)", skipped, len(df))
+            logger.info("Skipped %d rows with invalid/missing approval_no (kept %d)", skipped, len(df))
     if df.empty:
         raise HTTPException(status_code=400, detail="No rows with a valid approval_no found in the uploaded file.")
 
@@ -162,13 +176,14 @@ def upload_electrical_installations(
             db.close()
     else:
         # Background path — return job_id immediately
+        current_db_env = db_env.value
         job_id = str(uuid_mod.uuid4())
         _job_status[job_id] = {
             "status": "QUEUED",
             "queued_at": datetime.utcnow().isoformat(),
             "source_file_name": file.filename,
         }
-        background_tasks.add_task(_run_job, job_id, df, file.filename)
+        background_tasks.add_task(_run_job, job_id, df, file.filename, current_db_env)
         return JSONResponse(
             status_code=202,
             content={

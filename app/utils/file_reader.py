@@ -1,4 +1,5 @@
 # app/utils/file_reader.py
+import io
 import pandas as pd
 
 def read_users_file(filename: str, file_obj) -> pd.DataFrame:
@@ -19,6 +20,13 @@ def read_users_file(filename: str, file_obj) -> pd.DataFrame:
     Raises:
         ValueError: If the file is not a CSV or XLSX, or if no data rows are found.
     """
+    # SpooledTemporaryFile (FastAPI's default) does not implement seekable(),
+    # which pandas requires. Read all bytes once and wrap in BytesIO so every
+    # subsequent seek/read works regardless of the original file type.
+    if hasattr(file_obj, "read"):
+        raw = file_obj.read()
+        file_obj = io.BytesIO(raw)
+
     if filename.lower().endswith(".csv"):
         # Keep CSV reading simple for now, but could be enhanced if needed.
         df = pd.read_csv(file_obj)

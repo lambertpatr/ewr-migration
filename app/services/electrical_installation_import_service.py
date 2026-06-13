@@ -1005,11 +1005,13 @@ def import_electrical_installation_via_staging_copy(
                 approval_no,
                 approval_date,
                 category_license_type,
+                certificate_type,
                 license_type,
                 effective_date,
                 expire_date,
                 application_certificate_type,
                 owner_id,
+                sector,
                 created_at, updated_at
             )
             SELECT
@@ -1022,6 +1024,7 @@ def import_electrical_installation_via_staging_copy(
                 CASE WHEN NULLIF(trim(e.completed_at),'') IS NOT NULL
                      THEN trim(e.completed_at)::date END,
                 e.resolved_category_license_type,
+                COALESCE(NULLIF(trim(e.category_type), ''), 'License') AS certificate_type,
                 e.resolved_license_type,
                 CASE WHEN NULLIF(trim(e.effective_date),'') IS NOT NULL
                      THEN trim(e.effective_date)::date END,
@@ -1030,6 +1033,7 @@ def import_electrical_installation_via_staging_copy(
                 COALESCE(NULLIF(trim(e.application_type), ''), 'NEW'),
                 -- owner_id: the user who created the application (created_by = users.id)
                 a_owner.id,
+                'ELECTRICITY' AS sector,
                 now(), now()
             FROM eligible e
             LEFT JOIN public.applications a_src ON a_src.id = e.resolved_app_id
@@ -1040,6 +1044,7 @@ def import_electrical_installation_via_staging_copy(
                 approval_date             = COALESCE(EXCLUDED.approval_date,             public.certificates.approval_date),
                 license_type              = EXCLUDED.license_type,
                 category_license_type     = EXCLUDED.category_license_type,
+                certificate_type          = COALESCE(EXCLUDED.certificate_type, public.certificates.certificate_type),
                 application_id            = EXCLUDED.application_id,
                 effective_date            = COALESCE(EXCLUDED.effective_date,            public.certificates.effective_date),
                 expire_date               = COALESCE(EXCLUDED.expire_date,               public.certificates.expire_date),
@@ -1047,6 +1052,7 @@ def import_electrical_installation_via_staging_copy(
                 application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
                 -- Always fill owner_id when we now have a value and the stored one is still NULL
                 owner_id                  = COALESCE(public.certificates.owner_id, EXCLUDED.owner_id),
+                sector                    = COALESCE(EXCLUDED.sector,                    public.certificates.sector),
                 updated_at                = now()
             RETURNING id
         )

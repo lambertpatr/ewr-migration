@@ -1006,6 +1006,7 @@ def import_water_supply_via_staging(
         INSERT INTO public.certificates (
             id,
             application_id,
+            owner_id,
             application_number,
             approval_no,
             approval_date,
@@ -1022,6 +1023,7 @@ def import_water_supply_via_staging(
         SELECT
             gen_random_uuid(),
             a.id,
+            a.created_by,
             btrim(s.application_number),
             NULLIF(btrim(s.approval_no), ''),
             CASE WHEN NULLIF(btrim(s.completed_at), '') IS NOT NULL
@@ -1034,7 +1036,7 @@ def import_water_supply_via_staging(
                  THEN btrim(s.expire_date)::date END,
             COALESCE(({_at_sql}), 'NEW'),
             'WATER_SUPPLY',
-            'License',
+            COALESCE(NULLIF(a.category_type, ''), 'License') AS certificate_type,
             now(),
             now()
         FROM {_STAGE} s
@@ -1046,12 +1048,13 @@ def import_water_supply_via_staging(
             approval_date             = COALESCE(EXCLUDED.approval_date,             public.certificates.approval_date),
             license_type              = COALESCE(EXCLUDED.license_type,              public.certificates.license_type),
             category_license_type     = COALESCE(EXCLUDED.category_license_type,     public.certificates.category_license_type),
+            certificate_type          = COALESCE(EXCLUDED.certificate_type,          public.certificates.certificate_type),
             application_id            = COALESCE(EXCLUDED.application_id,            public.certificates.application_id),
+            owner_id                  = EXCLUDED.owner_id,
             effective_date            = COALESCE(EXCLUDED.effective_date,            public.certificates.effective_date),
             expire_date               = COALESCE(EXCLUDED.expire_date,               public.certificates.expire_date),
             application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
             sector                    = 'WATER_SUPPLY',
-            certificate_type          = 'License',
             updated_at                = now()
     """))
     upserted_certs = r_certs.rowcount or 0

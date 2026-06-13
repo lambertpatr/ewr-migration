@@ -11,8 +11,9 @@ Upload the Water Supply Excel/CSV and import into:
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File
+from fastapi import APIRouter, BackgroundTasks, HTTPException, UploadFile, File, Form, Query
 
+from app.core.database import _db_env_var, DBEnv
 from app.utils.file_reader import read_users_file
 from app.services.water_supply_import_service import import_water_supply_via_staging
 from app.utils.post_import_hooks import run_post_import_hooks
@@ -31,7 +32,8 @@ def _get_new_session():
 
 # ── Background job runner ─────────────────────────────────────────────────────
 
-def _run_job(job_id: str, df, source_file_name: str):
+def _run_job(job_id: str, df, source_file_name: str, db_env: str = "dev"):
+    _db_env_var.set(db_env)
     _job_status[job_id] = {
         "status": "RUNNING",
         "started_at": datetime.utcnow().isoformat(),
@@ -77,6 +79,7 @@ def upload_water_supply(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     background: bool = True,
+    db_env: DBEnv = Form(DBEnv.dev, description="Target database environment (dev / staging / prod)"),
 ):
     """Upload a Water Supply Excel/CSV file and import all records.
 
@@ -96,19 +99,28 @@ def upload_water_supply(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Could not read file: {exc}")
 
-    # Filter: only process rows where approval_no is present
+    _db_env_var.set(db_env.value)
+
+    # Filter: only process rows where approval_no is a valid licence number
+    # (must be non-null, non-blank, and contain at least one '-' or '/' — bare numbers like 33 are rejected)
     if "approval_no" in df.columns:
         before = len(df)
-        df = df[df["approval_no"].notna() & (df["approval_no"].astype(str).str.strip() != "")]
+        mask = (
+            df["approval_no"].notna()
+            & (df["approval_no"].astype(str).str.strip() != "")
+            & (df["approval_no"].astype(str).str.contains(r'[-/]', regex=True))
+        )
+        df = df[mask]
         skipped = before - len(df)
         if skipped:
-            logger.info("Skipped %d rows with null/empty approval_no (kept %d)", skipped, len(df))
+            logger.info("Skipped %d rows with invalid/missing approval_no (kept %d)", skipped, len(df))
     if df.empty:
         raise HTTPException(status_code=400, detail="No rows with a valid approval_no found in the uploaded file.")
 
     if background:
         job_id = f"water-supply-{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
-        background_tasks.add_task(_run_job, job_id, df, file.filename or "upload")
+        current_db_env = db_env.value
+        background_tasks.add_task(_run_job, job_id, df, file.filename or "upload", current_db_env)
         return {"job_id": job_id, "status": "QUEUED", "rows": len(df)}
 
     # Synchronous path

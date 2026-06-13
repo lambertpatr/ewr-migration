@@ -576,6 +576,7 @@ BEGIN
 
         application_id,
         owner_id,
+        sector,
         application_number,
         approval_no,
         application_certificate_type,
@@ -587,6 +588,7 @@ BEGIN
         licence_path,
         license_type,
         category_license_type,
+        certificate_type,
         certificate_owner,
         zone_id,
         zone_name
@@ -603,7 +605,15 @@ BEGIN
         NULL::uuid AS updated_by,
 
         a.id AS application_id,
-        NULL::uuid AS owner_id,
+        a.created_by AS owner_id,
+        -- Derive sector from the application's license_type
+        CASE
+            WHEN a.license_type LIKE '%PETROLEUM'      THEN 'PETROLEUM'
+            WHEN a.license_type LIKE '%NATURAL_GAS'    THEN 'NATURAL_GAS'
+            WHEN a.license_type = 'LICENSE_WATER'       THEN 'WATER_SUPPLY'
+            WHEN a.license_type LIKE '%ELECTRICITY%'   THEN 'ELECTRICITY'
+            ELSE NULL
+        END AS sector,
         a.application_number,
         a.approval_no,
         -- application_certificate_type from staged application_type (NEW/RENEW/UPGRADE etc.)
@@ -625,6 +635,7 @@ BEGIN
         a.licence_path,
         a.license_type,
         a.category_license_type,
+        a.category_type AS certificate_type,
         NULL::text AS certificate_owner,
         a.zone_id,
         a.zone_name
@@ -646,6 +657,8 @@ BEGIN
         application_number   = COALESCE(EXCLUDED.application_number,   public.certificates.application_number),
         approval_no          = COALESCE(EXCLUDED.approval_no,          public.certificates.approval_no),
         application_id       = EXCLUDED.application_id,
+        owner_id             = EXCLUDED.owner_id,
+        sector               = COALESCE(EXCLUDED.sector,               public.certificates.sector),
         effective_date       = COALESCE(EXCLUDED.effective_date,       public.certificates.effective_date),
         expire_date          = COALESCE(EXCLUDED.expire_date,          public.certificates.expire_date),
         intimate_date        = COALESCE(EXCLUDED.intimate_date,        public.certificates.intimate_date),
@@ -654,6 +667,7 @@ BEGIN
         licence_path         = COALESCE(EXCLUDED.licence_path,         public.certificates.licence_path),
         license_type         = EXCLUDED.license_type,
         category_license_type = EXCLUDED.category_license_type,
+        certificate_type     = COALESCE(EXCLUDED.certificate_type,     public.certificates.certificate_type),
         application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
         zone_id              = COALESCE(EXCLUDED.zone_id,              public.certificates.zone_id),
         zone_name            = COALESCE(EXCLUDED.zone_name,            public.certificates.zone_name),
@@ -661,6 +675,34 @@ BEGIN
 
     GET DIAGNOSTICS v_cert_inserted = ROW_COUNT;
     RAISE NOTICE '[staging-transform] inserted certificates=%', v_cert_inserted;
+END $$;
+
+
+-------------------------------------------------------------------------------
+-- 2b-backfill) Fix existing certificates: fill NULL sector from license_type
+-- and sync owner_id with applications.created_by.
+-------------------------------------------------------------------------------
+DO $$
+DECLARE
+    v_updated bigint;
+BEGIN
+    UPDATE public.certificates c
+    SET    sector = CASE
+                        WHEN a.license_type LIKE '%PETROLEUM'      THEN 'PETROLEUM'
+                        WHEN a.license_type LIKE '%NATURAL_GAS'    THEN 'NATURAL_GAS'
+                        WHEN a.license_type = 'LICENSE_WATER'       THEN 'WATER_SUPPLY'
+                        WHEN a.license_type LIKE '%ELECTRICITY%'   THEN 'ELECTRICITY'
+                        ELSE NULL
+                    END,
+           owner_id = a.created_by,
+           certificate_type = COALESCE(a.category_type, c.certificate_type),
+           updated_at = now()
+    FROM   public.applications a
+    WHERE  a.application_number = c.application_number
+      AND  (c.sector IS NULL OR c.sector = '' OR c.owner_id IS DISTINCT FROM a.created_by);
+
+    GET DIAGNOSTICS v_updated = ROW_COUNT;
+    RAISE NOTICE '[staging-transform] backfilled certificates (sector+owner_id)=%', v_updated;
 END $$;
 
 

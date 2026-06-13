@@ -2151,3 +2151,147 @@ def backfill_location_fields(dry_run: bool = True):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         db.close()
+
+
+# ── Application lookup by number ──────────────────────────────────────────────
+
+@router.get("/lookup-by-number", tags=["06 - Admin Utilities"])
+def lookup_by_number(
+    number: str = Query(
+        ...,
+        description="application_number OR approval_no to search (special chars are ignored when matching)",
+    ),
+    name: str = Query(
+        default=None,
+        description=(
+            "Optional: facility_name / company_name / applicant_name filter. "
+            "Partial, case-insensitive, special-char-insensitive match. "
+            "Leave blank to return the first match by number only."
+        ),
+    ),
+    limit: int = Query(
+        default=10,
+        ge=1,
+        le=100,
+        description="Maximum number of results to return (default 10, max 100).",
+    ),
+    db_env: str = Query(default="dev", description="Target database environment (dev / staging / prod)"),
+):
+    """
+    Look up application details — including **facility_name**, **company_name**,
+    and **applicant_name** — using an **application_number** or **approval_no**.
+
+    ### How matching works
+    - **Number match**: strips all non-alphanumeric characters before comparing,
+      so `EL/001/2022`, `EL001 2022`, and `EL0012022` all match the same record.
+    - **Name filter** (optional): partial, case-insensitive, strips special chars.
+      Useful when a number appears across multiple records.
+
+    ### Returns
+    A list of matching records with the most recently created first.
+    Each record contains the core application fields plus the resolved
+    `facility_name`, `company_name`, and `applicant_name` from related tables.
+    """
+    from app.core.database import _db_env_var
+    _db_env_var.set(db_env)
+
+    db = _get_new_session()
+    try:
+        params = {"number": number, "limit": limit}
+
+        if name:
+            params["name"] = name
+            name_filter_sql = """
+                AND regexp_replace(
+                        lower(COALESCE(aei.applicant_name, asd.facility_name, asd.company_name)),
+                        '[^a-z0-9]', '', 'g'
+                    )
+                    LIKE '%%' ||
+                         regexp_replace(lower(:name), '[^a-z0-9]', '', 'g')
+                    || '%%'
+            """
+        else:
+            name_filter_sql = ""
+
+        sql = text(f"""
+            SELECT
+                a.id,
+                a.application_number,
+                a.approval_no,
+                a.application_type,
+                a.license_type,
+                a.effective_date,
+                a.expire_date,
+                a.username,
+                a.created_at,
+                a.updated_at,
+                COALESCE(
+                    aei.applicant_name,
+                    asd.facility_name,
+                    asd.company_name
+                )                           AS resolved_name,
+                asd.facility_name           AS facility_name,
+                asd.company_name            AS company_name,
+                aei.applicant_name          AS applicant_name,
+                asd.region                  AS region,
+                asd.district                AS district
+            FROM public.applications a
+            LEFT JOIN public.application_sector_details asd
+                   ON asd.application_id = a.id
+            LEFT JOIN public.application_electrical_installation aei
+                   ON aei.application_id = a.id
+            WHERE (
+                regexp_replace(trim(a.application_number), '[^A-Za-z0-9]', '', 'g')
+                    = regexp_replace(trim(:number), '[^A-Za-z0-9]', '', 'g')
+                OR
+                regexp_replace(trim(a.approval_no), '[^A-Za-z0-9]', '', 'g')
+                    = regexp_replace(trim(:number), '[^A-Za-z0-9]', '', 'g')
+            )
+            {name_filter_sql}
+            ORDER BY a.created_at DESC
+            LIMIT :limit
+        """)
+
+        rows = db.execute(sql, params).fetchall()
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No application found for number='{number}'"
+                    + (f" and name containing '{name}'" if name else "")
+                    + "."
+                ),
+            )
+
+        def _fmt(v):
+            """Make every value JSON-serialisable."""
+            if v is None:
+                return None
+            if hasattr(v, "isoformat"):
+                return v.isoformat()
+            return str(v)
+
+        results = [
+            {k: _fmt(v) for k, v in dict(row._mapping).items()}
+            for row in rows
+        ]
+
+        return {
+            "count": len(results),
+            "query": {
+                "number": number,
+                "name_filter": name,
+                "limit": limit,
+                "db_env": db_env,
+            },
+            "results": results,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("lookup-by-number: error for number=%s name=%s", number, name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        db.close()

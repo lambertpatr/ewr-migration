@@ -194,6 +194,58 @@ def run_backfill_category_type(db: Any, *, progress_cb: Optional[Callable[[str],
         return {"skipped": str(exc)}
 
 
+def run_backfill_certificates_sector_owner(
+    db: Any, *,
+    progress_cb: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """Backfill ``certificates.sector`` (from ``applications.license_type``)
+    and ``certificates.owner_id`` (from ``applications.created_by``).
+
+    Idempotent and non-fatal.
+    """
+    def _progress(msg: str):
+        logger.info("[post-import:backfill-certs-sector-owner] %s", msg)
+        if callable(progress_cb):
+            try:
+                progress_cb(msg)
+            except Exception:
+                pass
+
+    _progress("backfilling certificates.sector + owner_id + certificate_type …")
+    try:
+        result = db.execute(text("""
+            UPDATE public.certificates c
+            SET    sector = CASE
+                               WHEN a.license_type LIKE '%PETROLEUM'      THEN 'PETROLEUM'
+                               WHEN a.license_type LIKE '%NATURAL_GAS'    THEN 'NATURAL_GAS'
+                               WHEN a.license_type = 'LICENSE_WATER'       THEN 'WATER_SUPPLY'
+                               WHEN a.license_type LIKE '%ELECTRICITY%'   THEN 'ELECTRICITY'
+                               ELSE NULL
+                           END,
+                                     owner_id   = a.created_by,
+                                     certificate_type = COALESCE(a.category_type, c.certificate_type),
+                   updated_at = now()
+            FROM   public.applications a
+            WHERE  a.application_number = c.application_number
+                            AND  (
+                                     c.sector IS NULL OR c.sector = ''
+                                OR c.owner_id IS DISTINCT FROM a.created_by
+                                OR (a.category_type IS NOT NULL AND a.category_type <> '' AND c.certificate_type IS DISTINCT FROM a.category_type)
+                            )
+        """))
+        db.commit()
+        updated = result.rowcount
+        _progress(f"certificates backfilled: {updated} rows updated")
+        return {"updated": updated}
+    except Exception as exc:
+        logger.warning("[post-import:backfill-certs-sector-owner] failed (non-fatal): %s", exc)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        return {"skipped": str(exc)}
+
+
 def run_post_import_hooks(
     db: Any,
     *,
@@ -205,6 +257,7 @@ def run_post_import_hooks(
     2. ``backfill_application_id`` — fills ``application_id`` on child tables
     3. ``backfill_created_by`` — fills ``created_by`` from ``username``
     4. ``backfill_category_type`` — fills ``category_type`` from ``categories``
+    5. ``backfill_certificates_sector_owner`` — fills ``sector`` + ``owner_id``
 
     Returns a dict with the result of each hook.
     """
@@ -214,5 +267,6 @@ def run_post_import_hooks(
     results["backfill_application_id"] = run_backfill_application_id(db, progress_cb=progress_cb)
     results["backfill_created_by"] = run_backfill_created_by(db, progress_cb=progress_cb)
     results["backfill_category_type"] = run_backfill_category_type(db, progress_cb=progress_cb)
+    results["backfill_certificates_sector_owner"] = run_backfill_certificates_sector_owner(db, progress_cb=progress_cb)
 
     return results

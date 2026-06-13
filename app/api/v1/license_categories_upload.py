@@ -1,11 +1,12 @@
 from enum import Enum
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 
 import uuid as uuid_mod
 from datetime import datetime
 
+from app.core.database import _db_env_var, DBEnv
 from app.utils.file_reader import read_users_file
 from app.services.license_categories_import_service import (
     import_license_categories_and_fees_via_staging_copy,
@@ -28,7 +29,8 @@ def _get_new_session():
     return db_module.new_session()
 
 
-def _run_job(job_id: str, df, source_file_name: str, sector_name: str):
+def _run_job(job_id: str, df, source_file_name: str, sector_name: str, db_env: str = "dev"):
+    _db_env_var.set(db_env)
     _job_status[job_id] = {
         "status": "RUNNING",
         "started_at": datetime.utcnow().isoformat(),
@@ -72,6 +74,7 @@ def upload_license_categories(
     background_tasks: BackgroundTasks = None,
     sync: bool = True,
     background: bool = False,
+    db_env: DBEnv = Form(DBEnv.dev, description="Target database environment (dev / staging / prod)"),
 ):
     """Upload Excel/CSV with license categories + fees.
 
@@ -86,6 +89,8 @@ def upload_license_categories(
         df = read_users_file(file.filename, file.file)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"failed to read uploaded file: {e}")
+
+    _db_env_var.set(db_env.value)
 
     if sync and not background:
         db = _get_new_session()
@@ -110,7 +115,8 @@ def upload_license_categories(
         "source_file_name": file.filename,
         "sector_name": sector_name,
     }
-    background_tasks.add_task(_run_job, job_id, df, file.filename, sector_name.value)
+    current_db_env = db_env.value
+    background_tasks.add_task(_run_job, job_id, df, file.filename, sector_name.value, current_db_env)
     return JSONResponse(
         status_code=202,
         content={

@@ -1,10 +1,10 @@
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 import uuid as uuid_mod
 from datetime import datetime
 
-from app.core.database import get_db
+from app.core.database import get_db, _db_env_var, DBEnv
 from app.utils.file_reader import read_users_file
 from app.services.shareholders_import_service import import_shareholders_via_staging_copy
 
@@ -19,8 +19,8 @@ def _get_new_session():
     return db_module.new_session()
 
 
-def _run_shareholders_job(job_id: str, df):
-    global _job_status
+def _run_shareholders_job(job_id: str, df, db_env: str = "dev"):
+    _db_env_var.set(db_env)
     _job_status[job_id] = {
         "status": "RUNNING",
         "started_at": datetime.utcnow().isoformat(),
@@ -62,6 +62,7 @@ def upload_shareholders(
     background_tasks: BackgroundTasks = None,
     sync: bool = True,
     background: bool = False,
+    db_env: DBEnv = Form(DBEnv.dev, description="Target database environment (dev / staging / prod)"),
 ):
     """Upload Excel/CSV containing shareholders and import into ca_shareholders.
 
@@ -74,6 +75,8 @@ def upload_shareholders(
         df = read_users_file(file.filename, file.file)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"failed to read uploaded file: {e}")
+
+    _db_env_var.set(db_env.value)
 
     # Default behavior: return detailed stats immediately.
     # If you want async/background mode, pass background=true (or sync=false).
@@ -95,7 +98,8 @@ def upload_shareholders(
         "queued_at": datetime.utcnow().isoformat(),
         "source_file_name": file.filename,
     }
-    background_tasks.add_task(_run_shareholders_job, job_id, df)
+    current_db_env = db_env.value
+    background_tasks.add_task(_run_shareholders_job, job_id, df, current_db_env)
     return JSONResponse(
         status_code=202,
         content={
