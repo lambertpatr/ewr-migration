@@ -636,7 +636,13 @@ BEGIN
         a.license_type,
         a.category_license_type,
         a.category_type AS certificate_type,
-        NULL::text AS certificate_owner,
+        TRIM(
+            COALESCE(NULLIF(trim(s.facility_name), ''), '') || 
+            CASE 
+                WHEN NULLIF(trim(s.po_box), '') IS NOT NULL THEN ', ' || trim(s.po_box) 
+                ELSE '' 
+            END
+        ) AS certificate_owner,
         a.zone_id,
         a.zone_name
     FROM public.applications a
@@ -644,7 +650,9 @@ BEGIN
     JOIN (
         SELECT DISTINCT ON (application_number)
                application_number,
-               application_type
+               application_type,
+               facility_name,
+               po_box
         FROM   public.stage_ca_applications_raw
         ORDER  BY application_number,
                   source_row_no
@@ -668,6 +676,7 @@ BEGIN
         license_type         = EXCLUDED.license_type,
         category_license_type = EXCLUDED.category_license_type,
         certificate_type     = COALESCE(EXCLUDED.certificate_type,     public.certificates.certificate_type),
+        certificate_owner    = COALESCE(EXCLUDED.certificate_owner,    public.certificates.certificate_owner),
         application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
         zone_id              = COALESCE(EXCLUDED.zone_id,              public.certificates.zone_id),
         zone_name            = COALESCE(EXCLUDED.zone_name,            public.certificates.zone_name),

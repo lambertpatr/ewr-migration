@@ -1660,8 +1660,16 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                         a.category_license_type,
                         a.zone_id,
                         a.zone_name,
-                        COALESCE(NULLIF(UPPER(TRIM(a.application_type)), ''), 'NEW') AS application_certificate_type
+                        COALESCE(NULLIF(UPPER(TRIM(a.application_type)), ''), 'NEW') AS application_certificate_type,
+                        TRIM(
+                            COALESCE(NULLIF(btrim(asd.facility_name), ''), '') || 
+                            CASE 
+                                WHEN NULLIF(btrim(asd.po_box), '') IS NOT NULL THEN ', ' || btrim(asd.po_box) 
+                                ELSE '' 
+                            END
+                        ) AS certificate_owner
                     FROM public.applications a
+                    LEFT JOIN public.application_sector_details asd ON asd.application_id = a.id
                     WHERE a.is_from_lois = true
                       AND a.application_number IS NOT NULL
                     ORDER BY a.application_number, a.created_at DESC
@@ -1679,7 +1687,8 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                     category_license_type,
                     zone_id,
                     zone_name,
-                    application_certificate_type
+                    application_certificate_type,
+                    certificate_owner
                 )
                 SELECT
                     -- id is a surrogate PK; the unique conflict key is application_number.
@@ -1695,7 +1704,8 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                     src.category_license_type,
                     src.zone_id,
                     src.zone_name,
-                    src.application_certificate_type
+                    src.application_certificate_type,
+                    src.certificate_owner
                 FROM src
                 ON CONFLICT (application_number) DO UPDATE
                 SET
@@ -1708,6 +1718,7 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                     application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
                     zone_id                   = COALESCE(EXCLUDED.zone_id,                   public.certificates.zone_id),
                     zone_name                 = COALESCE(EXCLUDED.zone_name,                 public.certificates.zone_name),
+                    certificate_owner         = COALESCE(EXCLUDED.certificate_owner,         public.certificates.certificate_owner),
                     updated_at                = now()
             """))
             inserted_certs = r_certs.rowcount or 0

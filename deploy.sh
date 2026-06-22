@@ -44,7 +44,6 @@ COPYFILE_DISABLE=1 tar --no-xattrs --exclude='.venv' \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
     --exclude='.git' \
-    --exclude='.env*' \
     --exclude='*.tar.gz' \
     -czf ewura-migration.tar.gz .
 echo -e "${GREEN}✓ Package created${NC}\n"

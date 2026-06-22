@@ -1017,6 +1017,7 @@ def import_water_supply_via_staging(
             application_certificate_type,
             sector,
             certificate_type,
+            certificate_owner,
             created_at,
             updated_at
         )
@@ -1037,6 +1038,13 @@ def import_water_supply_via_staging(
             COALESCE(({_at_sql}), 'NEW'),
             'WATER_SUPPLY',
             COALESCE(NULLIF(a.category_type, ''), 'License') AS certificate_type,
+            TRIM(
+                COALESCE(NULLIF(btrim(s.facility_name), ''), '') || 
+                CASE 
+                    WHEN NULLIF(btrim(s.po_box), '') IS NOT NULL THEN ', ' || btrim(s.po_box) 
+                    ELSE '' 
+                END
+            ) AS certificate_owner,
             now(),
             now()
         FROM {_STAGE} s
@@ -1054,6 +1062,7 @@ def import_water_supply_via_staging(
             effective_date            = COALESCE(EXCLUDED.effective_date,            public.certificates.effective_date),
             expire_date               = COALESCE(EXCLUDED.expire_date,               public.certificates.expire_date),
             application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),
+            certificate_owner         = COALESCE(EXCLUDED.certificate_owner, public.certificates.certificate_owner),
             sector                    = 'WATER_SUPPLY',
             updated_at                = now()
     """))

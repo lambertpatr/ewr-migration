@@ -5,6 +5,7 @@ from sqlalchemy.exc import SQLAlchemyError
 import logging
 import time
 from typing import Any
+from app.core.database import DBEnv
 
 logger = logging.getLogger(__name__)
 
@@ -2175,7 +2176,7 @@ def lookup_by_number(
         le=100,
         description="Maximum number of results to return (default 10, max 100).",
     ),
-    db_env: str = Query(default="dev", description="Target database environment (dev / staging / prod)"),
+    db_env: DBEnv = Query(DBEnv.dev, description="Target database environment"),
 ):
     """
     Look up application details — including **facility_name**, **company_name**,
@@ -2193,7 +2194,7 @@ def lookup_by_number(
     `facility_name`, `company_name`, and `applicant_name` from related tables.
     """
     from app.core.database import _db_env_var
-    _db_env_var.set(db_env)
+    _db_env_var.set(db_env.value)
 
     db = _get_new_session()
     try:
@@ -2292,6 +2293,200 @@ def lookup_by_number(
         raise
     except Exception as exc:
         logger.exception("lookup-by-number: error for number=%s name=%s", number, name)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        db.close()
+
+
+# ── Setup institution user and assign role ───────────────────────────────────
+
+@router.post("/setup-institution-user", tags=["06 - Admin Utilities"])
+def setup_institution_user(
+    user_id: str = Query(..., description="ID of the user (UUID)"),
+    company_id: str = Query(..., description="ID of the company (UUID)"),
+    role_name: str = Query(default="wasa_admin", description="Name of the role to assign"),
+    db_env: DBEnv = Query(DBEnv.dev, description="Target database environment"),
+):
+    """
+    Updates a user to be an institution-type user, assigns them to a company,
+    and assigns them the specified role (defaults to 'wasa_admin'),
+    creating or updating the user_roles mapping if needed.
+
+    ### Actions taken:
+    1. Sets `user_category = 'INSTITUTION'`, `account_type = 'COMPANY'`, and `company_id = :company_id` on the user.
+    2. Searches for a role matching the name (case-insensitive).
+    3. Assigns this user to the role in `user_roles` with `deleted = false` and `created_at = now()`.
+    """
+    from app.core.database import _db_env_var
+    _db_env_var.set(db_env.value)
+
+    db = _get_new_session()
+    try:
+        # 1. Verify user exists
+        user = db.execute(
+            text("SELECT id, username FROM public.users WHERE id = :user_id"),
+            {"user_id": user_id}
+        ).fetchone()
+
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail=f"User with ID '{user_id}' not found in environment '{db_env}'."
+            )
+
+        username = user[1]
+
+        # 2. Find the role (exact match first)
+        role = db.execute(
+            text("SELECT id, name FROM public.roles WHERE lower(trim(name)) = lower(trim(:role_name)) LIMIT 1"),
+            {"role_name": role_name}
+        ).fetchone()
+
+        if not role:
+            # Fallback to partial match
+            role = db.execute(
+                text("SELECT id, name FROM public.roles WHERE lower(name) LIKE :role_like LIMIT 1"),
+                {"role_like": f"%{role_name.lower().strip()}%"}
+            ).fetchone()
+
+        if not role:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Role matching '{role_name}' not found in roles table in environment '{db_env}'."
+            )
+
+        resolved_role_id = role[0]
+        resolved_role_name = role[1]
+
+        # 3. Update the user
+        db.execute(
+            text("""
+                UPDATE public.users
+                SET user_category = 'INSTITUTION',
+                    account_type = 'COMPANY',
+                    company_id = :company_id
+                WHERE id = :user_id
+            """),
+            {"user_id": user_id, "company_id": company_id}
+        )
+
+        # 4. Create or update user role assignment
+        existing_assignment = db.execute(
+            text("""
+                SELECT user_id, role_id, deleted 
+                FROM public.user_roles 
+                WHERE user_id = :user_id AND role_id = :role_id 
+                LIMIT 1
+            """),
+            {"user_id": user_id, "role_id": resolved_role_id}
+        ).fetchone()
+
+        role_action = "no_change"
+        if existing_assignment:
+            db.execute(
+                text("""
+                    UPDATE public.user_roles
+                    SET deleted = false, created_at = now()
+                    WHERE user_id = :user_id AND role_id = :role_id
+                """),
+                {"user_id": user_id, "role_id": resolved_role_id}
+            )
+            role_action = "updated"
+        else:
+            db.execute(
+                text("""
+                    INSERT INTO public.user_roles (user_id, role_id, deleted, created_at)
+                    VALUES (:user_id, :role_id, false, now())
+                """),
+                {"user_id": user_id, "role_id": resolved_role_id}
+            )
+            role_action = "created"
+
+        db.commit()
+        return {
+            "success": True,
+            "message": f"Successfully updated user '{username}' and assigned them the role '{resolved_role_name}'.",
+            "details": {
+                "user_id": user_id,
+                "username": username,
+                "company_id": company_id,
+                "role_id": str(resolved_role_id),
+                "role_name": resolved_role_name,
+                "role_action": role_action,
+                "environment": db_env
+            }
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        logger.exception("setup-institution-user: error for user_id=%s company_id=%s", user_id, company_id)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        db.close()
+
+
+@router.post("/sync-certificate-owner", tags=["06 - Admin Utilities"])
+def sync_certificate_owner(
+    db_env: DBEnv = Query(DBEnv.dev, description="Target database environment")
+):
+    """
+    Sync NULL or empty values of certificate_owner for all sectors using 
+    application_sector_details or application_electrical_installation.
+    """
+    from app.core.database import _db_env_var
+    _db_env_var.set(db_env.value)
+    db = _get_new_session()
+    
+    try:
+        # 1. Electrical Installations
+        res_elec = db.execute(text("""
+            UPDATE public.certificates c
+            SET 
+                certificate_owner = aei.applicant_name,
+                updated_at = now()
+            FROM public.application_electrical_installation aei
+            WHERE c.application_id = aei.application_id
+              AND c.sector = 'ELECTRICITY'
+              AND (c.certificate_owner IS NULL OR c.certificate_owner = '')
+        """))
+        elec_updated = res_elec.rowcount
+
+        # 2. Other Sectors (Water Supply, Petroleum, Natural Gas, etc.)
+        res_other = db.execute(text("""
+            UPDATE public.certificates c
+            SET 
+                certificate_owner = TRIM(
+                    COALESCE(asd.facility_name, '') || 
+                    CASE 
+                        WHEN asd.po_box IS NOT NULL AND asd.po_box <> '' THEN ', ' || asd.po_box 
+                        ELSE '' 
+                    END
+                ),
+                updated_at = now()
+            FROM public.application_sector_details asd
+            WHERE c.application_id = asd.application_id
+              AND (c.certificate_owner IS NULL OR c.certificate_owner = '')
+        """))
+        other_updated = res_other.rowcount
+        
+        db.commit()
+        
+        return {
+            "success": True,
+            "message": "Certificate owner sync complete.",
+            "details": {
+                "environment": db_env.value,
+                "electricity_certificates_updated": elec_updated,
+                "other_sectors_certificates_updated": other_updated,
+                "total_updated": elec_updated + other_updated
+            }
+        }
+    except Exception as exc:
+        db.rollback()
+        logger.exception("sync-certificate-owner: error")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         db.close()

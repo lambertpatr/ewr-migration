@@ -395,8 +395,8 @@ def import_electrical_installation_via_staging_copy(
             _c(row.get("userid", "")),
             _c(row.get("created_by", "")),
             _d(row.get("created_at", "")),
-            # certificate_owner: facility_name first, fall back to company_name
-            _c(row.get("facility_name", "")) or _c(row.get("company_name", "")),
+            # certificate_owner: applicant_name (which is mapped from company_name)
+            _c(row.get("company_name", "")),
             # personal_details
             _d(row.get("dateofbirth", "")),
             _c(row.get("nationality", "")),
