@@ -893,10 +893,10 @@ def import_electrical_installation_via_staging_copy(
                 COALESCE(
                     cm_lc.category_id,
                     -- OLD hard-coded fallback (kept for safety; active when temp table is empty):
-                    -- CASE UPPER(REGEXP_REPLACE(TRIM(ea.licensecategoryclass), '\\s+', ' '))
+                    -- CASE UPPER(REGEXP_REPLACE(TRIM(ea.approvedclass), '\\s+', ' '))
                     --     WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid ...
-                    CASE WHEN NULLIF(TRIM(ea.licensecategoryclass),'') ~ '^[0-9a-fA-F-]{36}$'
-                         THEN TRIM(ea.licensecategoryclass)::uuid
+                    CASE WHEN NULLIF(TRIM(ea.approvedclass),'') ~ '^[0-9a-fA-F-]{36}$'
+                         THEN TRIM(ea.approvedclass)::uuid
                          ELSE NULL END
                 ),
                 CASE WHEN NULLIF(trim(ea.effective_date),'') IS NOT NULL
@@ -918,14 +918,14 @@ def import_electrical_installation_via_staging_copy(
             FROM deduped ea
             -- Dynamic category map: JOIN normalises both "CLASS A" and bare "A".
             LEFT JOIN stage_elec_category_map cm_lc
-                   ON cm_lc.code = UPPER(REGEXP_REPLACE(TRIM(ea.licensecategoryclass), '\\s+', ' '))
-                   OR cm_lc.class_label = UPPER(REGEXP_REPLACE(TRIM(ea.licensecategoryclass), '\\s+', ' '))
+                   ON cm_lc.code = UPPER(REGEXP_REPLACE(TRIM(ea.approvedclass), '\\s+', ' '))
+                   OR cm_lc.class_label = UPPER(REGEXP_REPLACE(TRIM(ea.approvedclass), '\\s+', ' '))
             ON CONFLICT (application_number) DO UPDATE SET
                 -- Only fill NULLs — never overwrite existing non-null values (COALESCE pattern).
                 application_type          = COALESCE(public.applications.application_type,          EXCLUDED.application_type),
                 approval_no               = COALESCE(public.applications.approval_no,               EXCLUDED.approval_no),
                 approval_date             = COALESCE(public.applications.approval_date,             EXCLUDED.approval_date),
-                category_id               = COALESCE(public.applications.category_id,               EXCLUDED.category_id),
+                category_id               = COALESCE(EXCLUDED.category_id,               public.applications.category_id),
                 effective_date            = COALESCE(public.applications.effective_date,            EXCLUDED.effective_date),
                 expire_date               = COALESCE(public.applications.expire_date,               EXCLUDED.expire_date),
                 old_parent_application_id = COALESCE(public.applications.old_parent_application_id, EXCLUDED.old_parent_application_id),
@@ -953,23 +953,23 @@ def import_electrical_installation_via_staging_copy(
         SET    status       = 'APPROVED',
                is_from_lois = true,
                category_id  = COALESCE(
-                   a.category_id,
                    -- Dynamic lookup from temp table (code or class_label match):
-                   cm.category_id
+                   cm.category_id,
+                   a.category_id
                    -- OLD hard-coded fallback (uncomment to revert):
-                   -- CASE UPPER(REGEXP_REPLACE(TRIM(s.licensecategoryclass), '\\s+', ' '))
+                   -- CASE UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
                    --     WHEN 'CLASS A'  THEN '6dd52222-0eb2-471e-830d-1ee943177f93'::uuid ... ELSE NULL END
                ),
                updated_at   = now()
         FROM   public.stage_elec_install_raw s
         LEFT JOIN {ELEC_CAT_MAP_TEMP} cm
-               ON cm.code        = UPPER(REGEXP_REPLACE(TRIM(s.licensecategoryclass), '\\s+', ' '))
-               OR cm.class_label = UPPER(REGEXP_REPLACE(TRIM(s.licensecategoryclass), '\\s+', ' '))
+               ON cm.code        = UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
+               OR cm.class_label = UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
         WHERE  a.application_number = trim(s.application_number)
           AND  (
                a.status != 'APPROVED'
             OR a.is_from_lois IS DISTINCT FROM true
-            OR a.category_id IS NULL
+            OR a.category_id IS DISTINCT FROM cm.category_id
           );
     """))
     db.commit()
@@ -1081,11 +1081,11 @@ def import_electrical_installation_via_staging_copy(
             SELECT DISTINCT ON (a.id)
                    s.*,
                    a.id AS resolved_app_id,
+                   a.category_id AS resolved_decided_class_id,
+                   -- decided_class_name code mapping
+                   cm_lc.code AS resolved_class_code,
                    -- approved_class_id: dynamic lookup from stage_elec_category_map
                    -- (matches both "CLASS A" and bare "A" via class_label / code columns).
-                   -- OLD hard-coded fallback (uncomment to revert):
-                   -- CASE UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
-                   --     WHEN 'CLASS A'  THEN '6dd52222-...'::uuid ... ELSE NULL END
                    COALESCE(
                        cm_ac.category_id,
                        NULL  -- stays NULL when code not in temp table (rare / unknown class)
@@ -1095,6 +1095,9 @@ def import_electrical_installation_via_staging_copy(
             LEFT JOIN {ELEC_CAT_MAP_TEMP} cm_ac
                    ON cm_ac.code        = UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
                    OR cm_ac.class_label = UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
+            LEFT JOIN {ELEC_CAT_MAP_TEMP} cm_lc
+                   ON cm_lc.code        = UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
+                   OR cm_lc.class_label = UPPER(REGEXP_REPLACE(TRIM(s.approvedclass), '\\s+', ' '))
             ORDER BY a.id, s.row_no
         ),
         ins AS (
@@ -1102,6 +1105,8 @@ def import_electrical_installation_via_staging_copy(
                 id, application_id,
                 applicant_name, experience_type,
                 approved_class_id,
+                decided_class_id,
+                decided_class_name,
                 is_from_lois, created_at, updated_at
             )
             SELECT
@@ -1112,11 +1117,13 @@ def import_electrical_installation_via_staging_copy(
                 NULLIF(trim(e.company_name), ''),
                 COALESCE(NULLIF(trim(e.experience_type), ''), 'EMPLOYED'),
                 e.resolved_approved_class_id,
+                e.resolved_decided_class_id,
+                CASE WHEN e.resolved_class_code IS NOT NULL THEN 'CLASS ' || e.resolved_class_code ELSE NULL END,
                 true, now(), now()
             FROM eligible e
             ON CONFLICT (id) DO UPDATE SET
                 {_build_conflict_set(
-                    ['application_id', 'applicant_name', 'experience_type', 'approved_class_id'],
+                    ['application_id', 'applicant_name', 'experience_type', 'approved_class_id', 'decided_class_id', 'decided_class_name'],
                     'application_electrical_installation',
                     skip=('id', 'created_at')
                 )},
