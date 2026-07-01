@@ -17,6 +17,7 @@ from app.utils.lookup_cache import (
     load_applicant_role_id,
     load_default_role_id,
     load_zone_map,
+    load_zone_name_map,
 )
 
 # Setup logger
@@ -893,6 +894,7 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
     # Zone mapping — resolved dynamically from napa_regions JOIN zones.
     # Keyed by lower(region_name); value is zone_id (text UUID).
     zone_map = load_zone_map(db)
+    zone_name_map = load_zone_name_map(db)
 
     # columns in the incoming dataframe
     df_columns = [str(c).strip() for c in df.columns]
@@ -1128,6 +1130,14 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                             _zid = zone_map.get(_region_key)
                             if _zid:
                                 app_row['zone_id'] = _zid
+                    
+                    # zone_name: derive from the already-resolved region name.
+                    if 'zone_name' in ca_cols:
+                        _region_key = str(app_row.get('region') or '').strip().lower()
+                        if _region_key:
+                            _zname = zone_name_map.get(_region_key)
+                            if _zname:
+                                app_row['zone_name'] = _zname
 
                     app_inserts.append(app_row)
 

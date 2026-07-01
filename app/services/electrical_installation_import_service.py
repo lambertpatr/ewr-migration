@@ -873,7 +873,8 @@ def import_electrical_installation_via_staging_copy(
                 old_parent_application_id,
                 username, old_created_by,
                 status, is_from_lois,
-                zone_id,
+                zone_id, zone_name,
+                region, district, ward,
                 created_at, updated_at
             )
             SELECT
@@ -909,6 +910,10 @@ def import_electrical_installation_via_staging_copy(
                 'APPROVED',
                 true,
                 NULLIF(trim(ea.zone_id), '')::uuid,
+                z.name,
+                NULLIF(trim(ea.region), ''),
+                NULLIF(trim(ea.district), ''),
+                NULLIF(trim(ea.ward), ''),
                 COALESCE(
                     CASE WHEN NULLIF(trim(ea.created_at_raw),'') IS NOT NULL
                          THEN trim(ea.created_at_raw)::timestamp END,
@@ -920,6 +925,7 @@ def import_electrical_installation_via_staging_copy(
             LEFT JOIN stage_elec_category_map cm_lc
                    ON cm_lc.code = UPPER(REGEXP_REPLACE(TRIM(ea.approvedclass), '\\s+', ' '))
                    OR cm_lc.class_label = UPPER(REGEXP_REPLACE(TRIM(ea.approvedclass), '\\s+', ' '))
+            LEFT JOIN public.zones z ON z.id = NULLIF(trim(ea.zone_id), '')::uuid
             ON CONFLICT (application_number) DO UPDATE SET
                 -- Only fill NULLs — never overwrite existing non-null values (COALESCE pattern).
                 application_type          = COALESCE(public.applications.application_type,          EXCLUDED.application_type),
@@ -931,7 +937,11 @@ def import_electrical_installation_via_staging_copy(
                 old_parent_application_id = COALESCE(public.applications.old_parent_application_id, EXCLUDED.old_parent_application_id),
                 username                  = COALESCE(public.applications.username,                  EXCLUDED.username),
                 old_created_by            = COALESCE(public.applications.old_created_by,            EXCLUDED.old_created_by),
-                zone_id                   = COALESCE(public.applications.zone_id,                   EXCLUDED.zone_id),
+                zone_id                   = COALESCE(EXCLUDED.zone_id,                   public.applications.zone_id),
+                zone_name                 = COALESCE(EXCLUDED.zone_name,                 public.applications.zone_name),
+                region                    = COALESCE(EXCLUDED.region,                    public.applications.region),
+                district                  = COALESCE(EXCLUDED.district,                  public.applications.district),
+                ward                      = COALESCE(EXCLUDED.ward,                      public.applications.ward),
                 -- These two are always enforced for electrical installation imports.
                 status                    = 'APPROVED',
                 is_from_lois              = true,
@@ -1024,7 +1034,7 @@ def import_electrical_installation_via_staging_copy(
                 CASE WHEN NULLIF(trim(e.completed_at),'') IS NOT NULL
                      THEN trim(e.completed_at)::date END,
                 e.resolved_category_license_type,
-                COALESCE(NULLIF(trim(e.category_type), ''), 'License') AS certificate_type,
+                'License' AS certificate_type,
                 e.resolved_license_type,
                 CASE WHEN NULLIF(trim(e.effective_date),'') IS NOT NULL
                      THEN trim(e.effective_date)::date END,

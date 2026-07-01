@@ -456,6 +456,7 @@ DO $$
 DECLARE
     v_apps_inserted bigint;
     v_zone_expr     text;
+    v_zone_name_expr text;
     v_sql           text;
 BEGIN
     -- Determine zone_id expression based on whether lookup tables exist.
@@ -468,8 +469,14 @@ BEGIN
             ' JOIN public.zones z ON z.id = nr.zone_id'
             ' WHERE lower(trim(nr.name)) = lower(trim(s.region))'
             ' AND nr.zone_id IS NOT NULL LIMIT 1)';
+        v_zone_name_expr :=
+            '(SELECT z.name FROM public.napa_regions nr'
+            ' JOIN public.zones z ON z.id = nr.zone_id'
+            ' WHERE lower(trim(nr.name)) = lower(trim(s.region))'
+            ' AND nr.zone_id IS NOT NULL LIMIT 1)';
     ELSE
         v_zone_expr := 'NULL::uuid';
+        v_zone_name_expr := 'NULL::text';
     END IF;
 
     v_sql :=
@@ -482,7 +489,7 @@ BEGIN
         '    intimate_date, months_eligible, workflow_id, zone_id,'
         '    responsible_role_names, licence_path, license_type, category_license_type,'
         '    zone_name, payer_code, current_step_name, pending_actions,'
-        '    old_parent_application_id'
+        '    old_parent_application_id, region, district, ward'
         ') SELECT'
         '    s.generated_id,'
         '    now(),'
@@ -521,8 +528,9 @@ BEGIN
         '        ELSE NULL'
         '    END,'
         '    ''OPERATIONAL'','
-        '    NULL::text, NULL::text, NULL::text, NULL::text,'
-        '    NULLIF(trim(s.old_parent_application_id), '''')'
+        '    ' || v_zone_name_expr || ', NULL::text, NULL::text, NULL::text,'
+        '    NULLIF(trim(s.old_parent_application_id), ''''),'
+        '    NULLIF(trim(s.region), ''''), NULLIF(trim(s.district), ''''), NULLIF(trim(s.ward), '''')'
         ' FROM ('
         '    SELECT s.*, row_number() OVER ('
         '        PARTITION BY COALESCE(NULLIF(s.application_number,''''), s.generated_id::text)'
@@ -547,6 +555,9 @@ BEGIN
         '    zone_id          = COALESCE(EXCLUDED.zone_id,          public.applications.zone_id),'
         '    zone_name        = COALESCE(EXCLUDED.zone_name,        public.applications.zone_name),'
         '    old_parent_application_id = COALESCE(EXCLUDED.old_parent_application_id, public.applications.old_parent_application_id),'
+        '    region           = COALESCE(EXCLUDED.region,           public.applications.region),'
+        '    district         = COALESCE(EXCLUDED.district,         public.applications.district),'
+        '    ward             = COALESCE(EXCLUDED.ward,             public.applications.ward),'
         '    updated_at       = now()';
 
     EXECUTE v_sql;

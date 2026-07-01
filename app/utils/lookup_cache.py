@@ -941,3 +941,44 @@ def clear_zone_map_cache() -> None:
     with _zone_map_lock:
         _zone_map_cache.clear()
         _zone_map_loaded = False
+
+
+_zone_name_map_cache: Dict[str, str] = {}
+_zone_name_map_lock  = _threading.Lock()
+_zone_name_map_loaded = False
+
+def load_zone_name_map(db: Any) -> Dict[str, str]:
+    global _zone_name_map_loaded
+
+    if _zone_name_map_loaded:
+        return _zone_name_map_cache
+
+    with _zone_name_map_lock:
+        if _zone_name_map_loaded:
+            return _zone_name_map_cache
+
+        try:
+            from sqlalchemy import text
+            rows = db.execute(text("""
+                SELECT lower(trim(n.name)) AS region_name_lower,
+                       z.name              AS zone_name
+                FROM   public.napa_regions n
+                JOIN   public.zones z ON z.id = n.zone_id
+                WHERE  n.name  IS NOT NULL
+                  AND  n.zone_id IS NOT NULL
+            """)).fetchall()
+
+            for row in rows:
+                if row[0] and row[1]:
+                    _zone_name_map_cache[row[0]] = row[1]
+
+            _zone_name_map_loaded = True
+        except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            _zone_name_map_loaded = True
+
+    return _zone_name_map_cache
+

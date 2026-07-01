@@ -946,6 +946,11 @@ def import_water_supply_via_staging(
             username,
             created_by,
             is_from_lois,
+            region,
+            district,
+            ward,
+            zone_id,
+            zone_name,
             created_at,
             updated_at
         )
@@ -962,12 +967,19 @@ def import_water_supply_via_staging(
             NULLIF(lower(btrim(s.username)), ''),
             u.id,
             true,
+            NULLIF(btrim(s.region), ''),
+            NULLIF(btrim(s.district), ''),
+            NULLIF(btrim(s.ward), ''),
+            z.id,
+            z.name,
             now(),
             now()
         FROM {_STAGE} s
         LEFT JOIN public.users u
             ON lower(trim(u.username)) = lower(trim(s.username))
            AND NULLIF(trim(s.username), '') IS NOT NULL
+        LEFT JOIN public.napa_regions nr ON lower(btrim(nr.name)) = lower(btrim(s.region))
+        LEFT JOIN public.zones z ON z.id = nr.zone_id
         WHERE btrim(s.application_number) <> ''
         ON CONFLICT (application_number) DO UPDATE SET
             application_type      = COALESCE(EXCLUDED.application_type,  public.applications.application_type),
@@ -977,6 +989,11 @@ def import_water_supply_via_staging(
             completed_at          = COALESCE(EXCLUDED.completed_at,      public.applications.completed_at),
             license_type          = COALESCE(EXCLUDED.license_type,      public.applications.license_type),
             created_by            = COALESCE(public.applications.created_by, EXCLUDED.created_by),
+            region                = COALESCE(EXCLUDED.region, public.applications.region),
+            district              = COALESCE(EXCLUDED.district, public.applications.district),
+            ward                  = COALESCE(EXCLUDED.ward, public.applications.ward),
+            zone_id               = COALESCE(EXCLUDED.zone_id, public.applications.zone_id),
+            zone_name             = COALESCE(EXCLUDED.zone_name, public.applications.zone_name),
             updated_at            = now()
     """))
     upserted_apps = r_apps.rowcount or 0
