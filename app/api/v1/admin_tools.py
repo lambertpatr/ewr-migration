@@ -2491,13 +2491,10 @@ def sync_certificate_owner(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         db.close()
-class TransferRequest(BaseModel):
-    approval_no: str
-    destination_username: str
-
 @router.post("/transfer-application", tags=["06 - Admin Utilities"])
 def transfer_application(
-    request: TransferRequest,
+    approval_no: str = Query(..., description="Application number to transfer"),
+    destination_username: str = Query(..., description="Username of the user to transfer to"),
     db_env: DBEnv = Query(DBEnv.dev, description="Target database environment")
 ):
     """
@@ -2511,24 +2508,24 @@ def transfer_application(
     # 1. Fetch destination user ID
     result_dest = db.execute(
         text("SELECT id FROM users WHERE username = :username"),
-        {"username": request.destination_username}
+        {"username": destination_username}
     ).fetchone()
     
     if not result_dest:
         db.close()
-        raise HTTPException(status_code=404, detail=f"User {request.destination_username} not found")
+        raise HTTPException(status_code=404, detail=f"User {destination_username} not found")
         
     dest_user_id = result_dest[0]
     
     # 2. Fetch application and source details
     result_app = db.execute(
         text("SELECT id, created_by, username, approval_no FROM applications WHERE approval_no = :approval_no"),
-        {"approval_no": request.approval_no}
+        {"approval_no": approval_no}
     ).fetchone()
     
     if not result_app:
         db.close()
-        raise HTTPException(status_code=404, detail=f"Application {request.approval_no} not found")
+        raise HTTPException(status_code=404, detail=f"Application {approval_no} not found")
         
     app_id = result_app[0]
     source_user_id = result_app[1]
@@ -2556,7 +2553,7 @@ def transfer_application(
     DO $$
     DECLARE
         v_dest_user_id UUID := '{dest_user_id}';
-        v_dest_username VARCHAR := '{request.destination_username.replace("'", "''")}';
+        v_dest_username VARCHAR := '{destination_username.replace("'", "''")}';
         v_app_id UUID := '{app_id}';
         
         v_source_user_id UUID := '{source_user_id}'::uuid;
@@ -2608,7 +2605,7 @@ def transfer_application(
         
     return {
         "success": True,
-        "message": f"Successfully transferred application {request.approval_no} to {request.destination_username}",
+        "message": f"Successfully transferred application {approval_no} to {destination_username}",
         "data": {
             "application_id": app_id,
             "destination_user_id": dest_user_id
