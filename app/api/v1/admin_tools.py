@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel
 from pathlib import Path
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -2490,3 +2491,122 @@ def sync_certificate_owner(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
         db.close()
+class TransferRequest(BaseModel):
+    approval_no: str
+    destination_username: str
+
+@router.post("/transfer-application", tags=["06 - Admin Utilities"])
+def transfer_application(request: TransferRequest):
+    """
+    Safely reassign an application to a new user, update ownership across all 
+    associated tables, and log the manual transfer.
+    """
+    db = _get_new_session()
+    
+    # 1. Fetch destination user ID
+    result_dest = db.execute(
+        text("SELECT id FROM users WHERE username = :username"),
+        {"username": request.destination_username}
+    ).fetchone()
+    
+    if not result_dest:
+        db.close()
+        raise HTTPException(status_code=404, detail=f"User {request.destination_username} not found")
+        
+    dest_user_id = result_dest[0]
+    
+    # 2. Fetch application and source details
+    result_app = db.execute(
+        text("SELECT id, created_by, username, approval_no FROM applications WHERE approval_no = :approval_no"),
+        {"approval_no": request.approval_no}
+    ).fetchone()
+    
+    if not result_app:
+        db.close()
+        raise HTTPException(status_code=404, detail=f"Application {request.approval_no} not found")
+        
+    app_id = result_app[0]
+    source_user_id = result_app[1]
+    source_username = result_app[2]
+    license_number = result_app[3]
+    
+    # 3. Ensure audit table exists
+    db.execute(text("""
+        CREATE TABLE IF NOT EXISTS application_manual_transfers (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            application_id UUID REFERENCES applications(id),
+            license_number VARCHAR(255),
+            facility_name VARCHAR(255),
+            source_username VARCHAR(255),
+            source_user_id UUID,
+            destination_username VARCHAR(255),
+            destination_user_id UUID,
+            transferred_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            transferred_by VARCHAR(255) DEFAULT current_user
+        );
+    """))
+    
+    # 4. PL/pgSQL block
+    plpgsql_block = f"""
+    DO $$
+    DECLARE
+        v_dest_user_id UUID := '{dest_user_id}';
+        v_dest_username VARCHAR := '{request.destination_username.replace("'", "''")}';
+        v_app_id UUID := '{app_id}';
+        
+        v_source_user_id UUID := '{source_user_id}'::uuid;
+        v_source_username VARCHAR := '{source_username.replace("'", "''")}';
+        v_license_number VARCHAR := '{license_number.replace("'", "''")}';
+        v_facility_name VARCHAR;
+        r RECORD;
+    BEGIN
+        SELECT facility_name INTO v_facility_name
+        FROM application_sector_details WHERE application_id = v_app_id LIMIT 1;
+
+        INSERT INTO application_manual_transfers (
+            application_id, license_number, facility_name,
+            source_username, source_user_id, destination_username, destination_user_id
+        ) VALUES (
+            v_app_id, v_license_number, v_facility_name,
+            v_source_username, v_source_user_id, v_dest_username, v_dest_user_id
+        );
+
+        UPDATE applications
+        SET username = v_dest_username, created_by = v_dest_user_id
+        WHERE id = v_app_id;
+
+        UPDATE certificates
+        SET owner_id = v_dest_user_id, created_by = v_dest_user_id
+        WHERE application_id = v_app_id;
+
+        FOR r IN 
+            SELECT c.table_name
+            FROM information_schema.columns c
+            JOIN information_schema.columns c2 ON c.table_name = c2.table_name AND c.table_schema = c2.table_schema
+            WHERE c.table_schema = 'public'
+              AND c.column_name = 'application_id'
+              AND c2.column_name = 'created_by'
+        LOOP
+            EXECUTE format('UPDATE %I SET created_by = %L WHERE application_id = %L', r.table_name, v_dest_user_id, v_app_id);
+        END LOOP;
+    END $$;
+    """
+    
+    try:
+        db.execute(text(plpgsql_block))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        db.close()
+        
+    return {
+        "success": True,
+        "message": f"Successfully transferred application {request.approval_no} to {request.destination_username}",
+        "data": {
+            "application_id": app_id,
+            "destination_user_id": dest_user_id
+        }
+    }
+
