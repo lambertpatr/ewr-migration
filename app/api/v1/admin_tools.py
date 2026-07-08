@@ -2496,11 +2496,16 @@ class TransferRequest(BaseModel):
     destination_username: str
 
 @router.post("/transfer-application", tags=["06 - Admin Utilities"])
-def transfer_application(request: TransferRequest):
+def transfer_application(
+    request: TransferRequest,
+    db_env: DBEnv = Query(DBEnv.dev, description="Target database environment")
+):
     """
     Safely reassign an application to a new user, update ownership across all 
     associated tables, and log the manual transfer.
     """
+    from app.core.database import _db_env_var
+    _db_env_var.set(db_env.value)
     db = _get_new_session()
     
     # 1. Fetch destination user ID
