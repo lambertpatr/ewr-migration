@@ -1,330 +1,164 @@
-# EWURA Migration API — Upload Checklist & Reference
+# EWURA Migration API — Architecture & Data Flow Guide
 
-> **Quick rule:** Always run steps in the numbered order below. Each step depends on rows
-> created in the previous one (e.g. users must exist before applications link to them).
-
----
-
-## 🚀 Server Deployment
-
-To deploy this API to server 10.1.8.144:
-
-```bash
-# 1. Verify server is ready
-./verify-server.sh
-
-# 2. Deploy automatically
-./deploy.sh
-```
-
-**Quick Start:** See [QUICK_DEPLOY.md](QUICK_DEPLOY.md) for step-by-step instructions.
-
-**Full Documentation:** See [DEPLOY_TO_SERVER.md](DEPLOY_TO_SERVER.md) for detailed deployment guide.
-
-**Server Details:**
-- Server: 10.1.8.144
-- User: ewura-admin (password: secure@123)
-- Deploy Path: /var/lib/pgsql/scripts/ewura-migration
-- Owner: postgres:postgres
-- API URL: http://10.1.8.144:8000/docs
+Welcome to the **EWURA Migration System**. This document clearly explains how data flows from uploaded Excel/CSV files into the PostgreSQL database, how different sector migrations work, and how the core table relationships (Applications, Certificates, Sector Details) operate.
 
 ---
 
-## Prerequisites
+## 🏗️ 1. Core Architecture & Data Flow Pattern
 
-Before touching any endpoint:
-
-| # | Check | Command / action |
-|---|-------|-----------------|
-| 1 | Confirm target database | `./use-env.sh show` |
-| 2 | Switch environment if needed | `./use-env.sh test` / `staging` / `production` |
-| 3 | Start the API (restart after env switch) | `uvicorn app.main:app --reload` |
-| 4 | Open Swagger UI | http://127.0.0.1:8000/docs |
-
----
-
-## Upload Checklist — Step by Step
-
-### Step 1 — Sync schema *(run once per environment)*
-
-Aligns live DB tables/columns with the migration schema (adds missing columns, drops stale UNIQUE constraints). **Always run before any data upload.**
-
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/admin-tools/sync-schemas` |
-| **Swagger tag** | `01 - Schema Sync` |
-| **File required** | None |
-| **Dry-run first** | `?dry_run=true` — preview SQL with no changes |
-| **Apply** | `?dry_run=false` — executes ALTER TABLE / DROP CONSTRAINT |
-
-> ⚠️ Schema sync **drops** certain UNIQUE constraints on `ca_applications` (except the one on `application_number`). Always dry-run first on production.
-
----
-
-### Step 2 — Upload LOIS users
-
-Creates user accounts in `public.users`. Must run **before** applications so FK links resolve.
-
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/lois-users/upload` |
-| **Swagger tag** | `02 - LOIS Users Migration` |
-| **File field** | `file` — Excel/CSV with at least a `userid` / `username` column |
-| **Key response fields** | `inserted_users`, `skipped_users` (skipped = already existed) |
-
-> Re-runs are safe. Duplicate usernames are deduped within the batch before the bulk COPY.
-
----
-
-### Step 3 — Upload Applications (Petroleum **or** Electricity)
-
-Imports applications + documents + contacts via staging COPY. This is a **background job** — the endpoint returns a `job_id` immediately.
-
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/application-migrations/upload` |
-| **Swagger tag** | `03 - Applications Migration` |
-| **File field** | `file` |
-| **Form field** | `sector_name` — `PETROLEUM` (default) or `ELECTRICITY` |
-| **Returns** | `job_id` — use it in Step 3a |
-
-#### Step 3a — Poll job status
+The migration engine uses a high-performance **Two-Stage Pattern** (Staging $\rightarrow$ Final Production Tables):
 
 ```
-GET /api/v1/application-migrations/jobs/{job_id}
+┌────────────────────────────────┐
+│   Excel / CSV Source File      │
+│  (LOIS Legacy or eService File)│
+└───────────────┬────────────────┘
+                │
+                ▼ 1. Bulk Upload (Python / COPY)
+┌────────────────────────────────┐
+│        STAGING TABLES          │
+│ - stage_ca_applications_raw    │
+│ - stage_elec_install_raw       │
+│ - stage_water_supply_raw       │
+└───────────────┬────────────────┘
+                │
+                ▼ 2. Transform & Upsert (SQL Engine)
+┌─────────────────────────────────────────────────────────────┐
+│                       FINAL PRODUCTION TABLES                │
+│                                                             │
+│  ┌──────────────────────┐        1:1        ┌────────────┐  │
+│  │     applications     ├──────────────────►│categories  │  │
+│  │ (NEW, RENEW, etc.)   │                   └────────────┘  │
+│  └──────────┬───────────┘                                   │
+│             │                                               │
+│             │ N:1 (Many applications share 1 license)       │
+│             ▼                                               │
+│  ┌──────────────────────┐        1:1        ┌────────────┐  │
+│  │     certificates     ├──────────────────►│   zones    │  │
+│  │(1 Unique Approval No)│                   └────────────┘  │
+│  └──────────────────────┘                                   │
+│             ▲                                               │
+│             │ 1:1 Child Details                             │
+│             ├───────────────────┬──────────────────────┐    │
+│             │                   │                      │    │
+│             ▼                   ▼                      ▼    │
+│  ┌──────────────────┐  ┌──────────────────┐  ┌───────────┐  │
+│  │application_sector│  │   application_   │  │ documents │  │
+│  │     _details     │  │   electrical_    │  │ contacts  │  │
+│  │(Petroleum/Water) │  │   installation   │  │   etc.    │  │
+│  └──────────────────┘  └──────────────────┘  └───────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                │
+                ▼ 3. Materialized View Refresh
+┌─────────────────────────────────────────────────────────────┐
+│                 API & PUBLIC MATERIALIZED VIEWS             │
+│ - website_api_mv  (Public EWURA Portal)                     │
+│ - tanesco_api_mv  (Electricity Sector Integration)           │
+│ - npgis_api_mv    (Petroleum & Natural Gas GIS System)      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-Response fields to verify:
+---
 
-| Field | Meaning |
-|---|---|
-| `status` | `RUNNING` / `COMPLETED` / `FAILED` |
-| `result.inserted_applications` | Newly inserted rows |
-| `result.inserted_users` | New user accounts created |
-| `result.skipped_users` | Users that already existed |
-| `result.inserted_user_roles` | New role assignments |
-| `result.skipped_user_roles` | Role assignments already present |
+## 🔑 2. Relationship Rules (Applications & Certificates)
 
-> A `skipped_*` count is **normal on re-uploads** — it means those rows already existed.
+Understanding the relationship between `applications` and `certificates` is essential:
+
+### A. One Unique Certificate per License (`approval_no`)
+- A physical EWURA license has a unique **`approval_no`** (e.g. `PWL-2016-006`, `PRL-2021-087`, `ELD-2022-107`).
+- The `certificates` table stores **strictly 1 row per `approval_no`**. Duplicate certificate rows are not allowed.
+
+### B. Applications (`NEW` vs `RENEW`)
+- Over time, a license goes through multiple applications:
+  1. Initial **`NEW`** application (e.g. created in 2016).
+  2. First **`RENEW`** application (e.g. created in 2021).
+  3. Second **`RENEW`** application (e.g. created in 2026).
+- **All applications** sharing the same `approval_no` point to the **same single `certificate_id`** (`applications.certificate_id = certificates.id`).
+
+### C. Latest Application Synchronization
+- The single `certificates` record **always displays the latest active status**:
+  - `certificates.application_id` $\rightarrow$ points to the **latest `RENEW` (or approved) application**.
+  - `certificates.effective_date` & `approval_date` $\rightarrow$ updated to the latest application's approval date.
+  - `certificates.expire_date` $\rightarrow$ updated to the latest application's expiration date.
+  - `certificates.intimate_date` $\rightarrow$ updated to the latest application's reminder trigger date.
 
 ---
 
-### Step 4 — Upload Shareholders
+## ⏳ 3. License Durations & Reminder Thresholds
 
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/shareholders/upload` |
-| **Swagger tag** | `04 - Shareholders Migration` |
-| **File field** | `file` — Excel/CSV with `apprefno` / `application_number` column |
-| **Depends on** | Step 3 (applications must exist first) |
-
----
-
-### Step 5 — Upload Managing Directors
-
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/managing-directors/upload` |
-| **Swagger tag** | `05 - Managing Directors Migration` |
-| **File field** | `file` |
-| **Depends on** | Step 3 |
+| Sector / License Type | Standard Duration | Reminder Threshold (`intimate_date`) |
+| :--- | :---: | :--- |
+| **Electrical Installation** | **5 Years** (60 months) | **90 days** before `expire_date` (`expire_date - 90 days`) |
+| **Petroleum Operational** | **5 Years** (60 months) | **180 days** before `expire_date` (`expire_date - 180 days`) |
+| **Petroleum Construction** | **2 Years** (24 months) | **180 days** before `expire_date` (`expire_date - 180 days`) |
+| **Electricity Supply** | **5 Years** (60 months) | **180 days** before `expire_date` (`expire_date - 180 days`) |
+| **Natural Gas** | **5 Years** (60 months) | **180 days** before `expire_date` (`expire_date - 180 days`) |
+| **Water Supply** | **5 Years** (60 months) | **180 days** before `expire_date` (`expire_date - 180 days`) |
 
 ---
 
-### Step 6 — Sync License Types
+## 🌐 4. Sector Migration Pipelines
 
-Syncs `license_type` values between source and target databases. No file needed.
+The migration system handles 5 distinct regulated sectors:
 
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/sync-license-type` |
-| **Swagger tag** | `05 - Sync License Type` |
-| **File required** | None — reads from DB directly |
+### 1. Petroleum Sector
+- **Source**: Excel/CSV files uploaded to `POST /api/v1/application-migrations/upload` with `sector_name = PETROLEUM`.
+- **Staging Table**: `stage_ca_applications_raw`.
+- **Target Tables**: `applications` $\rightarrow$ `certificates` $\rightarrow$ `application_sector_details`.
+- **License Types**: `LICENSE_PETROLEUM`, `CONSTRUCTION_PETROLEUM`.
 
----
+### 2. Natural Gas Sector
+- **Source**: Uploaded under `PETROLEUM` or specialized Natural Gas files.
+- **Target Tables**: `applications` $\rightarrow$ `certificates` $\rightarrow$ `application_sector_details`.
+- **License Types**: `LICENSE_NATURAL_GAS` (Operational categories like CNG filling stations) and `CONSTRUCTION_NATURAL_GAS` (Pipelines, processing facilities).
 
-### Step 7 — Upload Electrical Installations (main)
+### 3. Electricity Supply Sector
+- **Source**: Uploaded to `POST /api/v1/application-migrations/upload` with `sector_name = ELECTRICITY`.
+- **Staging Table**: `stage_ca_applications_raw`.
+- **Target Tables**: `applications` $\rightarrow$ `certificates`.
+- **License Type**: `LICENSE_ELECTRICITY_SUPPLY`.
 
-The largest import — fans out into **8 tables**: `applications`, `application_electrical_installation`, `personal_details`, `contact_details`, `attachments`, `work_experience`, `self_employed`, `certificate_verifications`. Background job.
+### 4. Electrical Installation Sector
+- **Source**: Uploaded to `POST /api/v1/electrical-installations/upload`.
+- **Staging Table**: `stage_elec_install_raw`.
+- **Target Tables**: `applications` $\rightarrow$ `certificates` $\rightarrow$ `application_electrical_installation`.
+- **License Type**: `LICENSE_ELECTRICITY_INSTALLATION` (Classes A, B, C, D, Wireman, Contractor).
 
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/electrical-installations/upload` |
-| **Swagger tag** | `06 - Electrical Installations Migration` |
-| **File field** | `file` |
-| **Key Excel columns** | `apprefno`, `licensecategoryclass` (→ `category_id`), `approvedclass` (→ `approved_class_id`) |
-| **Depends on** | Step 1, Step 2 |
-
-#### Category class UUID mapping (auto-applied)
-
-The importer accepts both `CLASS A` style and bare codes (`A`, `S1`, …):
-
-| Excel value | Code | Written to |
-|---|---|---|
-| CLASS A / A | A | `applications.category_id`, `application_electrical_installation.approved_class_id` |
-| CLASS B / B | B | same |
-| CLASS C / C | C | same |
-| CLASS D / D | D | same |
-| CLASS W / W | W | same |
-| CLASS S1 / S1 | S1 | same |
-| CLASS S2 / S2 | S2 | same |
-| CLASS S3 / S3 | S3 | same |
-
-> On re-upload, `category_id` and `approved_class_id` are **back-filled** on existing rows that previously had NULL in those columns.
-
-#### Step 7a — Poll job status
-
-```
-GET /api/v1/electrical-installations/status/{job_id}
-GET /api/v1/electrical-installations/jobs          ← list all recent jobs
-```
-
-Response fields to verify:
-
-| Field | Meaning |
-|---|---|
-| `result.inserted_applications` | New application rows |
-| `result.inserted_certificates` | New certificate rows |
-| `result.inserted_electrical_installations` | New AEI rows |
-| `result.inserted_users` / `result.skipped_users` | User creation stats |
-| `result.inserted_user_roles` / `result.skipped_user_roles` | Role assignment stats |
+### 5. Water Supply Sector
+- **Source**: Uploaded to `POST /api/v1/water-supply/upload`.
+- **Staging Table**: `stage_water_supply_raw`.
+- **Target Tables**: `applications` $\rightarrow$ `certificates` $\rightarrow$ `application_sector_details`.
+- **License Type**: `LICENSE_WATER`.
 
 ---
 
-### Step 8 — Upload Electrical Supervisors / Work Experience
+## 🌍 5. Geographical & Dynamic Zone Mapping Rules
 
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/electrical-installations/upload-supervisors-work-experience` |
-| **Swagger tag** | `06 - Electrical Installations Migration` |
-| **File field** | `file` |
-| **Depends on** | Step 7 (electrical installations must exist) |
-
-Poll: `GET /api/v1/electrical-installations/supervisors-status/{job_id}`
+- **Precedence**: When importing geographical columns (`region`, `district`, `ward`, `zone_name`), the uploaded string (`EXCLUDED`) strictly overwrites null or legacy database entries.
+- **Dynamic Zone Mapping**: Instead of hardcoding static UUIDs, `zone_id` and `zone_name` are mapped dynamically during transformation by looking up incoming `region` names against `napa_regions` joined with `zones`.
 
 ---
 
-### Step 9 — Upload Supervisor Details
+## 🛡️ 6. eService Data Protection Rule
 
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/electrical-installations/upload-supervisor-details` |
-| **Swagger tag** | `06 - Electrical Installations Migration` |
-| **File field** | `file` |
-| **Depends on** | Step 8 |
-
-Poll: `GET /api/v1/electrical-installations/supervisor-details-status/{job_id}`
+- Applications originating from the live eService system have `is_from_lois = false`.
+- Legacy LOIS migration re-uploads (`is_from_lois = true`) **will NOT overwrite** `effective_date`, `expire_date`, or `is_from_lois` on native eService applications (`is_from_lois = false`).
 
 ---
 
-### Step 10 — Upload Self-Employed Records
+## 🛠️ 7. Key Maintenance Scripts & Endpoints
 
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/electrical-installations/upload-self-employed` |
-| **Swagger tag** | `06 - Electrical Installations Migration` |
-| **File field** | `file` |
-| **Depends on** | Step 7 |
-
-Poll: `GET /api/v1/electrical-installations/self-employed-status/{job_id}`
+| Maintenance Task | Command / Endpoint | Purpose |
+| :--- | :--- | :--- |
+| **Certificate Deduplication & Sync** | `POST /api/v1/admin-tools/fix-certificates`<br>or `python3 scripts/fix_certificates_unique_approval.py --apply` | Cleans up duplicate `approval_no` certificate rows, syncs `certificates` with latest application dates, and links all applications to single `certificate_id`. |
+| **Natural Gas License Type Sync** | `python3 scripts/fix_natural_gas_license_types.py` | Ensures operational CNG filling stations use `LICENSE_NATURAL_GAS`. |
+| **Electrical Expiration Alignment** | `python3 scripts/fix_electrical_license_dates.py --apply` | Aligns all Electrical Installation licenses to 5-year durations. |
+| **Server Deployment** | `python3 scripts/deploy_remote.py` | Bundles and deploys codebase updates to server `10.1.8.144`. |
 
 ---
 
-### Step 11 — Upload Certificate Verifications
+## 🖥️ 8. Environment & Server Details
 
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/electrical-installations/upload-certificate-verifications` |
-| **Swagger tag** | `06 - Electrical Installations Migration` |
-| **File field** | `file` |
-| **Depends on** | Step 7 (needs `application_id`; links `application_electrical_installation_id` best-effort) |
-
-Poll: `GET /api/v1/electrical-installations/cert-verifications-status/{job_id}`
-
----
-
-### Step 12 — Upload Categories
-
-Upserts records into `categories` / `license_types` lookup tables.
-
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/categories/upload` |
-| **Swagger tag** | `07 - Categories Upload` |
-| **File field** | `file` |
-
----
-
-### Step 13 — Upload License Category Fees
-
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/license-categories/upload` |
-| **Swagger tag** | `06 - License Category Fees Migration` |
-| **File field** | `file` |
-
-Poll: `GET /api/v1/license-categories/status/{job_id}`
-
----
-
-### Step 14 — Backfill `created_by` *(optional, run after all uploads)*
-
-Patches `created_by` on applications by matching `username` columns case-insensitively.
-
-| | |
-|---|---|
-| **Endpoint** | `POST /api/v1/admin-tools/repair-and-backfill` |
-| **Swagger tag** | `99 - Backfill created_by` |
-| **File required** | None |
-
----
-
-## Re-upload / Idempotency Notes
-
-- **All importers are idempotent.** Re-uploading the same file is safe — no duplicates will be created.
-- `inserted_* = 0` and `skipped_* > 0` on a re-upload is the **expected** result.
-- `category_id` and `approved_class_id` are back-filled on existing rows — re-upload the electrical file to patch rows that previously had NULL in those columns.
-- If FDW role tables (`public.users`, `public.roles`, `public.user_roles`) are unreachable, role assignment is skipped automatically and logged. This is **non-fatal**.
-
----
-
-## Environment Reference
-
-| Command | Use for |
-|---|---|
-| `./use-env.sh show` | Print the current active `.env` without switching |
-| `./use-env.sh test` | Safe sandbox — run all experiments here first |
-| `./use-env.sh staging` | Pre-production validation |
-| `./use-env.sh production` | Live DB — use with caution |
-
-> **Always restart `uvicorn` after switching environments.**
-
----
-
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `ON CONFLICT DO UPDATE command cannot affect row a second time` | Two rows in the Excel share the same unique key | Source Excel has exact duplicates — deduplicate the file before uploading |
-| `category_id` / `approved_class_id` still NULL | Rows existed before the UUID mapping was added | Re-upload the electrical file; `DO UPDATE` + post-insert UPDATE will back-fill it |
-| `inserted_users = 0` | All usernames already exist | Normal on re-runs — check `skipped_users` count |
-| Role assignment skipped entirely | FDW foreign tables unreachable | Non-fatal — re-run after FDW connection is restored |
-| Job stuck at `RUNNING` after server restart | In-memory `_job_status` dict is lost on restart | Re-upload safely — upsert pattern prevents duplicate rows |
-| Job status returns 404 | Wrong `job_id` or server was restarted | Check `GET .../jobs` to list recent jobs |
-| No rows imported, no error | Header row not detected | Check `apprefno` column exists in the Excel; `file_reader.py` scans for it as an anchor |
-
----
-
-## SQL Migration Scripts (`app/migrations/`)
-
-Run these manually in your SQL client when the API endpoints are not applicable.
-
-| File | Purpose |
-|---|---|
-| `align_live_schema_eservice_construction.sql` | Adds missing columns, drops stale UNIQUE constraints on live DB |
-| `staging_schema.sql` | Creates `public.stage_*_raw` staging tables |
-| `transform_into_final.sql` | INSERT from staging into final tables |
-| `backfill_created_by_from_username.sql` | Patch `created_by` by username match |
-| `20260219_add_is_from_lois.sql` | Adds `is_from_lois` column |
-| `20260221_certificates_unique_application_number.sql` | Unique constraint on certificates |
-| `extend_stage_schema_shareholders.sql` | Extends staging schema for shareholders |
+- **Production API Server**: `10.1.8.144` (Path: `/var/lib/pgsql/scripts/ewura-migration`, Service: `ewura-migration-api`)
+- **Production Database**: `10.1.8.166:5432/eservice_applications`
+- **Swagger Documentation**: `http://10.1.8.144:8000/docs`
