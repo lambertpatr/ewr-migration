@@ -76,9 +76,9 @@ Understanding the relationship between `applications` and `certificates` is esse
 - **All applications** sharing the same `approval_no` point to the **same single `certificate_id`** (`applications.certificate_id = certificates.id`).
 
 ### C. Latest Application Synchronization
-- The single `certificates` record **always displays the latest active status**:
-  - `certificates.application_id` $\rightarrow$ points to the **latest `RENEW` (or approved) application**.
-  - `certificates.effective_date` & `approval_date` $\rightarrow$ updated to the latest application's approval date.
+- The single `certificates` record **always captures the most recent approved application** based on **`effective_date`** (regardless of application type — whether `RENEW`, `APPEAL`, `EXTEND`, `UPGRADE`, `TRANSFER`, etc.):
+  - `certificates.application_id` $\rightarrow$ points to the application with the **most recent approved `effective_date`**.
+  - `certificates.effective_date` & `approval_date` $\rightarrow$ updated to the latest application's approval/effective date.
   - `certificates.expire_date` $\rightarrow$ updated to the latest application's expiration date.
   - `certificates.intimate_date` $\rightarrow$ updated to the latest application's reminder trigger date.
 

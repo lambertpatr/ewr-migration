@@ -731,6 +731,7 @@ def fix_certificates():
                 WHERE a.approval_no IS NOT NULL AND TRIM(a.approval_no) <> ''
                 ORDER BY a.approval_no, 
                          CASE WHEN a.status = 'APPROVED' THEN 1 ELSE 2 END,
+                         COALESCE(a.effective_date, a.approval_date) DESC NULLS LAST,
                          a.expire_date DESC NULLS LAST, 
                          a.created_at DESC,
                          a.id DESC
