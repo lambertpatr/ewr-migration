@@ -82,6 +82,13 @@ Understanding the relationship between `applications` and `certificates` is esse
   - `certificates.expire_date` $\rightarrow$ updated to the latest application's expiration date.
   - `certificates.intimate_date` $\rightarrow$ updated to the latest application's reminder trigger date.
 
+### D. Certificate Owner Rules (`certificate_owner`)
+- **Electrical Installation Sector (`LICENSE_ELECTRICITY_INSTALLATION`)**:
+  - `certificates.certificate_owner` is populated from `application_electrical_installation.applicant_name`.
+- **All Other Sectors (Petroleum, Natural Gas, Electricity Supply, Water Supply)**:
+  - `certificates.certificate_owner` is populated from `application_sector_details.facility_name` (formatted with `po_box` if present: `facility_name, po_box`), falling back to `company_name` or `tin_name`.
+- **All `is_from_lois = true` applications** must have `certificate_owner` populated in `certificates`.
+
 ---
 
 ## ⏳ 3. License Durations & Reminder Thresholds

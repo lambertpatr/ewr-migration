@@ -809,10 +809,20 @@ BEGIN
                 ELSE 'PETROLEUM'
             END as latest_sector,
             a.zone_id as latest_zone_id,
-            a.zone_name as latest_zone_name
+            a.zone_name as latest_zone_name,
+            CASE 
+                WHEN a.license_type = 'LICENSE_ELECTRICITY_INSTALLATION' OR cat.name ~* 'Electrical Installation'
+                THEN NULLIF(TRIM(aei.applicant_name), '')
+                ELSE TRIM(
+                    COALESCE(NULLIF(TRIM(asd.facility_name), ''), NULLIF(TRIM(asd.company_name), ''), NULLIF(TRIM(asd.tin_name), '')) ||
+                    CASE WHEN NULLIF(TRIM(asd.po_box), '') IS NOT NULL THEN ', ' || TRIM(asd.po_box) ELSE '' END
+                )
+            END as latest_cert_owner
         FROM public.applications a
         LEFT JOIN public.categories cat ON cat.id = a.category_id
         LEFT JOIN public.sectors sec ON sec.id = cat.sector_id
+        LEFT JOIN public.application_sector_details asd ON asd.application_id = a.id
+        LEFT JOIN public.application_electrical_installation aei ON aei.application_id = a.id
         WHERE a.approval_no IS NOT NULL AND TRIM(a.approval_no) <> ''
         ORDER BY a.approval_no, 
                  CASE WHEN a.status = 'APPROVED' THEN 1 ELSE 2 END,
@@ -835,6 +845,7 @@ BEGIN
         license_type                 = la.latest_license_type,
         category_license_type        = la.latest_cat_license_type,
         certificate_type             = la.latest_cert_type,
+        certificate_owner            = COALESCE(la.latest_cert_owner, c.certificate_owner),
         zone_id                      = COALESCE(la.latest_zone_id, c.zone_id),
         zone_name                    = COALESCE(la.latest_zone_name, c.zone_name),
         updated_at                   = now()
