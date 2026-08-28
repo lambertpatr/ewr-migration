@@ -932,8 +932,8 @@ def import_electrical_installation_via_staging_copy(
                 approval_no               = COALESCE(public.applications.approval_no,               EXCLUDED.approval_no),
                 approval_date             = COALESCE(public.applications.approval_date,             EXCLUDED.approval_date),
                 category_id               = COALESCE(EXCLUDED.category_id,               public.applications.category_id),
-                effective_date            = COALESCE(public.applications.effective_date,            EXCLUDED.effective_date),
-                expire_date               = COALESCE(public.applications.expire_date,               EXCLUDED.expire_date),
+                effective_date            = CASE WHEN public.applications.is_from_lois IS FALSE THEN public.applications.effective_date ELSE COALESCE(public.applications.effective_date, EXCLUDED.effective_date) END,
+                expire_date               = CASE WHEN public.applications.is_from_lois IS FALSE THEN public.applications.expire_date ELSE COALESCE(public.applications.expire_date, EXCLUDED.expire_date) END,
                 old_parent_application_id = COALESCE(public.applications.old_parent_application_id, EXCLUDED.old_parent_application_id),
                 username                  = COALESCE(public.applications.username,                  EXCLUDED.username),
                 old_created_by            = COALESCE(public.applications.old_created_by,            EXCLUDED.old_created_by),
@@ -942,9 +942,8 @@ def import_electrical_installation_via_staging_copy(
                 region                    = COALESCE(EXCLUDED.region,                    public.applications.region),
                 district                  = COALESCE(EXCLUDED.district,                  public.applications.district),
                 ward                      = COALESCE(EXCLUDED.ward,                      public.applications.ward),
-                -- These two are always enforced for electrical installation imports.
                 status                    = 'APPROVED',
-                is_from_lois              = true,
+                is_from_lois              = COALESCE(public.applications.is_from_lois, true),
                 updated_at                = now()
             RETURNING id
         )

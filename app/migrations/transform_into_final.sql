@@ -542,14 +542,14 @@ BEGIN
         ' LEFT JOIN public.sectors     sec ON sec.id = cat.sector_id'
         ' WHERE s.rn = 1 AND NULLIF(trim(s.application_number), '''') IS NOT NULL'
         ' ON CONFLICT (application_number) DO UPDATE SET'
-        '    effective_date   = COALESCE(EXCLUDED.effective_date,   public.applications.effective_date),'
-        '    expire_date      = COALESCE(EXCLUDED.expire_date,      public.applications.expire_date),'
+        '    effective_date   = CASE WHEN public.applications.is_from_lois IS FALSE THEN public.applications.effective_date ELSE COALESCE(EXCLUDED.effective_date, public.applications.effective_date) END,'
+        '    expire_date      = CASE WHEN public.applications.is_from_lois IS FALSE THEN public.applications.expire_date ELSE COALESCE(EXCLUDED.expire_date, public.applications.expire_date) END,'
         '    completed_at     = COALESCE(EXCLUDED.completed_at,     public.applications.completed_at),'
         '    approval_no      = COALESCE(EXCLUDED.approval_no,      public.applications.approval_no),'
         '    application_type = COALESCE(EXCLUDED.application_type, public.applications.application_type),'
         '    status           = COALESCE(EXCLUDED.status,           public.applications.status),'
         '    username         = COALESCE(EXCLUDED.username,         public.applications.username),'
-        '    is_from_lois     = true,'
+        '    is_from_lois     = COALESCE(public.applications.is_from_lois, true),'
         '    license_type     = COALESCE(EXCLUDED.license_type,     public.applications.license_type),'
         '    category_id      = COALESCE(EXCLUDED.category_id,      public.applications.category_id),'
         '    zone_id          = COALESCE(EXCLUDED.zone_id,          public.applications.zone_id),'
@@ -678,8 +678,8 @@ BEGIN
         application_id       = EXCLUDED.application_id,
         owner_id             = EXCLUDED.owner_id,
         sector               = COALESCE(EXCLUDED.sector,               public.certificates.sector),
-        effective_date       = COALESCE(EXCLUDED.effective_date,       public.certificates.effective_date),
-        expire_date          = COALESCE(EXCLUDED.expire_date,          public.certificates.expire_date),
+        effective_date       = CASE WHEN (SELECT a.is_from_lois FROM public.applications a WHERE a.id = public.certificates.application_id) IS FALSE THEN public.certificates.effective_date ELSE COALESCE(EXCLUDED.effective_date, public.certificates.effective_date) END,
+        expire_date          = CASE WHEN (SELECT a.is_from_lois FROM public.applications a WHERE a.id = public.certificates.application_id) IS FALSE THEN public.certificates.expire_date ELSE COALESCE(EXCLUDED.expire_date, public.certificates.expire_date) END,
         intimate_date        = COALESCE(EXCLUDED.intimate_date,        public.certificates.intimate_date),
         months_eligible      = COALESCE(EXCLUDED.months_eligible,      public.certificates.months_eligible),
         approval_date        = COALESCE(EXCLUDED.approval_date,        public.certificates.approval_date),
@@ -699,30 +699,161 @@ END $$;
 
 
 -------------------------------------------------------------------------------
--- 2b-backfill) Fix existing certificates: fill NULL sector from license_type
--- and sync owner_id with applications.created_by.
+-- 2b-backfill) Deduplicate certificates by approval_no, sync with latest application
+-- dates/application_id, and link all applications sharing approval_no to certificate_id.
 -------------------------------------------------------------------------------
 DO $$
 DECLARE
-    v_updated bigint;
+    v_updated bigint := 0;
+    v_linked  bigint := 0;
 BEGIN
+    -- 1. Re-link foreign key references to primary certificate ID
+    WITH ranked_certs AS (
+        SELECT 
+            c.id as cert_id,
+            c.approval_no,
+            ROW_NUMBER() OVER (
+                PARTITION BY c.approval_no 
+                ORDER BY c.created_at ASC, c.id ASC
+            ) as rn
+        FROM public.certificates c
+        WHERE c.approval_no IS NOT NULL AND TRIM(c.approval_no) <> ''
+    ),
+    primary_certs AS (
+        SELECT approval_no, cert_id as primary_cert_id
+        FROM ranked_certs WHERE rn = 1
+    ),
+    duplicate_certs AS (
+        SELECT rc.cert_id as dup_cert_id, pc.primary_cert_id
+        FROM ranked_certs rc
+        JOIN primary_certs pc ON pc.approval_no = rc.approval_no
+        WHERE rc.rn > 1
+    )
+    UPDATE public.applications app
+    SET certificate_id = dc.primary_cert_id
+    FROM duplicate_certs dc
+    WHERE app.certificate_id = dc.dup_cert_id;
+
+    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+               WHERE n.nspname = 'public' AND c.relname = 'certificate_owner_change_log') THEN
+        WITH ranked_certs AS (
+            SELECT 
+                c.id as cert_id,
+                c.approval_no,
+                ROW_NUMBER() OVER (
+                    PARTITION BY c.approval_no 
+                    ORDER BY c.created_at ASC, c.id ASC
+                ) as rn
+            FROM public.certificates c
+            WHERE c.approval_no IS NOT NULL AND TRIM(c.approval_no) <> ''
+        ),
+        primary_certs AS (
+            SELECT approval_no, cert_id as primary_cert_id
+            FROM ranked_certs WHERE rn = 1
+        ),
+        duplicate_certs AS (
+            SELECT rc.cert_id as dup_cert_id, pc.primary_cert_id
+            FROM ranked_certs rc
+            JOIN primary_certs pc ON pc.approval_no = rc.approval_no
+            WHERE rc.rn > 1
+        )
+        UPDATE public.certificate_owner_change_log cocl
+        SET certificate_id = dc.primary_cert_id
+        FROM duplicate_certs dc
+        WHERE cocl.certificate_id = dc.dup_cert_id;
+    END IF;
+
+    -- 2. Delete duplicate certificate rows
+    WITH ranked AS (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY approval_no
+                   ORDER BY created_at ASC, id ASC
+               ) AS rn
+        FROM public.certificates
+        WHERE approval_no IS NOT NULL AND TRIM(approval_no) <> ''
+    )
+    DELETE FROM public.certificates WHERE id IN (SELECT id FROM ranked WHERE rn > 1);
+
+    -- 3. Sync certificates with latest application details for each approval_no
+    WITH latest_app AS (
+        SELECT DISTINCT ON (a.approval_no)
+            a.approval_no,
+            a.id as latest_app_id,
+            a.created_by as latest_owner_id,
+            a.application_number as latest_app_num,
+            COALESCE(a.effective_date, a.approval_date) as latest_eff_date,
+            COALESCE(a.approval_date, a.effective_date) as latest_app_date,
+            a.expire_date as latest_exp_date,
+            COALESCE(a.intimate_date, 
+                CASE WHEN a.license_type = 'LICENSE_ELECTRICITY_INSTALLATION' OR cat.name ~* 'Electrical Installation'
+                     THEN a.expire_date - INTERVAL '90 days'
+                     ELSE a.expire_date - INTERVAL '180 days'
+                END
+            ) as latest_int_date,
+            a.months_eligible as latest_months_eligible,
+            a.licence_path as latest_licence_path,
+            a.license_type as latest_license_type,
+            a.category_license_type as latest_cat_license_type,
+            COALESCE(a.application_type, 'NEW') as latest_app_cert_type,
+            CASE WHEN cat.category_type IS NOT NULL THEN cat.category_type
+                 WHEN a.license_type LIKE 'CONSTRUCTION%' THEN 'Construction'
+                 ELSE 'License'
+            END as latest_cert_type,
+            CASE
+                WHEN sec.name IS NOT NULL THEN sec.name
+                WHEN a.license_type LIKE '%PETROLEUM' THEN 'PETROLEUM'
+                WHEN a.license_type LIKE '%NATURAL_GAS' THEN 'NATURAL_GAS'
+                WHEN a.license_type = 'LICENSE_WATER' THEN 'WATER_SUPPLY'
+                WHEN a.license_type LIKE '%ELECTRICITY%' THEN 'ELECTRICITY'
+                ELSE 'PETROLEUM'
+            END as latest_sector,
+            a.zone_id as latest_zone_id,
+            a.zone_name as latest_zone_name
+        FROM public.applications a
+        LEFT JOIN public.categories cat ON cat.id = a.category_id
+        LEFT JOIN public.sectors sec ON sec.id = cat.sector_id
+        WHERE a.approval_no IS NOT NULL AND TRIM(a.approval_no) <> ''
+        ORDER BY a.approval_no, 
+                 CASE WHEN a.status = 'APPROVED' THEN 1 ELSE 2 END,
+                 a.expire_date DESC NULLS LAST, 
+                 a.created_at DESC,
+                 a.id DESC
+    )
     UPDATE public.certificates c
-    SET    sector = CASE
-                        WHEN a.license_type LIKE '%PETROLEUM'      THEN 'PETROLEUM'
-                        WHEN a.license_type LIKE '%NATURAL_GAS'    THEN 'NATURAL_GAS'
-                        WHEN a.license_type = 'LICENSE_WATER'       THEN 'WATER_SUPPLY'
-                        WHEN a.license_type LIKE '%ELECTRICITY%'   THEN 'ELECTRICITY'
-                        ELSE NULL
-                    END,
-           owner_id = a.created_by,
-           certificate_type = COALESCE(a.category_type, c.certificate_type),
-           updated_at = now()
-    FROM   public.applications a
-    WHERE  a.application_number = c.application_number
-      AND  (c.sector IS NULL OR c.sector = '' OR c.owner_id IS DISTINCT FROM a.created_by);
+    SET
+        application_id               = la.latest_app_id,
+        owner_id                     = COALESCE(la.latest_owner_id, c.owner_id),
+        sector                       = la.latest_sector,
+        application_certificate_type = la.latest_app_cert_type,
+        effective_date               = la.latest_eff_date,
+        approval_date                = la.latest_app_date,
+        expire_date                  = la.latest_exp_date,
+        intimate_date                = la.latest_int_date,
+        months_eligible              = COALESCE(la.latest_months_eligible, c.months_eligible),
+        licence_path                 = COALESCE(la.latest_licence_path, c.licence_path),
+        license_type                 = la.latest_license_type,
+        category_license_type        = la.latest_cat_license_type,
+        certificate_type             = la.latest_cert_type,
+        zone_id                      = COALESCE(la.latest_zone_id, c.zone_id),
+        zone_name                    = COALESCE(la.latest_zone_name, c.zone_name),
+        updated_at                   = now()
+    FROM latest_app la
+    WHERE c.approval_no = la.approval_no;
 
     GET DIAGNOSTICS v_updated = ROW_COUNT;
-    RAISE NOTICE '[staging-transform] backfilled certificates (sector+owner_id)=%', v_updated;
+
+    -- 4. Link ALL applications sharing approval_no to that single certificate ID
+    UPDATE public.applications a
+    SET certificate_id = c.id, updated_at = now()
+    FROM public.certificates c
+    WHERE TRIM(a.approval_no) = TRIM(c.approval_no)
+      AND a.approval_no IS NOT NULL AND TRIM(a.approval_no) <> ''
+      AND (a.certificate_id IS DISTINCT FROM c.id);
+
+    GET DIAGNOSTICS v_linked = ROW_COUNT;
+
+    RAISE NOTICE '[staging-transform] synced certificates with latest application (updated=%, linked_apps=%)', v_updated, v_linked;
 END $$;
 
 

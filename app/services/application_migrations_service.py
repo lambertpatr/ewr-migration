@@ -1370,10 +1370,15 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                     c for c in col_names
                     if c not in ('id', 'application_number', 'created_at')
                 ]
-                _set_conflict_sql = ', '.join(
-                    [f"{c} = COALESCE(EXCLUDED.{c}, public.applications.{c})"
-                     for c in _conflict_update_cols]
-                ) + ", updated_at = now()"
+                _conflict_parts = []
+                for c in _conflict_update_cols:
+                    if c in ('effective_date', 'expire_date'):
+                        _conflict_parts.append(f"{c} = CASE WHEN public.applications.is_from_lois IS FALSE THEN public.applications.{c} ELSE COALESCE(EXCLUDED.{c}, public.applications.{c}) END")
+                    elif c == 'is_from_lois':
+                        _conflict_parts.append("is_from_lois = COALESCE(public.applications.is_from_lois, true)")
+                    else:
+                        _conflict_parts.append(f"{c} = COALESCE(EXCLUDED.{c}, public.applications.{c})")
+                _set_conflict_sql = ', '.join(_conflict_parts) + ", updated_at = now()"
                 # ask DB to RETURNING id so we can map document rows to real ids
                 insert_sql = text(
                     f"INSERT INTO public.applications ({cols_sql}) VALUES ({vals_sql}) "
@@ -1721,8 +1726,8 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                 SET
                     approval_no               = COALESCE(EXCLUDED.approval_no,               public.certificates.approval_no),
                     application_id            = EXCLUDED.application_id,
-                    effective_date            = COALESCE(EXCLUDED.effective_date,            public.certificates.effective_date),
-                    expire_date               = COALESCE(EXCLUDED.expire_date,               public.certificates.expire_date),
+                    effective_date            = CASE WHEN (SELECT a.is_from_lois FROM public.applications a WHERE a.id = public.certificates.application_id) IS FALSE THEN public.certificates.effective_date ELSE COALESCE(EXCLUDED.effective_date, public.certificates.effective_date) END,
+                    expire_date               = CASE WHEN (SELECT a.is_from_lois FROM public.applications a WHERE a.id = public.certificates.application_id) IS FALSE THEN public.certificates.expire_date ELSE COALESCE(EXCLUDED.expire_date, public.certificates.expire_date) END,
                     license_type              = COALESCE(EXCLUDED.license_type,              public.certificates.license_type),
                     category_license_type     = COALESCE(EXCLUDED.category_license_type,     public.certificates.category_license_type),
                     application_certificate_type = COALESCE(EXCLUDED.application_certificate_type, public.certificates.application_certificate_type),

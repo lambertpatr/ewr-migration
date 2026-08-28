@@ -69,12 +69,28 @@ _SQL_UPDATE_CERTIFICATES = """
 UPDATE public.certificates cert
 SET
     license_type          = a.license_type,
-    category_license_type = a.category_license_type
+    category_license_type = a.category_license_type,
+    sector                = CASE
+                                WHEN a.license_type LIKE '%PETROLEUM'    THEN 'PETROLEUM'
+                                WHEN a.license_type LIKE '%NATURAL_GAS'  THEN 'NATURAL_GAS'
+                                WHEN a.license_type = 'LICENSE_WATER'     THEN 'WATER_SUPPLY'
+                                WHEN a.license_type LIKE '%ELECTRICITY%' THEN 'ELECTRICITY'
+                                ELSE cert.sector
+                            END
 FROM public.applications a
 WHERE cert.application_id = a.id
   AND (
       cert.license_type          IS DISTINCT FROM a.license_type
    OR cert.category_license_type IS DISTINCT FROM a.category_license_type
+   OR cert.sector                IS DISTINCT FROM (
+                                    CASE
+                                        WHEN a.license_type LIKE '%PETROLEUM'    THEN 'PETROLEUM'
+                                        WHEN a.license_type LIKE '%NATURAL_GAS'  THEN 'NATURAL_GAS'
+                                        WHEN a.license_type = 'LICENSE_WATER'     THEN 'WATER_SUPPLY'
+                                        WHEN a.license_type LIKE '%ELECTRICITY%' THEN 'ELECTRICITY'
+                                        ELSE cert.sector
+                                    END
+                                  )
   )
 """
 
@@ -566,35 +582,94 @@ def clean_name_fields(dry_run: bool = True):
             db.rollback()
         except Exception:
             pass
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
-
-
 @router.post("/fix-certificates", tags=["01 - Schema Sync"])
 def fix_certificates():
     """Post-upload certificate maintenance."""
     db = _get_new_session()
     try:
+        # Step 1: Backfill intimate_date for applications
         r1 = db.execute(text("""
             UPDATE public.applications a
-            SET intimate_date = a.expire_date - INTERVAL '6 months',
-                updated_at    = now()
+            SET intimate_date = CASE 
+                    WHEN a.license_type = 'LICENSE_ELECTRICITY_INSTALLATION' OR c.name ~* 'Electrical Installation'
+                    THEN a.expire_date - INTERVAL '90 days'
+                    ELSE a.expire_date - INTERVAL '180 days'
+                END,
+                updated_at = now()
             FROM public.categories c
             WHERE a.category_id = c.id
-              AND c.category_type = 'License'
               AND a.intimate_date IS NULL
               AND a.expire_date IS NOT NULL
         """))
         intimate_date_updated = r1.rowcount or 0
         db.commit()
 
+        # Step 2: Re-link foreign key references (applications and certificate_owner_change_log) to primary certificate ID
+        db.execute(text("""
+            WITH ranked_certs AS (
+                SELECT 
+                    c.id as cert_id,
+                    c.approval_no,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.approval_no 
+                        ORDER BY c.created_at ASC, c.id ASC
+                    ) as rn
+                FROM public.certificates c
+                WHERE c.approval_no IS NOT NULL AND TRIM(c.approval_no) <> ''
+            ),
+            primary_certs AS (
+                SELECT approval_no, cert_id as primary_cert_id
+                FROM ranked_certs WHERE rn = 1
+            ),
+            duplicate_certs AS (
+                SELECT rc.cert_id as dup_cert_id, pc.primary_cert_id
+                FROM ranked_certs rc
+                JOIN primary_certs pc ON pc.approval_no = rc.approval_no
+                WHERE rc.rn > 1
+            )
+            UPDATE public.applications app
+            SET certificate_id = dc.primary_cert_id
+            FROM duplicate_certs dc
+            WHERE app.certificate_id = dc.dup_cert_id;
+        """))
+        db.commit()
+
+        db.execute(text("""
+            WITH ranked_certs AS (
+                SELECT 
+                    c.id as cert_id,
+                    c.approval_no,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY c.approval_no 
+                        ORDER BY c.created_at ASC, c.id ASC
+                    ) as rn
+                FROM public.certificates c
+                WHERE c.approval_no IS NOT NULL AND TRIM(c.approval_no) <> ''
+            ),
+            primary_certs AS (
+                SELECT approval_no, cert_id as primary_cert_id
+                FROM ranked_certs WHERE rn = 1
+            ),
+            duplicate_certs AS (
+                SELECT rc.cert_id as dup_cert_id, pc.primary_cert_id
+                FROM ranked_certs rc
+                JOIN primary_certs pc ON pc.approval_no = rc.approval_no
+                WHERE rc.rn > 1
+            )
+            UPDATE public.certificate_owner_change_log cocl
+            SET certificate_id = dc.primary_cert_id
+            FROM duplicate_certs dc
+            WHERE cocl.certificate_id = dc.dup_cert_id;
+        """))
+        db.commit()
+
+        # Step 3: Delete duplicate certificate rows
         r2 = db.execute(text("""
             WITH ranked AS (
                 SELECT id,
                        ROW_NUMBER() OVER (
                            PARTITION BY approval_no
-                           ORDER BY expire_date DESC NULLS LAST, created_at DESC NULLS LAST
+                           ORDER BY created_at ASC, id ASC
                        ) AS rn
                 FROM public.certificates
                 WHERE approval_no IS NOT NULL AND TRIM(approval_no) <> ''
@@ -604,44 +679,94 @@ def fix_certificates():
         certificates_deleted = r2.rowcount or 0
         db.commit()
 
+        # Step 4: Update certificates with latest application dates and application_id
         r3 = db.execute(text("""
+            WITH latest_app AS (
+                SELECT DISTINCT ON (a.approval_no)
+                    a.approval_no,
+                    a.id as latest_app_id,
+                    a.created_by as latest_owner_id,
+                    a.application_number as latest_app_num,
+                    COALESCE(a.effective_date, a.approval_date) as latest_eff_date,
+                    COALESCE(a.approval_date, a.effective_date) as latest_app_date,
+                    a.expire_date as latest_exp_date,
+                    COALESCE(a.intimate_date, 
+                        CASE WHEN a.license_type = 'LICENSE_ELECTRICITY_INSTALLATION' OR cat.name ~* 'Electrical Installation'
+                             THEN a.expire_date - INTERVAL '90 days'
+                             ELSE a.expire_date - INTERVAL '180 days'
+                        END
+                    ) as latest_int_date,
+                    a.months_eligible as latest_months_eligible,
+                    a.licence_path as latest_licence_path,
+                    a.license_type as latest_license_type,
+                    a.category_license_type as latest_cat_license_type,
+                    COALESCE(a.application_type, 'NEW') as latest_app_cert_type,
+                    CASE WHEN cat.category_type IS NOT NULL THEN cat.category_type
+                         WHEN a.license_type LIKE 'CONSTRUCTION%' THEN 'Construction'
+                         ELSE 'License'
+                    END as latest_cert_type,
+                    CASE
+                        WHEN sec.name IS NOT NULL THEN sec.name
+                        WHEN a.license_type LIKE '%PETROLEUM' THEN 'PETROLEUM'
+                        WHEN a.license_type LIKE '%NATURAL_GAS' THEN 'NATURAL_GAS'
+                        WHEN a.license_type = 'LICENSE_WATER' THEN 'WATER_SUPPLY'
+                        WHEN a.license_type LIKE '%ELECTRICITY%' THEN 'ELECTRICITY'
+                        ELSE 'PETROLEUM'
+                    END as latest_sector,
+                    a.zone_id as latest_zone_id,
+                    a.zone_name as latest_zone_name
+                FROM public.applications a
+                LEFT JOIN public.categories cat ON cat.id = a.category_id
+                LEFT JOIN public.sectors sec ON sec.id = cat.sector_id
+                WHERE a.approval_no IS NOT NULL AND TRIM(a.approval_no) <> ''
+                ORDER BY a.approval_no, 
+                         CASE WHEN a.status = 'APPROVED' THEN 1 ELSE 2 END,
+                         a.expire_date DESC NULLS LAST, 
+                         a.created_at DESC,
+                         a.id DESC
+            )
+            UPDATE public.certificates c
+            SET
+                application_id               = la.latest_app_id,
+                owner_id                     = COALESCE(la.latest_owner_id, c.owner_id),
+                sector                       = la.latest_sector,
+                application_certificate_type = la.latest_app_cert_type,
+                effective_date               = la.latest_eff_date,
+                approval_date                = la.latest_app_date,
+                expire_date                  = la.latest_exp_date,
+                intimate_date                = la.latest_int_date,
+                months_eligible              = COALESCE(la.latest_months_eligible, c.months_eligible),
+                licence_path                 = COALESCE(la.latest_licence_path, c.licence_path),
+                license_type                 = la.latest_license_type,
+                category_license_type        = la.latest_cat_license_type,
+                certificate_type             = la.latest_cert_type,
+                zone_id                      = COALESCE(la.latest_zone_id, c.zone_id),
+                zone_name                    = COALESCE(la.latest_zone_name, c.zone_name),
+                updated_at                   = now()
+            FROM latest_app la
+            WHERE c.approval_no = la.approval_no;
+        """))
+        certificates_updated = r3.rowcount or 0
+        db.commit()
+
+        # Step 5: Link ALL applications sharing approval_no to that single certificate ID
+        r4 = db.execute(text("""
             UPDATE public.applications a
             SET certificate_id = c.id, updated_at = now()
             FROM public.certificates c
             WHERE TRIM(a.approval_no) = TRIM(c.approval_no)
               AND a.approval_no IS NOT NULL AND TRIM(a.approval_no) <> ''
+              AND (a.certificate_id IS DISTINCT FROM c.id)
         """))
-        certificate_id_updated = r3.rowcount or 0
-        db.commit()
-
-        try:
-            db.execute(text("""
-                ALTER TABLE public.certificates
-                    ADD COLUMN IF NOT EXISTS sector           character varying NULL,
-                    ADD COLUMN IF NOT EXISTS certificate_type character varying NULL
-            """))
-            db.commit()
-        except Exception:
-            db.rollback()
-
-        r4 = db.execute(text("""
-            UPDATE public.certificates c
-            SET sector = s.name, certificate_type = cat.category_type, updated_at = now()
-            FROM public.applications a
-            JOIN public.categories cat ON cat.id = a.category_id
-            JOIN public.sectors    s   ON s.id   = cat.sector_id
-            WHERE c.application_id = a.id
-              AND (c.sector IS NULL OR c.certificate_type IS NULL)
-        """))
-        certificates_sector_updated = r4.rowcount or 0
+        certificate_id_updated = r4.rowcount or 0
         db.commit()
 
         return {
             "status": "OK",
             "intimate_date_backfilled": intimate_date_updated,
             "duplicate_certificates_deleted": certificates_deleted,
+            "certificates_updated_with_latest_app": certificates_updated,
             "applications_certificate_id_updated": certificate_id_updated,
-            "certificates_sector_and_type_updated": certificates_sector_updated,
         }
 
     except Exception as e:

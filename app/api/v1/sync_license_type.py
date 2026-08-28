@@ -79,12 +79,28 @@ _SQL_UPDATE_CERTIFICATES = """
 UPDATE public.certificates cert
 SET
     license_type          = a.license_type,
-    category_license_type = a.category_license_type
+    category_license_type = a.category_license_type,
+    sector                = CASE
+                                WHEN a.license_type LIKE '%PETROLEUM'    THEN 'PETROLEUM'
+                                WHEN a.license_type LIKE '%NATURAL_GAS'  THEN 'NATURAL_GAS'
+                                WHEN a.license_type = 'LICENSE_WATER'     THEN 'WATER_SUPPLY'
+                                WHEN a.license_type LIKE '%ELECTRICITY%' THEN 'ELECTRICITY'
+                                ELSE cert.sector
+                            END
 FROM public.applications a
 WHERE cert.application_id = a.id
   AND (
       cert.license_type          IS DISTINCT FROM a.license_type
    OR cert.category_license_type IS DISTINCT FROM a.category_license_type
+   OR cert.sector                IS DISTINCT FROM (
+                                    CASE
+                                        WHEN a.license_type LIKE '%PETROLEUM'    THEN 'PETROLEUM'
+                                        WHEN a.license_type LIKE '%NATURAL_GAS'  THEN 'NATURAL_GAS'
+                                        WHEN a.license_type = 'LICENSE_WATER'     THEN 'WATER_SUPPLY'
+                                        WHEN a.license_type LIKE '%ELECTRICITY%' THEN 'ELECTRICITY'
+                                        ELSE cert.sector
+                                    END
+                                  )
   )
 """
 
