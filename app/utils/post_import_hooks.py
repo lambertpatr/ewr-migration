@@ -223,14 +223,19 @@ def run_backfill_certificates_sector_owner(
                                ELSE NULL
                            END,
                                      owner_id   = a.created_by,
-                                     certificate_type = COALESCE(a.category_type, c.certificate_type),
+                                     certificate_type = CASE
+                                         WHEN a.category_type IN ('Construction', 'License', 'Registration') THEN a.category_type
+                                         WHEN a.license_type LIKE 'CONSTRUCTION%' THEN 'Construction'
+                                         WHEN c.certificate_type IN ('Construction', 'License', 'Registration') THEN c.certificate_type
+                                         ELSE 'License'
+                                     END,
                    updated_at = now()
             FROM   public.applications a
             WHERE  a.application_number = c.application_number
                             AND  (
                                      c.sector IS NULL OR c.sector = ''
                                 OR c.owner_id IS DISTINCT FROM a.created_by
-                                OR (a.category_type IS NOT NULL AND a.category_type <> '' AND c.certificate_type IS DISTINCT FROM a.category_type)
+                                OR (a.category_type IN ('Construction', 'License', 'Registration') AND c.certificate_type IS DISTINCT FROM a.category_type)
                             )
         """))
         db.commit()

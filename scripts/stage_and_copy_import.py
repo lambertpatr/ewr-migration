@@ -1014,6 +1014,7 @@ def stage_and_copy_import(
                             EXECUTE format('ALTER TABLE %I.certificates DROP CONSTRAINT IF EXISTS %I',
                                            _schema, _rec.conname);
                         END LOOP;
+                        EXECUTE format('DROP INDEX IF EXISTS %I.uq_certificates_approval_no', _schema);
                     END IF;
 
                     -- Drop any existing unique on application_number (we re-add cleanly below)

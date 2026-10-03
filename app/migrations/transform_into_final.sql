@@ -70,6 +70,8 @@ BEGIN
                            _schema, _rec.conname);
             RAISE NOTICE '[staging-transform] Dropped certificates unique on approval_no: %', _rec.conname;
         END LOOP;
+        EXECUTE format('DROP INDEX IF EXISTS %I.uq_certificates_approval_no', _schema);
+        RAISE NOTICE '[staging-transform] Dropped index uq_certificates_approval_no';
     END IF;
 
     -- ── certificates: drop any unique mentioning application_number EXCEPT our own ──
@@ -519,10 +521,10 @@ BEGIN
         '    ' || v_zone_expr || ','
         '    NULL::text, NULL::text,'
         '    CASE'
-        '        WHEN TRIM(sec.name) = ''PETROLEUM'' AND cat.category_type = ''Construction'' THEN ''CONSTRUCTION_PETROLEUM'''
-        '        WHEN TRIM(sec.name) = ''PETROLEUM'' AND cat.category_type = ''License''      THEN ''LICENSE_PETROLEUM'''
-        '        WHEN TRIM(sec.name) = ''NATURAL_GAS'' AND cat.category_type = ''Construction'' THEN ''CONSTRUCTION_NATURAL_GAS'''
-        '        WHEN TRIM(sec.name) = ''NATURAL_GAS'' AND cat.category_type = ''License''    THEN ''LICENSE_NATURAL_GAS'''
+        '        WHEN TRIM(sec.name) = ''PETROLEUM'' AND (cat.category_type = ''Construction'' OR cat.name ~* ''Construction'') THEN ''CONSTRUCTION_PETROLEUM'''
+        '        WHEN TRIM(sec.name) = ''PETROLEUM''                                           THEN ''LICENSE_PETROLEUM'''
+        '        WHEN TRIM(sec.name) = ''NATURAL_GAS'' AND (cat.category_type = ''Construction'' OR cat.name ~* ''Construction'') THEN ''CONSTRUCTION_NATURAL_GAS'''
+        '        WHEN TRIM(sec.name) = ''NATURAL_GAS''                                         THEN ''LICENSE_NATURAL_GAS'''
         '        WHEN TRIM(sec.name) = ''WATER_SUPPLY''                                       THEN ''LICENSE_WATER'''
         '        WHEN TRIM(sec.name) = ''ELECTRICITY''                                        THEN ''LICENSE_ELECTRICITY_SUPPLY'''
         '        ELSE NULL'
@@ -538,7 +540,13 @@ BEGIN
         '    ) AS rn'
         '    FROM public.stage_ca_applications_raw s'
         ' ) s'
-        ' LEFT JOIN public.categories cat ON LOWER(TRIM(cat.name)) = LOWER(TRIM(s.license_type))'
+        ' LEFT JOIN LATERAL ('
+        '     SELECT c.id, c.name, c.category_type, c.sector_id'
+        '     FROM public.categories c'
+        '     WHERE LOWER(TRIM(c.name)) = LOWER(TRIM(s.license_type))'
+        '     ORDER BY c.created_at ASC'
+        '     LIMIT 1'
+        ' ) cat ON true'
         ' LEFT JOIN public.sectors     sec ON sec.id = cat.sector_id'
         ' WHERE s.rn = 1 AND NULLIF(trim(s.application_number), '''') IS NOT NULL'
         ' ON CONFLICT (application_number) DO UPDATE SET'
@@ -646,7 +654,11 @@ BEGIN
         a.licence_path,
         a.license_type,
         a.category_license_type,
-        a.category_type AS certificate_type,
+        CASE 
+            WHEN a.category_type IN ('Construction', 'License', 'Registration') THEN a.category_type
+            WHEN a.license_type LIKE 'CONSTRUCTION%' THEN 'Construction'
+            ELSE 'License'
+        END AS certificate_type,
         TRIM(
             COALESCE(NULLIF(trim(s.facility_name), ''), '') || 
             CASE 
@@ -796,8 +808,9 @@ BEGIN
             a.license_type as latest_license_type,
             a.category_license_type as latest_cat_license_type,
             COALESCE(a.application_type, 'NEW') as latest_app_cert_type,
-            CASE WHEN cat.category_type IS NOT NULL THEN cat.category_type
-                 WHEN a.license_type LIKE 'CONSTRUCTION%' THEN 'Construction'
+            CASE 
+                 WHEN cat.category_type = 'Construction' OR a.license_type LIKE 'CONSTRUCTION%' THEN 'Construction'
+                 WHEN cat.category_type = 'Registration' THEN 'Registration'
                  ELSE 'License'
             END as latest_cert_type,
             CASE
@@ -866,6 +879,11 @@ BEGIN
     GET DIAGNOSTICS v_linked = ROW_COUNT;
 
     RAISE NOTICE '[staging-transform] synced certificates with latest application (updated=%, linked_apps=%)', v_updated, v_linked;
+
+    -- Re-create the unique index on approval_no now that deduplication is complete
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_certificates_approval_no
+        ON public.certificates USING btree (approval_no)
+        WHERE ((approval_no IS NOT NULL) AND ((approval_no)::text <> ''::text));
 END $$;
 
 
