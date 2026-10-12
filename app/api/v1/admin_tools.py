@@ -2359,9 +2359,14 @@ def lookup_by_number(
                 a.approval_no,
                 a.application_type,
                 a.license_type,
+                a.status,
                 a.effective_date,
                 a.expire_date,
+                a.intimate_date,
                 a.username,
+                a.certificate_id,
+                c.certificate_owner,
+                c.expire_date               AS certificate_expire_date,
                 a.created_at,
                 a.updated_at,
                 COALESCE(
@@ -2373,8 +2378,11 @@ def lookup_by_number(
                 asd.company_name            AS company_name,
                 aei.applicant_name          AS applicant_name,
                 asd.region                  AS region,
-                asd.district                AS district
+                asd.district                AS district,
+                asd.ward                    AS ward
             FROM public.applications a
+            LEFT JOIN public.certificates c
+                   ON c.id = a.certificate_id
             LEFT JOIN public.application_sector_details asd
                    ON asd.application_id = a.id
             LEFT JOIN public.application_electrical_installation aei

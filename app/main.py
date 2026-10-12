@@ -21,6 +21,7 @@ from app.api.v1.self_employed_upload import router as self_employed_upload_route
 from app.api.v1.water_supply_upload import router as water_supply_router
 import app.api.v1.categories_upload as categories_upload
 from app.api.v1.application_transfers import router as application_transfers_router
+from app.frontend.portal import router as portal_router
 
 
 app = FastAPI(
@@ -36,6 +37,7 @@ app.add_middleware(
 	allow_headers=["*"],
 )
 
+app.include_router(portal_router)
 app.include_router(lois_users_router)
 app.include_router(app_migrations_router)
 app.include_router(shareholders_router)
