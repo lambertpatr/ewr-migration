@@ -8,11 +8,11 @@ USER = "ewura-admin"
 PASS = "secure@123"
 
 def main():
-    print("Creating fresh deployment package ewura-migration.tar.gz...")
+    print("Creating fresh deployment package /tmp/ewura-migration-upload.tar.gz...")
     subprocess.run(
         "COPYFILE_DISABLE=1 tar --no-xattrs --exclude='.venv' "
         "--exclude='__pycache__' --exclude='*.pyc' --exclude='.git' "
-        "--exclude='*.tar.gz' -czf ewura-migration.tar.gz .",
+        "--exclude='*.tar.gz' -czf /tmp/ewura-migration-upload.tar.gz .",
         shell=True,
         check=True
     )
@@ -25,8 +25,13 @@ def main():
 
     sftp = ssh.open_sftp()
     print("Uploading ewura-migration.tar.gz...")
-    sftp.put("ewura-migration.tar.gz", "/tmp/ewura-migration.tar.gz")
+    sftp.put("/tmp/ewura-migration-upload.tar.gz", "/tmp/ewura-migration.tar.gz")
     sftp.close()
+    try:
+        import os
+        os.remove("/tmp/ewura-migration-upload.tar.gz")
+    except Exception:
+        pass
 
     commands = [
         "echo 'secure@123' | sudo -S mkdir -p /var/lib/pgsql/scripts/ewura-migration",
