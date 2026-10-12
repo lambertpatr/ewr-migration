@@ -193,6 +193,101 @@ PORTAL_HTML = """<!DOCTYPE html>
       font-weight: 700;
     }
 
+    /* Pipeline Segmented Selector */
+    .pipeline-nav {
+      display: flex;
+      gap: 0.5rem;
+      background: #e2e8f0;
+      padding: 0.4rem;
+      border-radius: 12px;
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+    }
+    .pipeline-tab-btn {
+      flex: 1;
+      min-width: 200px;
+      padding: 0.75rem 1.25rem;
+      border: none;
+      background: transparent;
+      color: #475569;
+      font-weight: 700;
+      font-size: 0.9rem;
+      border-radius: 8px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .pipeline-tab-btn:hover {
+      color: var(--primary);
+      background: rgba(255, 255, 255, 0.65);
+    }
+    .pipeline-tab-btn.active {
+      background: #fff;
+      color: var(--primary-dark);
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.1);
+    }
+
+    .pipeline-panel {
+      display: none;
+    }
+    .pipeline-panel.active {
+      display: block;
+      animation: fadeIn 0.2s ease-in-out;
+    }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Step Sequence Progress Indicator */
+    .workflow-progress {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 1.25rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      padding: 1rem 1.5rem;
+      border-radius: var(--radius);
+      margin-bottom: 1.5rem;
+      flex-wrap: wrap;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .wf-step {
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      font-size: 0.9rem;
+      font-weight: 700;
+      color: #64748b;
+    }
+    .wf-step.active {
+      color: var(--primary-dark);
+    }
+    .wf-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.8rem;
+      height: 1.8rem;
+      border-radius: 50%;
+      background: #e2e8f0;
+      color: #475569;
+      font-size: 0.85rem;
+      font-weight: 800;
+    }
+    .wf-step.active .wf-badge {
+      background: var(--primary);
+      color: #fff;
+    }
+    .wf-arrow {
+      color: #cbd5e1;
+      font-size: 1.25rem;
+    }
+
     /* Container */
     main {
       flex: 1;
@@ -717,293 +812,374 @@ PORTAL_HTML = """<!DOCTYPE html>
     <!-- ========================================== -->
     <div id="uploadTab" class="tab-content active">
 
-      <div class="first-timer-tip">
-        <div>💡</div>
-        <div>
-          <strong>First-time Migration Guidance:</strong> Always follow the numbered sequence!
-          Parent applications must exist in the database <em>before</em> attaching Shareholders, Directors, or Supervisor details.
-          Records match on <code>apprefno</code> (Application Number).
+      <!-- Pipeline Segmented Selector -->
+      <div class="pipeline-nav">
+        <button type="button" class="pipeline-tab-btn active" onclick="switchPipeline('pipeline-standard')">
+          🛢️ Standard Sectors (Most Common)
+        </button>
+        <button type="button" class="pipeline-tab-btn" onclick="switchPipeline('pipeline-electrical')">
+          ⚡ Electrical Installations Pipeline
+        </button>
+        <button type="button" class="pipeline-tab-btn" onclick="switchPipeline('pipeline-water')">
+          💧 Water Supply Pipeline
+        </button>
+        <button type="button" class="pipeline-tab-btn" onclick="switchPipeline('pipeline-reference')">
+          🏛️ Reference Data & Fees
+        </button>
+      </div>
+
+      <!-- ============================================== -->
+      <!-- PIPELINE 1: STANDARD SECTORS (DEFAULT VISIBLE) -->
+      <!-- ============================================== -->
+      <div id="pipeline-standard" class="pipeline-panel active">
+
+        <!-- Guided Step Indicator -->
+        <div class="workflow-progress">
+          <div class="wf-step active">
+            <span class="wf-badge">1</span>
+            <span>Step 1: Applications (Mandatory First)</span>
+          </div>
+          <span class="wf-arrow">→</span>
+          <div class="wf-step">
+            <span class="wf-badge">2</span>
+            <span>Step 2: Shareholders</span>
+          </div>
+          <span class="wf-arrow">→</span>
+          <div class="wf-step">
+            <span class="wf-badge">3</span>
+            <span>Step 3: Directors</span>
+          </div>
+        </div>
+
+        <div class="first-timer-tip">
+          <div>💡</div>
+          <div>
+            <strong>Standard Sectors Workflow:</strong> Use this workflow for Petroleum, Natural Gas, Electricity, and general Water applications.
+            Upload the <strong>Applications</strong> file first so records exist in the database, then upload <strong>Shareholders</strong> and <strong>Directors</strong> (which link automatically via <code>apprefno</code>).
+          </div>
+        </div>
+
+        <div class="steps-grid">
+
+          <!-- 1.1 Sector Applications Upload -->
+          <div class="step-card">
+            <span class="step-badge badge-primary-order">STEP 1 OF 3 • MANDATORY FIRST</span>
+            <div class="step-header">License Applications Migration</div>
+            <div class="step-details">
+              Creates application records, assigns sector categories, and generates linked certificates for Petroleum, Natural Gas, Electricity, or Water Supply.
+            </div>
+
+            <form id="appForm" onsubmit="handleSectorAppUpload(event)">
+              <div class="form-group">
+                <label class="form-label">Sector Name</label>
+                <select class="form-select" id="appSector" required>
+                  <option value="PETROLEUM" selected>PETROLEUM</option>
+                  <option value="NATURAL_GAS">NATURAL_GAS</option>
+                  <option value="ELECTRICITY">ELECTRICITY</option>
+                  <option value="WATER_SUPPLY">WATER_SUPPLY</option>
+                </select>
+              </div>
+
+              <div class="file-dropzone">
+                <div class="dropzone-icon">📄</div>
+                <div class="dropzone-text">Choose Applications Excel/CSV</div>
+                <div class="dropzone-hint">e.g. Approved Petroleum License missing.xlsx</div>
+                <div class="file-chosen-name" id="appChosenName"></div>
+                <input type="file" id="appFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'appChosenName')" required>
+              </div>
+
+              <button type="submit" class="btn btn-primary" id="appSubmitBtn">
+                Upload Applications File
+              </button>
+            </form>
+
+            <div class="status-box" id="appStatus"></div>
+          </div>
+
+          <!-- 1.2 Shareholders -->
+          <div class="step-card">
+            <span class="step-badge badge-secondary-order">STEP 2 OF 3 • AFTER APPLICATIONS</span>
+            <div class="step-header">Company Shareholders Details</div>
+            <div class="step-details">
+              Attaches shareholder structure to each company. Matches on <code>apprefno</code> to link shareholders to the applications loaded in Step 1.
+            </div>
+            <form onsubmit="handleGenericFormUpload(event, '/api/v1/shareholders/upload', 'shFile', 'shSubmitBtn', 'shStatus', 'Shareholders')">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">👥</div>
+                <div class="dropzone-text">Choose Shareholders Excel/CSV</div>
+                <div class="dropzone-hint">e.g. ShareHolder missing.xlsx</div>
+                <div class="file-chosen-name" id="shChosenName"></div>
+                <input type="file" id="shFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'shChosenName')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="shSubmitBtn">Upload Shareholders File</button>
+            </form>
+            <div class="status-box" id="shStatus"></div>
+          </div>
+
+          <!-- 1.3 Managing Directors -->
+          <div class="step-card">
+            <span class="step-badge badge-tertiary-order">STEP 3 OF 3 • AFTER APPLICATIONS</span>
+            <div class="step-header">Managing Directors & Contacts</div>
+            <div class="step-details">
+              Attaches directors and official company contacts. Matches on <code>apprefno</code> to link directors to the applications loaded in Step 1.
+            </div>
+            <form onsubmit="handleGenericFormUpload(event, '/api/v1/managing-directors/upload', 'mdFile', 'mdSubmitBtn', 'mdStatus', 'Directors')">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">👔</div>
+                <div class="dropzone-text">Choose Directors Excel/CSV</div>
+                <div class="dropzone-hint">e.g. Directors Details Missing.xlsx</div>
+                <div class="file-chosen-name" id="mdChosenName"></div>
+                <input type="file" id="mdFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'mdChosenName')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="mdSubmitBtn">Upload Directors File</button>
+            </form>
+            <div class="status-box" id="mdStatus"></div>
+          </div>
+
         </div>
       </div>
 
-      <!-- SECTION A: PRIMARY SECTOR APPLICATIONS -->
-      <div class="section-headline">
-        <span>1. Main License Applications (Mandatory First)</span>
+      <!-- ============================================== -->
+      <!-- PIPELINE 2: ELECTRICAL INSTALLATIONS           -->
+      <!-- ============================================== -->
+      <div id="pipeline-electrical" class="pipeline-panel">
+
+        <!-- Guided Step Indicator -->
+        <div class="workflow-progress">
+          <div class="wf-step active">
+            <span class="wf-badge">1</span>
+            <span>1. Electrical Apps</span>
+          </div>
+          <span class="wf-arrow">→</span>
+          <div class="wf-step">
+            <span class="wf-badge">2</span>
+            <span>2. Employed Experience</span>
+          </div>
+          <span class="wf-arrow">→</span>
+          <div class="wf-step">
+            <span class="wf-badge">3</span>
+            <span>3. Cert Verifications</span>
+          </div>
+          <span class="wf-arrow">→</span>
+          <div class="wf-step">
+            <span class="wf-badge">4</span>
+            <span>4. Self-Employed</span>
+          </div>
+        </div>
+
+        <div class="first-timer-tip">
+          <div>⚡</div>
+          <div>
+            <strong>Electrical Installations Pipeline:</strong> Specific to electrical contractors and licensed wiremen.
+            Always upload the <strong>Electrical Installation Applications</strong> first, followed by experience and verification records.
+          </div>
+        </div>
+
+        <div class="steps-grid">
+
+          <!-- 2.1 Electrical Applications -->
+          <div class="step-card">
+            <span class="step-badge badge-primary-order">STEP 1 • ELECTRICAL APPS</span>
+            <div class="step-header">Electrical Installation Applications</div>
+            <div class="step-details">
+              Imports electrical installation applications into <code>application_electrical_installation</code>. Matches on <code>apprefno</code> and <code>installationname</code>.
+            </div>
+            <form onsubmit="handleElectricalPipelineUpload(event, '/api/v1/electrical-installations/upload', 'elecAppFile', 'elecAppBtn', 'elecAppStatus', 'Electrical Applications')">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">⚡</div>
+                <div class="dropzone-text">Electrical Applications Excel</div>
+                <div class="file-chosen-name" id="elecAppChosen"></div>
+                <input type="file" id="elecAppFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'elecAppChosen')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="elecAppBtn">Upload Electrical Apps</button>
+            </form>
+            <div class="status-box" id="elecAppStatus"></div>
+          </div>
+
+          <!-- 2.2 Employed Supervisors Experience -->
+          <div class="step-card">
+            <span class="step-badge badge-secondary-order">STEP 2 • EMPLOYED EXPERIENCE</span>
+            <div class="step-header">Employed Experience / Supervisors</div>
+            <div class="step-details">
+              Attaches supervisor work experience into <code>supervisor_details</code> and <code>employed_experience</code> for electrical contractors.
+            </div>
+            <form onsubmit="handleElectricalPipelineUpload(event, '/api/v1/electrical-installations/upload-employed-experience', 'elecExpFile', 'elecExpBtn', 'elecExpStatus', 'Employed Experience')">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">👷</div>
+                <div class="dropzone-text">Employed Experience Excel</div>
+                <div class="file-chosen-name" id="elecExpChosen"></div>
+                <input type="file" id="elecExpFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'elecExpChosen')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="elecExpBtn">Upload Employed Experience</button>
+            </form>
+            <div class="status-box" id="elecExpStatus"></div>
+          </div>
+
+          <!-- 2.3 Certificate Verifications -->
+          <div class="step-card">
+            <span class="step-badge badge-secondary-order">STEP 3 • CERT VERIFICATIONS</span>
+            <div class="step-header">Certificate Verifications</div>
+            <div class="step-details">
+              Imports supervisor qualification and wireman test verifications into <code>certificate_verifications</code>.
+            </div>
+            <form onsubmit="handleElectricalPipelineUpload(event, '/api/v1/electrical-installations/upload-certificate-verifications', 'elecVerFile', 'elecVerBtn', 'elecVerStatus', 'Cert Verifications')">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">📜</div>
+                <div class="dropzone-text">Certificate Verifications Excel</div>
+                <div class="file-chosen-name" id="elecVerChosen"></div>
+                <input type="file" id="elecVerFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'elecVerChosen')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="elecVerBtn">Upload Verifications</button>
+            </form>
+            <div class="status-box" id="elecVerStatus"></div>
+          </div>
+
+          <!-- 2.4 Self-Employed Projects -->
+          <div class="step-card">
+            <span class="step-badge badge-secondary-order">STEP 4 • SELF-EMPLOYED</span>
+            <div class="step-header">Self-Employed Experience</div>
+            <div class="step-details">
+              Imports project records into <code>self_employed</code> and <code>custom_details</code> for self-employed licensed wiremen.
+            </div>
+            <form onsubmit="handleElectricalPipelineUpload(event, '/api/v1/electrical-installations/upload-self-employed', 'elecSelfFile', 'elecSelfBtn', 'elecSelfStatus', 'Self-Employed Experience')">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">🔨</div>
+                <div class="dropzone-text">Self-Employed Excel</div>
+                <div class="file-chosen-name" id="elecSelfChosen"></div>
+                <input type="file" id="elecSelfFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'elecSelfChosen')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="elecSelfBtn">Upload Self-Employed</button>
+            </form>
+            <div class="status-box" id="elecSelfStatus"></div>
+          </div>
+
+        </div>
       </div>
 
-      <div class="steps-grid">
+      <!-- ============================================== -->
+      <!-- PIPELINE 3: WATER SUPPLY SPECIALIZED           -->
+      <!-- ============================================== -->
+      <div id="pipeline-water" class="pipeline-panel">
 
-        <!-- 1.1 Sector Applications Upload -->
-        <div class="step-card">
-          <span class="step-badge badge-primary-order">PIPELINE 1 • PRIMARY</span>
-          <div class="step-header">Sector Applications (Bulk Migration)</div>
-          <div class="step-details">
-            Imports Petroleum, Natural Gas, Electricity, or Water Supply applications. Creates applications, assigns categories, and generates linked certificates.
+        <div class="first-timer-tip">
+          <div>💧</div>
+          <div>
+            <strong>Water Supply Dedicated Ingestion:</strong> Use this pipeline when migrating water utility authority applications with detailed financial reports, bank information, and official government gazette notices.
           </div>
-
-          <form id="appForm" onsubmit="handleSectorAppUpload(event)">
-            <div class="form-group">
-              <label class="form-label">Sector Name</label>
-              <select class="form-select" id="appSector" required>
-                <option value="PETROLEUM" selected>PETROLEUM</option>
-                <option value="NATURAL_GAS">NATURAL_GAS</option>
-                <option value="ELECTRICITY">ELECTRICITY</option>
-                <option value="WATER_SUPPLY">WATER_SUPPLY</option>
-              </select>
-            </div>
-
-            <div class="file-dropzone">
-              <div class="dropzone-icon">📄</div>
-              <div class="dropzone-text">Choose Applications Excel/CSV</div>
-              <div class="dropzone-hint">e.g. Approved Petroleum License missing.xlsx</div>
-              <div class="file-chosen-name" id="appChosenName"></div>
-              <input type="file" id="appFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'appChosenName')" required>
-            </div>
-
-            <button type="submit" class="btn btn-primary" id="appSubmitBtn">
-              Upload Applications File
-            </button>
-          </form>
-
-          <div class="status-box" id="appStatus"></div>
         </div>
 
-        <!-- 1.2 Water Supply Specialized Upload -->
-        <div class="step-card">
-          <span class="step-badge badge-primary-order">PIPELINE 1B • WATER SPECIAL</span>
-          <div class="step-header">Water Supply Applications Pipeline</div>
-          <div class="step-details">
-            Specialized ingestion for water authority applications, populating <code>financial_information</code>, <code>bank_details_tanzania</code>, and government notice attachments.
-          </div>
+        <div class="steps-grid">
 
-          <form id="waterForm" onsubmit="handleWaterSupplyUpload(event)">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">💧</div>
-              <div class="dropzone-text">Choose Water Supply Excel/CSV</div>
-              <div class="dropzone-hint">e.g. Water_Supply_Final.xlsx</div>
-              <div class="file-chosen-name" id="waterChosenName"></div>
-              <input type="file" id="waterFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'waterChosenName')" required>
+          <div class="step-card" style="max-width: 550px;">
+            <span class="step-badge badge-primary-order">WATER SUPPLY SPECIAL</span>
+            <div class="step-header">Water Authority Applications Pipeline</div>
+            <div class="step-details">
+              Specialized ingestion for water authority applications, automatically populating <code>financial_information</code>, <code>bank_details_tanzania</code>, and government notice attachments.
             </div>
 
-            <button type="submit" class="btn btn-primary" id="waterSubmitBtn">
-              Upload Water Applications
-            </button>
-          </form>
+            <form id="waterForm" onsubmit="handleWaterSupplyUpload(event)">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">💧</div>
+                <div class="dropzone-text">Choose Water Supply Excel/CSV</div>
+                <div class="dropzone-hint">e.g. Water_Supply_Final.xlsx</div>
+                <div class="file-chosen-name" id="waterChosenName"></div>
+                <input type="file" id="waterFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'waterChosenName')" required>
+              </div>
 
-          <div class="status-box" id="waterStatus"></div>
+              <button type="submit" class="btn btn-primary" id="waterSubmitBtn">
+                Upload Water Applications
+              </button>
+            </form>
+
+            <div class="status-box" id="waterStatus"></div>
+          </div>
+
         </div>
-
       </div>
 
-      <!-- SECTION B: ELECTRICAL INSTALLATIONS PIPELINE -->
-      <div class="section-headline">
-        <span>2. Electrical Installations 4-Step Pipeline</span>
-      </div>
+      <!-- ============================================== -->
+      <!-- PIPELINE 4: REFERENCE DATA & FEES              -->
+      <!-- ============================================== -->
+      <div id="pipeline-reference" class="pipeline-panel">
 
-      <div class="steps-grid">
-
-        <!-- 2.1 Electrical Applications -->
-        <div class="step-card">
-          <span class="step-badge badge-primary-order">STEP 1 • ELECTRICAL APPS</span>
-          <div class="step-header">Electrical Installation Applications</div>
-          <div class="step-details">
-            Imports applications into <code>application_electrical_installation</code>. Matches on <code>apprefno</code> and <code>installationname</code>.
+        <div class="first-timer-tip">
+          <div>🏛️</div>
+          <div>
+            <strong>Reference Data & Fee Tables:</strong> Upload foundation lookup tables here, including historical LOIS user accounts, system license categories, and statutory tariff fee schedules.
           </div>
-          <form onsubmit="handleElectricalPipelineUpload(event, '/api/v1/electrical-installations/upload', 'elecAppFile', 'elecAppBtn', 'elecAppStatus', 'Electrical Applications')">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">⚡</div>
-              <div class="dropzone-text">Electrical Applications Excel</div>
-              <div class="file-chosen-name" id="elecAppChosen"></div>
-              <input type="file" id="elecAppFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'elecAppChosen')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="elecAppBtn">Upload Electrical Apps</button>
-          </form>
-          <div class="status-box" id="elecAppStatus"></div>
         </div>
 
-        <!-- 2.2 Employed Supervisors Experience -->
-        <div class="step-card">
-          <span class="step-badge badge-secondary-order">STEP 2 • EMPLOYED EXPERIENCE</span>
-          <div class="step-header">Employed Experience / Supervisors</div>
-          <div class="step-details">
-            Attaches supervisor work experience into <code>supervisor_details</code> and <code>employed_experience</code> for electrical contractors.
+        <div class="steps-grid">
+
+          <!-- 4.1 LOIS Portal Users Upload -->
+          <div class="step-card">
+            <span class="step-badge badge-tool">SYSTEM USERS</span>
+            <div class="step-header">LOIS Portal Users Upload</div>
+            <div class="step-details">
+              Upload historical user credentials from legacy LOIS database into <code>public.users</code> with password hashes and roles.
+            </div>
+            <form onsubmit="handleDirectFileUpload(event, '/api/v1/lois-users/upload', 'loisUserFile', 'loisUserBtn', 'loisUserStatus', 'LOIS Users')">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">👤</div>
+                <div class="dropzone-text">Choose LOIS Users Excel</div>
+                <div class="dropzone-hint">Columns: username, full_name, email, phone, role</div>
+                <div class="file-chosen-name" id="loisUserChosen"></div>
+                <input type="file" id="loisUserFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'loisUserChosen')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="loisUserBtn">Upload LOIS Users</button>
+            </form>
+            <div class="status-box" id="loisUserStatus"></div>
           </div>
-          <form onsubmit="handleElectricalPipelineUpload(event, '/api/v1/electrical-installations/upload-employed-experience', 'elecExpFile', 'elecExpBtn', 'elecExpStatus', 'Employed Experience')">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">👷</div>
-              <div class="dropzone-text">Employed Experience Excel</div>
-              <div class="file-chosen-name" id="elecExpChosen"></div>
-              <input type="file" id="elecExpFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'elecExpChosen')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="elecExpBtn">Upload Employed Experience</button>
-          </form>
-          <div class="status-box" id="elecExpStatus"></div>
-        </div>
 
-        <!-- 2.3 Certificate Verifications -->
-        <div class="step-card">
-          <span class="step-badge badge-secondary-order">STEP 3 • CERT VERIFICATIONS</span>
-          <div class="step-header">Certificate Verifications</div>
-          <div class="step-details">
-            Imports supervisor qualification verifications into <code>certificate_verifications</code>.
+          <!-- 4.2 System Categories Upload -->
+          <div class="step-card">
+            <span class="step-badge badge-tool">CATEGORIES</span>
+            <div class="step-header">Categories Upload</div>
+            <div class="step-details">
+              Import new categories into <code>public.categories</code>. Requires Excel columns: <code>category_name</code> and <code>sector_name</code>.
+            </div>
+            <form onsubmit="handleDirectFileUpload(event, '/api/v1/categories/upload', 'catFile', 'catBtn', 'catStatus', 'Categories')">
+              <div class="file-dropzone">
+                <div class="dropzone-icon">🏷️</div>
+                <div class="dropzone-text">Choose Categories Excel</div>
+                <div class="dropzone-hint">Columns: category_name, sector_name</div>
+                <div class="file-chosen-name" id="catChosen"></div>
+                <input type="file" id="catFile" accept=".xlsx,.xls" onchange="showChosenFile(this, 'catChosen')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="catBtn">Upload Categories</button>
+            </form>
+            <div class="status-box" id="catStatus"></div>
           </div>
-          <form onsubmit="handleElectricalPipelineUpload(event, '/api/v1/electrical-installations/upload-certificate-verifications', 'elecVerFile', 'elecVerBtn', 'elecVerStatus', 'Cert Verifications')">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">📜</div>
-              <div class="dropzone-text">Certificate Verifications Excel</div>
-              <div class="file-chosen-name" id="elecVerChosen"></div>
-              <input type="file" id="elecVerFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'elecVerChosen')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="elecVerBtn">Upload Verifications</button>
-          </form>
-          <div class="status-box" id="elecVerStatus"></div>
-        </div>
 
-        <!-- 2.4 Self-Employed Projects -->
-        <div class="step-card">
-          <span class="step-badge badge-secondary-order">STEP 4 • SELF-EMPLOYED</span>
-          <div class="step-header">Self-Employed Experience</div>
-          <div class="step-details">
-            Imports project records into <code>self_employed</code> and <code>custom_details</code> for self-employed licensed wiremen.
+          <!-- 4.3 License Category Fees -->
+          <div class="step-card">
+            <span class="step-badge badge-tool">FEES & TARIFFS</span>
+            <div class="step-header">License Category Fees Upload</div>
+            <div class="step-details">
+              Imports license categories and tariff fee schedules into <code>ca_license_categories</code> for the selected sector.
+            </div>
+            <form onsubmit="handleLicenseCategoryFeesUpload(event)">
+              <div class="form-group">
+                <label class="form-label">Sector Name</label>
+                <select class="form-select" id="licCatSector" required>
+                  <option value="Petroleum" selected>Petroleum</option>
+                  <option value="Natural Gas">Natural Gas</option>
+                  <option value="Electricity">Electricity</option>
+                  <option value="Water & Wastewater">Water & Wastewater</option>
+                </select>
+              </div>
+              <div class="file-dropzone">
+                <div class="dropzone-icon">💰</div>
+                <div class="dropzone-text">Choose License Categories & Fees Excel</div>
+                <div class="file-chosen-name" id="licCatChosen"></div>
+                <input type="file" id="licCatFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'licCatChosen')" required>
+              </div>
+              <button type="submit" class="btn btn-primary" id="licCatBtn">Upload License Category Fees</button>
+            </form>
+            <div class="status-box" id="licCatStatus"></div>
           </div>
-          <form onsubmit="handleElectricalPipelineUpload(event, '/api/v1/electrical-installations/upload-self-employed', 'elecSelfFile', 'elecSelfBtn', 'elecSelfStatus', 'Self-Employed Experience')">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">🔨</div>
-              <div class="dropzone-text">Self-Employed Excel</div>
-              <div class="file-chosen-name" id="elecSelfChosen"></div>
-              <input type="file" id="elecSelfFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'elecSelfChosen')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="elecSelfBtn">Upload Self-Employed</button>
-          </form>
-          <div class="status-box" id="elecSelfStatus"></div>
+
         </div>
-
-      </div>
-
-      <!-- SECTION C: COMPANY ENTITIES -->
-      <div class="section-headline">
-        <span>3. Company Ownership & Entity Details (After Applications)</span>
-      </div>
-
-      <div class="steps-grid">
-
-        <!-- 3.1 Shareholders -->
-        <div class="step-card">
-          <span class="step-badge badge-secondary-order">STEP 2 • SHAREHOLDERS</span>
-          <div class="step-header">Shareholders Details</div>
-          <div class="step-details">
-            Upload company shareholders file. Matches on <code>apprefno</code> to link each shareholder to its parent application sector detail.
-          </div>
-          <form onsubmit="handleGenericFormUpload(event, '/api/v1/shareholders/upload', 'shFile', 'shSubmitBtn', 'shStatus', 'Shareholders')">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">👥</div>
-              <div class="dropzone-text">Choose Shareholders Excel/CSV</div>
-              <div class="dropzone-hint">e.g. ShareHolder missing.xlsx</div>
-              <div class="file-chosen-name" id="shChosenName"></div>
-              <input type="file" id="shFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'shChosenName')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="shSubmitBtn">Upload Shareholders</button>
-          </form>
-          <div class="status-box" id="shStatus"></div>
-        </div>
-
-        <!-- 3.2 Managing Directors -->
-        <div class="step-card">
-          <span class="step-badge badge-tertiary-order">STEP 3 • DIRECTORS</span>
-          <div class="step-header">Managing Directors & Contacts</div>
-          <div class="step-details">
-            Upload directors and contacts file. Matches on <code>apprefno</code> to attach directors to the existing application.
-          </div>
-          <form onsubmit="handleGenericFormUpload(event, '/api/v1/managing-directors/upload', 'mdFile', 'mdSubmitBtn', 'mdStatus', 'Directors')">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">👔</div>
-              <div class="dropzone-text">Choose Directors Excel/CSV</div>
-              <div class="dropzone-hint">e.g. Directors Details Missing.xlsx</div>
-              <div class="file-chosen-name" id="mdChosenName"></div>
-              <input type="file" id="mdFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'mdChosenName')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="mdSubmitBtn">Upload Directors</button>
-          </form>
-          <div class="status-box" id="mdStatus"></div>
-        </div>
-
-      </div>
-
-      <!-- SECTION D: SYSTEM FOUNDATION & REFERENCE UPLOADS -->
-      <div class="section-headline">
-        <span>4. System Foundation & Reference Data Uploads</span>
-      </div>
-
-      <div class="steps-grid">
-
-        <!-- 4.1 LOIS Portal Users Upload -->
-        <div class="step-card">
-          <span class="step-badge badge-tool">SYSTEM USERS</span>
-          <div class="step-header">LOIS Portal Users Upload</div>
-          <div class="step-details">
-            Upload historical user credentials from legacy LOIS database into <code>public.users</code> with password hashes and roles.
-          </div>
-          <form onsubmit="handleDirectFileUpload(event, '/api/v1/lois-users/upload', 'loisUserFile', 'loisUserBtn', 'loisUserStatus', 'LOIS Users')">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">👤</div>
-              <div class="dropzone-text">Choose LOIS Users Excel</div>
-              <div class="dropzone-hint">Columns: username, full_name, email, phone, role</div>
-              <div class="file-chosen-name" id="loisUserChosen"></div>
-              <input type="file" id="loisUserFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'loisUserChosen')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="loisUserBtn">Upload LOIS Users</button>
-          </form>
-          <div class="status-box" id="loisUserStatus"></div>
-        </div>
-
-        <!-- 4.2 System Categories Upload -->
-        <div class="step-card">
-          <span class="step-badge badge-tool">CATEGORIES</span>
-          <div class="step-header">Categories Upload</div>
-          <div class="step-details">
-            Import new categories into <code>public.categories</code>. Requires Excel columns: <code>category_name</code> and <code>sector_name</code>.
-          </div>
-          <form onsubmit="handleDirectFileUpload(event, '/api/v1/categories/upload', 'catFile', 'catBtn', 'catStatus', 'Categories')">
-            <div class="file-dropzone">
-              <div class="dropzone-icon">🏷️</div>
-              <div class="dropzone-text">Choose Categories Excel</div>
-              <div class="dropzone-hint">Columns: category_name, sector_name</div>
-              <div class="file-chosen-name" id="catChosen"></div>
-              <input type="file" id="catFile" accept=".xlsx,.xls" onchange="showChosenFile(this, 'catChosen')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="catBtn">Upload Categories</button>
-          </form>
-          <div class="status-box" id="catStatus"></div>
-        </div>
-
-        <!-- 4.3 License Category Fees -->
-        <div class="step-card">
-          <span class="step-badge badge-tool">FEES & TARIFFS</span>
-          <div class="step-header">License Category Fees Upload</div>
-          <div class="step-details">
-            Imports license categories and tariff fee schedules into <code>ca_license_categories</code> for the selected sector.
-          </div>
-          <form onsubmit="handleLicenseCategoryFeesUpload(event)">
-            <div class="form-group">
-              <label class="form-label">Sector Name</label>
-              <select class="form-select" id="licCatSector" required>
-                <option value="Petroleum" selected>Petroleum</option>
-                <option value="Natural Gas">Natural Gas</option>
-                <option value="Electricity">Electricity</option>
-                <option value="Water & Wastewater">Water & Wastewater</option>
-              </select>
-            </div>
-            <div class="file-dropzone">
-              <div class="dropzone-icon">💰</div>
-              <div class="dropzone-text">Choose License Categories & Fees Excel</div>
-              <div class="file-chosen-name" id="licCatChosen"></div>
-              <input type="file" id="licCatFile" accept=".xlsx,.xls,.csv" onchange="showChosenFile(this, 'licCatChosen')" required>
-            </div>
-            <button type="submit" class="btn btn-primary" id="licCatBtn">Upload License Category Fees</button>
-          </form>
-          <div class="status-box" id="licCatStatus"></div>
-        </div>
-
       </div>
 
     </div>
@@ -1643,6 +1819,17 @@ PORTAL_HTML = """<!DOCTYPE html>
         loadCategories();
         loadRoles();
       }
+    }
+
+    // Pipeline Switcher within Data Migration Tab
+    function switchPipeline(panelId) {
+      document.querySelectorAll('.pipeline-tab-btn').forEach(btn => btn.classList.remove('active'));
+      document.querySelectorAll('.pipeline-panel').forEach(panel => panel.classList.remove('active'));
+
+      const targetBtn = Array.from(document.querySelectorAll('.pipeline-tab-btn')).find(b => b.getAttribute('onclick').includes(panelId));
+      if (targetBtn) targetBtn.classList.add('active');
+      const targetPanel = document.getElementById(panelId);
+      if (targetPanel) targetPanel.classList.add('active');
     }
 
     // Keep global environment synced across entire app
