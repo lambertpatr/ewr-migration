@@ -1665,7 +1665,7 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
 
             r_certs = db.execute(text("""
                 WITH src AS (
-                    SELECT DISTINCT ON (a.application_number)
+                    SELECT DISTINCT ON (COALESCE(NULLIF(TRIM(a.approval_no), ''), a.application_number))
                         a.id                  AS application_id,
                         a.application_number,
                         a.approval_no,
@@ -1687,7 +1687,17 @@ def import_applications_from_df(db: Any, df, preserve_source_id: bool = False, b
                     LEFT JOIN public.application_sector_details asd ON asd.application_id = a.id
                     WHERE a.is_from_lois = true
                       AND a.application_number IS NOT NULL
-                    ORDER BY a.application_number, a.created_at DESC
+                      AND (
+                          a.approval_no IS NULL 
+                          OR TRIM(a.approval_no) = ''
+                          OR NOT EXISTS (
+                              SELECT 1 FROM public.certificates c
+                              WHERE c.approval_no = a.approval_no
+                          )
+                      )
+                    ORDER BY COALESCE(NULLIF(TRIM(a.approval_no), ''), a.application_number),
+                             a.expire_date DESC NULLS LAST,
+                             COALESCE(a.effective_date, a.approval_date) DESC NULLS LAST
                 )
                 INSERT INTO public.certificates (
                     id,

@@ -637,12 +637,12 @@ BEGIN
         a.approval_no,
         -- application_certificate_type from staged application_type (NEW/RENEW/UPGRADE etc.)
         COALESCE(
-            CASE UPPER(TRIM(s.application_type))
+            CASE UPPER(TRIM(a.staged_app_type))
                 WHEN 'EXTENSION'   THEN 'EXTEND'
                 WHEN 'RENEWAL'     THEN 'RENEW'
                 WHEN 'CHANGE_NAME' THEN 'CHANGE_OF_NAME'
                 WHEN 'CHANGES'     THEN 'CHANGE_OF_NAME'
-                ELSE NULLIF(UPPER(TRIM(s.application_type)), '')
+                ELSE NULLIF(UPPER(TRIM(a.staged_app_type)), '')
             END,
             'NEW'
         ) AS application_certificate_type,
@@ -660,26 +660,59 @@ BEGIN
             ELSE 'License'
         END AS certificate_type,
         TRIM(
-            COALESCE(NULLIF(trim(s.facility_name), ''), '') || 
+            COALESCE(NULLIF(trim(a.staged_facility_name), ''), '') || 
             CASE 
-                WHEN NULLIF(trim(s.po_box), '') IS NOT NULL THEN ', ' || trim(s.po_box) 
+                WHEN NULLIF(trim(a.staged_po_box), '') IS NOT NULL THEN ', ' || trim(a.staged_po_box) 
                 ELSE '' 
             END
         ) AS certificate_owner,
         a.zone_id,
         a.zone_name
-    FROM public.applications a
-    -- One certificate row per application_number (first occurrence in staging).
-    JOIN (
-        SELECT DISTINCT ON (application_number)
-               application_number,
-               application_type,
-               facility_name,
-               po_box
-        FROM   public.stage_ca_applications_raw
-        ORDER  BY application_number,
-                  source_row_no
-    ) s ON s.application_number = a.application_number
+    FROM (
+        SELECT DISTINCT ON (COALESCE(NULLIF(TRIM(a.approval_no), ''), a.application_number))
+            a.id,
+            a.created_by,
+            a.application_number,
+            a.approval_no,
+            a.effective_date,
+            a.expire_date,
+            a.intimate_date,
+            a.months_eligible,
+            a.approval_date,
+            a.licence_path,
+            a.license_type,
+            a.category_license_type,
+            a.category_type,
+            a.zone_id,
+            a.zone_name,
+            s.application_type AS staged_app_type,
+            s.facility_name    AS staged_facility_name,
+            s.po_box           AS staged_po_box
+        FROM public.applications a
+        JOIN (
+            SELECT DISTINCT ON (application_number)
+                   application_number,
+                   application_type,
+                   facility_name,
+                   po_box
+            FROM   public.stage_ca_applications_raw
+            ORDER  BY application_number,
+                      source_row_no
+        ) s ON s.application_number = a.application_number
+        WHERE NULLIF(trim(a.application_number), '') IS NOT NULL
+          -- IGNORE if approval_no already exists in certificates (do not insert duplicate)!
+          AND (
+              a.approval_no IS NULL 
+              OR TRIM(a.approval_no) = ''
+              OR NOT EXISTS (
+                  SELECT 1 FROM public.certificates c
+                  WHERE c.approval_no = a.approval_no
+              )
+          )
+        ORDER BY COALESCE(NULLIF(TRIM(a.approval_no), ''), a.application_number),
+                 a.expire_date DESC NULLS LAST,
+                 COALESCE(a.effective_date, a.approval_date) DESC NULLS LAST
+    ) a
     WHERE NULLIF(trim(a.application_number), '') IS NOT NULL
     -- Use the unique constraint on application_number for conflict detection.
     -- This is simpler and more reliable than the old md5-id approach.
@@ -1369,8 +1402,10 @@ BEGIN
     END IF;
 
     -- application_electrical_installation: fill via applications.application_number
-    IF EXISTS (SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-               WHERE n.nspname = 'public' AND c.relname = 'application_electrical_installation') THEN
+    IF EXISTS (SELECT 1 FROM information_schema.columns 
+               WHERE table_schema = 'public' 
+                 AND table_name = 'application_electrical_installation' 
+                 AND column_name = 'application_number') THEN
         UPDATE public.application_electrical_installation aei
         SET    application_id = a.id
         FROM   public.applications a

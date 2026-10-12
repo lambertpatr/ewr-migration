@@ -1003,6 +1003,11 @@ def import_electrical_installation_via_staging_copy(
                    a.category_license_type AS resolved_category_license_type
             FROM public.stage_elec_install_raw s
             JOIN public.applications a ON a.application_number = trim(s.application_number)
+            WHERE NULLIF(trim(s.approval_no), '') IS NULL
+               OR NOT EXISTS (
+                   SELECT 1 FROM public.certificates c
+                   WHERE c.approval_no = trim(s.approval_no)
+               )
             ORDER BY trim(s.application_number), s.row_no
         ),
         ins AS (

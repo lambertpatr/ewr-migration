@@ -1069,6 +1069,13 @@ def import_water_supply_via_staging(
         JOIN public.applications a
             ON a.application_number = btrim(s.application_number)
         WHERE btrim(s.application_number) <> ''
+          AND (
+              NULLIF(btrim(s.approval_no), '') IS NULL
+              OR NOT EXISTS (
+                  SELECT 1 FROM public.certificates c
+                  WHERE c.approval_no = btrim(s.approval_no)
+              )
+          )
         ON CONFLICT (application_number) DO UPDATE SET
             approval_no               = COALESCE(EXCLUDED.approval_no,               public.certificates.approval_no),
             approval_date             = COALESCE(EXCLUDED.approval_date,             public.certificates.approval_date),
