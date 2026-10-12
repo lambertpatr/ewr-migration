@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import subprocess
 import paramiko
 import time
 
@@ -7,6 +8,16 @@ USER = "ewura-admin"
 PASS = "secure@123"
 
 def main():
+    print("Creating fresh deployment package ewura-migration.tar.gz...")
+    subprocess.run(
+        "COPYFILE_DISABLE=1 tar --no-xattrs --exclude='.venv' "
+        "--exclude='__pycache__' --exclude='*.pyc' --exclude='.git' "
+        "--exclude='*.tar.gz' -czf ewura-migration.tar.gz .",
+        shell=True,
+        check=True
+    )
+    print("✓ Package created.")
+
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     print(f"Connecting to {SERVER}...")
