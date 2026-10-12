@@ -2533,8 +2533,8 @@ PORTAL_HTML = """<!DOCTYPE html>
 </html>
 """
 
-@router.get("/", response_class=HTMLResponse, include_in_schema=False)
-@router.get("/portal", response_class=HTMLResponse, include_in_schema=False)
+@router.api_route("/", methods=["GET", "HEAD"], response_class=HTMLResponse, include_in_schema=False)
+@router.api_route("/portal", methods=["GET", "HEAD"], response_class=HTMLResponse, include_in_schema=False)
 def get_migration_portal():
     """Serves the interactive EWURA Migration Portal Web Interface."""
     return HTMLResponse(content=PORTAL_HTML, status_code=200)
