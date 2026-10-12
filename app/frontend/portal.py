@@ -2067,7 +2067,7 @@ PORTAL_HTML = """<!DOCTYPE html>
       statusBox.innerText = 'Fetching transfer preview...';
 
       try {
-        const url = '/api/v1/admin-tools/transfer-ownership/preview?application_number=' + encodeURIComponent(appNo) + '&new_username=' + encodeURIComponent(newUser);
+        const url = '/api/v1/admin-tools/transfer-ownership/preview?application_number=' + encodeURIComponent(appNo) + '&new_username=' + encodeURIComponent(newUser) + '&db_env=' + getEnv();
         const resp = await fetch(url);
         const data = await resp.json();
         if (resp.ok) {
@@ -2104,7 +2104,7 @@ PORTAL_HTML = """<!DOCTYPE html>
       statusBox.innerText = 'Processing transfer...';
 
       try {
-        const url = '/api/v1/admin-tools/transfer-ownership?application_number=' + encodeURIComponent(appNo) + '&new_username=' + encodeURIComponent(newUser) + '&dry_run=' + dryRun;
+        const url = '/api/v1/admin-tools/transfer-ownership?application_number=' + encodeURIComponent(appNo) + '&new_username=' + encodeURIComponent(newUser) + '&dry_run=' + dryRun + '&db_env=' + getEnv();
         const resp = await fetch(url, { method: 'POST' });
         const data = await resp.json();
         if (resp.ok) {
@@ -2143,7 +2143,7 @@ PORTAL_HTML = """<!DOCTYPE html>
       statusBox.innerText = 'Restoring snapshot...';
 
       try {
-        const url = '/api/v1/admin-tools/transfer-ownership/restore?application_number=' + encodeURIComponent(appNo) + '&dry_run=' + dryRun;
+        const url = '/api/v1/admin-tools/transfer-ownership/restore?application_number=' + encodeURIComponent(appNo) + '&dry_run=' + dryRun + '&db_env=' + getEnv();
         const resp = await fetch(url, { method: 'POST' });
         const data = await resp.json();
         if (resp.ok) {

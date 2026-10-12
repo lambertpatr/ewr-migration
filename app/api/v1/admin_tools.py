@@ -1558,6 +1558,7 @@ def transfer_ownership_preview(
     application_number: str = Query(..., description="Application number to transfer"),
     new_username: str = Query(None, description="Target username (either this or new_user_id)"),
     new_user_id: str = Query(None, description="Target user UUID (either this or new_username)"),
+    db_env: DBEnv = Query(DBEnv.dev, description="Target database environment"),
 ):
     """
     Preview what will change when ownership of an application is transferred.
@@ -1565,6 +1566,9 @@ def transfer_ownership_preview(
     """
     if not new_username and not new_user_id:
         raise HTTPException(status_code=422, detail="Provide new_username or new_user_id")
+
+    from app.core.database import _db_env_var
+    _db_env_var.set(db_env.value)
 
     db = _get_new_session()
     try:
@@ -1657,6 +1661,7 @@ def transfer_ownership(
     new_username: str = Query(None, description="Target username (either this or new_user_id)"),
     new_user_id: str = Query(None, description="Target user UUID (either this or new_username)"),
     dry_run: bool = Query(True, description="true = preview only, false = apply changes"),
+    db_env: DBEnv = Query(DBEnv.dev, description="Target database environment"),
 ):
     """
     Transfer ownership of an application to another user.
@@ -1671,6 +1676,9 @@ def transfer_ownership(
     """
     if not new_username and not new_user_id:
         raise HTTPException(status_code=422, detail="Provide new_username or new_user_id")
+
+    from app.core.database import _db_env_var
+    _db_env_var.set(db_env.value)
 
     db = _get_new_session()
     try:
@@ -1853,11 +1861,15 @@ def transfer_ownership(
 def transfer_ownership_restore(
     application_number: str = Query(..., description="Application number to roll back"),
     dry_run: bool = Query(True, description="true = preview what will be restored, false = apply"),
+    db_env: DBEnv = Query(DBEnv.dev, description="Target database environment"),
 ):
     """
     Roll back a previous transfer by restoring values from the backup snapshot
     in `public.transfer_ownership_backup`.
     """
+    from app.core.database import _db_env_var
+    _db_env_var.set(db_env.value)
+
     db = _get_new_session()
     try:
         # ── Check backup exists ───────────────────────────────────────────────
